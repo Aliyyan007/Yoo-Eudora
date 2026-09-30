@@ -47,16 +47,19 @@ def is_skip_channel(channel_name: str) -> bool:
     return any(kw in name_lower for kw in SKIP_CHANNEL_NAMES)
 
 
-def can_speak_in(channel: discord.TextChannel, me: discord.Member) -> bool:
-    """Check if the bot has permission to read and send messages in a channel."""
+def can_speak_in(channel: discord.TextChannel, me: discord.Member, *,
+                 include_name_check: bool = True) -> bool:
+    """Check if the bot has permission to read and send messages in a channel.
+
+    include_name_check=False skips the skip-channel name filter — used when
+    the message is directed at the bot (reply/sticky convo); the name list is
+    only meant to gate unsolicited participation in utility channels."""
     try:
         perms = channel.permissions_for(me)
-        return (
-            perms.send_messages
-            and perms.read_messages
-            and perms.read_message_history
-            and not is_skip_channel(channel.name)
-        )
+        if not (perms.send_messages and perms.read_messages
+                and perms.read_message_history):
+            return False
+        return not include_name_check or not is_skip_channel(channel.name)
     except Exception:
         return False
 

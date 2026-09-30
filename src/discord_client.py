@@ -1191,6 +1191,17 @@ class AIPersonaClient(discord.Client):
                 # The reply is to someone else, not us
                 return False, "addressed-to-other-user (reply)"
 
+        # ── 2b. Mentions — always respond ────────────────────────────────
+        # A direct ping outranks every gate below (sticky cooldown, perms
+        # name-checks, engagement scoring). This MUST run before the sticky
+        # block — a mention inside a live sticky window is still a mention,
+        # and the sticky gates were swallowing it (e.g. 'sticky-no-perms'
+        # in a bump channel whose name is on the skip list).
+        if mentions_bot:
+            if not self.can_send(ch_id):
+                return False, "mention-daily-cap"
+            return True, "mention"
+
         # ── 3. Conversation stickiness ─────────────────────────────────────
         # If we recently replied in this channel, respond to messages for
         # 5 minutes — BUT only if the message isn't addressed to someone else
@@ -1264,19 +1275,16 @@ class AIPersonaClient(discord.Client):
             if msg_has_other_name and not msg_has_our_name and not mentions_bot:
                 return False, "sticky-name-match (addressing another user)"
 
-            # Check permissions
+            # Check permissions — real Discord perms only. The skip-channel
+            # name list is for UNSOLICITED participation; once she's already
+            # conversing in a channel (that's what sticky means), continuing
+            # shouldn't be blocked by the channel being called e.g. 'bump-server'.
             if hasattr(message.channel, 'guild') and message.channel.guild:
                 me = message.channel.guild.me
-                if not can_speak_in(message.channel, me):
+                if not can_speak_in(message.channel, me, include_name_check=False):
                     return False, "sticky-no-perms"
             remaining = int(sticky_end - now)
             return True, f"sticky-convo ({remaining}s left)"
-
-        # ── 4. Mentions — always respond ───────────────────────────────────
-        if mentions_bot:
-            if not self.can_send(ch_id):
-                return False, "mention-daily-cap"
-            return True, "mention"
 
         # ── 5. Direct reply to the bot (via reply button) ──────────────────
         # Reply button = ALWAYS respond (it's a direct response to us)
