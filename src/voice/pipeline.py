@@ -1398,6 +1398,20 @@ class VoicePipeline:
                 logger.error(f"[voice] Sing handler error: {e!r}")
             logger.info("[voice] Sing failed — falling back to normal reply")
 
+        # ── Spoken action request → side-channel worker ───────────────────
+        # "ping X", "send a message to #general", "change your status".
+        # leave_vc is deliberately NOT routed here — the internal path above
+        # already handles it (filtered per spec). The client callback resolves
+        # the VC channel/guild and runs the worker; the reply speaks a short
+        # acknowledgment instead of a "done" message.
+        if not (hints.get("leave_cmd") or hints.get("sing") or hints.get("farewell")):
+            try:
+                from ..actions.intent import looks_like_action
+                if looks_like_action(final_text):
+                    hints["action"] = True
+            except Exception:
+                pass
+
         # ── TTS pre-warm ─────────────────────────────────────────────────
         # Open the Fish Audio WebSocket NOW, in parallel with the LLM call —
         # the handshake (~0.1-0.6s) overlaps generation so the first sentence

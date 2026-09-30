@@ -30,7 +30,8 @@ davey>=0.1.0; sys_platform == 'win32'                  # DAVE E2EE — required 
 # Utilities
 tenacity>=8.0.0
 pydantic>=2.0.0
-aiohttp>=3.9.0  # for D1 REST API client
+aiohttp>=3.9.0
+rapidfuzz>=3.10.0           # action worker: fuzzy channel/member/role resolution  # for D1 REST API client
 
 # NOTE: Playwright is NO LONGER NEEDED!
 # Bumping is now done via the Discord API (slash commands) directly.

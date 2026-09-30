@@ -168,6 +168,14 @@ class AIPersonaClient(discord.Client):
         self.reply_history: dict = {}      # channel_id -> deque of last 8 replies
         self.processed_msgs = deque(maxlen=200)
         self.history_cache: dict = {}      # channel_id -> deque of last 40 messages
+        self.engager_leaves = deque(maxlen=1000)   # action worker: recent leaves feed
+
+        # Side-channel action worker (vendored Engager tool loop) — env knobs:
+        # ACTIONS_ENABLED=0 kills the whole feature; ACTIONS_OWNER_ONLY=0
+        # lets non-owner directed action requests run (owner-gated tools like
+        # schedule/prefs still refuse internally).
+        self._actions_enabled = os.getenv("ACTIONS_ENABLED", "1") == "1"
+        self._actions_owner_only = os.getenv("ACTIONS_OWNER_ONLY", "1") == "1"
 
         # Daily message counters
         self.daily_count_ch: dict = {}
@@ -398,6 +406,17 @@ class AIPersonaClient(discord.Client):
             asyncio.create_task(self.proactive_messenger.start_monitoring())
             asyncio.create_task(self.proactive_messenger.proactive_loop())
 
+        # Action worker: scheduled-message executor (schedule_message tool
+        # persistence + revival). Independent of the reply path — failure is
+        # isolated.
+        try:
+            from .actions.core import scheduler as _action_scheduler
+            _action_scheduler.init(self)
+            asyncio.create_task(_action_scheduler.scheduler.start())
+            logger.info("Action worker scheduler started")
+        except Exception as e:
+            logger.warning(f"Action worker scheduler unavailable: {e}")
+
         # Start periodic status/bio updates
         asyncio.create_task(self._status_update_loop())
 
@@ -523,6 +542,18 @@ class AIPersonaClient(discord.Client):
                     if others:
                         other_users = ", ".join(others[:5])
                     break
+
+        # ── Spoken action request → side-channel worker ───────────────
+        # Pipeline flagged this utterance as action-ish (leave/sing/etc are
+        # already filtered out upstream). Owner-only by default; the worker
+        # runs silently and the reply just acknowledges it in one line.
+        if (hints or {}).get("action") and is_owner(str(user_id)):
+            try:
+                action_dir = await self._run_vc_action(user_id, transcript)
+                if action_dir:
+                    hints = {**(hints or {}), "directive": (hints.get("directive", "") + " " + action_dir).strip()}
+            except Exception as e:
+                logger.warning(f"[voice action] worker failed: {e}")
 
         # Wait for the memory lookup — capped so a slow D1 can never stall
         # a live voice turn. On timeout the reply is just less personalised.
@@ -1681,6 +1712,84 @@ class AIPersonaClient(discord.Client):
             await message.channel.send(result["message"])
             logger.info(f"Mention: user '{target_name}' not found (requested by {requester_name})")
 
+    def _wants_action_worker(self, message: discord.Message, text: str, is_dm: bool) -> bool:
+        """Should this message go to the side-channel action worker?
+
+        Runs only for messages directed at the bot (mention / reply / DM) —
+        or for an owner mid-conversation — and only when the text smells like
+        a Discord action request. Non-owners get the worker only when
+        ACTIONS_OWNER_ONLY=0.
+        """
+        if not self._actions_enabled:
+            return False
+        try:
+            from .actions.intent import looks_like_action
+            if not looks_like_action(text):
+                return False
+        except Exception:
+            return False
+        directed = (
+            is_dm
+            or self.user in message.mentions
+            or message.reference is not None
+        )
+        owner = is_owner(str(message.author.id))
+        if not directed:
+            # owner mid-conversation still counts as directed
+            sticky = self.sticky_until.get(str(message.channel.id), 0) > time.time()
+            if not (owner and sticky):
+                return False
+        if self._actions_owner_only:
+            return owner
+        return True
+
+    async def _run_vc_action(self, user_id: int, transcript: str) -> str:
+        """Run the side-channel worker for a spoken action request.
+        Returns a voice-prompt directive fragment ('' if nothing ran)."""
+        if not self._actions_enabled or not self.voice_manager:
+            return ""
+        guild_id = self._find_voice_guild_id(user_id)
+        if not guild_id:
+            return ""
+        guild = self.get_guild(guild_id)
+        vc_id = self.voice_manager.get_current_vc_id(guild_id)
+        channel = guild.get_channel(vc_id) if guild and vc_id else None
+        if channel is None:
+            return ""
+        member = guild.get_member(user_id)
+        from .actions.worker import get_action_worker
+        note = await get_action_worker().run_request(
+            self, guild=guild, channel=channel, author_id=user_id,
+            author_name=getattr(member, "display_name", None) or str(user_id),
+            text=transcript)
+        if not note:
+            return ""
+        # note looks like "[ACTION PERFORMED for X: sent a message — ...]"
+        m = re.search(r"for [^:]+:\s*([^—\]]+)", note)
+        did = m.group(1).strip() if m else "the thing they asked"
+        return (f"You already did it for them ({did}) — acknowledge it in "
+                f"ONE short spoken line like it's no big deal. Don't re-ask.")
+
+    async def _run_action_request(self, message: discord.Message, text: str) -> str:
+        """Hand a directed action request to the side-channel worker.
+        Returns a context note for the prompt, or "" when nothing ran."""
+        try:
+            from .actions.worker import get_action_worker
+            # typing() makes the (intentional) execution delay look human
+            async with message.channel.typing():
+                note = await get_action_worker().run_request(
+                    self,
+                    guild=getattr(message.channel, "guild", None),
+                    channel=message.channel,
+                    author_id=message.author.id,
+                    author_name=message.author.name,
+                    text=text,
+                )
+            return note or ""
+        except Exception as e:
+            logger.warning(f"[action] worker call failed: {e}")
+            return ""
+
     async def _handle_command(self, cmd_type: str, params: dict, message: discord.Message, ch_id: str):
         """Handle a detected command from the user.
 
@@ -1934,6 +2043,15 @@ class AIPersonaClient(discord.Client):
                 if cmd_type == "leave_vc":
                     return
 
+            # ── Side-channel action worker ────────────────────────────────
+            # Natural-language Discord actions the regex commands missed:
+            # "send him a dm", "react to that", "change your status to dnd",
+            # "ping me in 10 mins". Silent execution — the normal reply path
+            # acknowledges it in-character via action_note below.
+            action_note = ""
+            if not cmd_type and self._wants_action_worker(message, trigger_text, is_dm):
+                action_note = await self._run_action_request(message, trigger_text)
+
             # ── Scan recent messages for unexecuted commands ────────────────
             # When the bot is mentioned, check if there were commands in recent
             # messages that the bot missed (e.g., "ping Mr. Alien" sent before
@@ -2079,6 +2197,8 @@ class AIPersonaClient(discord.Client):
             # Add command context if a command was detected
             if cmd_type:
                 transcript = f"[COMMAND DETECTED: {cmd_type} — already handled, acknowledge naturally]\n" + transcript
+            elif action_note:
+                transcript = action_note + " — already done silently; acknowledge naturally in your own words, don't ask if they want it done\n" + transcript
 
             # ── Add unanswered questions context ────────────────────────────
             # If there are unanswered questions from recent messages, prepend them
