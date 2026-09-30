@@ -47,9 +47,13 @@ COMMAND_PATTERNS = [
     # Matches: "join vc", "join the vc", "join my vc", "join this vc",
     # "join the current vc", "hop in vc", "get in voice", "come to call",
     # "join THE DEV vc" (channel name), "vc me", "join voice channel"
-    (r'\b(join|hop\s+in|get\s+in|come\s+to|hop\s+on)\s+(?:(?:the|my|this|current|active|a)\s+)?(?:vc|voice|call|voice\s+channel)\b',
+    (r'\b(join|jon|jion|hop\s+in|get\s+in|come\s+to|hop\s+on)\s+(?:(?:the|my|this|current|active|a)\s+)?(?:vc|voice|call|voice\s+channel)\b',
      "join_vc", "User wants the bot to join a voice channel"),
-    (r'\b(join|hop\s+in|get\s+in)\s+\w+\s+(?:vc|voice|call)\b',
+    (r'\b(join|jon|jion|hop\s+in|get\s+in)\s+\w+\s+(?:vc|voice|call)\b',
+     "join_vc", "User wants the bot to join a named voice channel"),
+    # Lenient named form: "join the 'Your Custom' vc" — quoted/multi-word
+    # channel names between the verb and the vc keyword
+    (r'\b(join|jon|jion)\s+["\'\w\s\-]{2,40}?(?:vc|voice\s+channel)\b',
      "join_vc", "User wants the bot to join a named voice channel"),
     (r'\b(vc\s+me|vc\s+now|join\s+voice)\b',
      "join_vc", "User wants the bot to join voice (casual)"),

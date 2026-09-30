@@ -22,7 +22,7 @@ from .ai.engagement import EngagementEngine
 from .ai.sentiment import detect_sentiment, get_sentiment_timing_modifier, get_sentiment_context, detect_loneliness
 from .ai.commands import detect_command
 from .ai.msg_cache import get_cache
-from .ai.vc_manager import get_vc_manager, find_active_voice_channels, find_user_voice_channel, detect_vc_join_request
+from .ai.vc_manager import get_vc_manager, find_active_voice_channels, find_user_voice_channel, detect_vc_join_request, find_vc_by_name
 try:
     from .voice import VoiceManager
     from .voice.tts import TTSConfig
@@ -1561,6 +1561,37 @@ class AIPersonaClient(discord.Client):
         if exc is not None:
             logger.error(f"Background task failed: {exc!r}", exc_info=exc)
 
+    def _extract_named_vc(self, text: str, guild) -> Optional[discord.VoiceChannel]:
+        """Pull a voice-channel name out of a join request, if present.
+
+        Handles: join "Your Custom" vc | join 'general' vc | join the dev vc.
+        Returns a resolved channel, or None (no name / no match — caller
+        falls back to the requester-is-in-VC heuristic)."""
+        if not guild:
+            return None
+        name = None
+        # Quoted name first — most precise
+        m = re.search(r'["\u201c\']([^"\'\u201d]{1,45})["\'\u201d]\s*(?:vc|voice|call)', text, re.I)
+        if m:
+            name = m.group(1).strip()
+        if not name:
+            # "join the X vc" — words between the join verb and the vc keyword
+            verb = re.search(r'\b(join|jon|jion)\b', text, re.I)
+            if verb:
+                tail = text[verb.end():]
+                m3 = re.match(
+                    r'\s+(?:the\s+)?([A-Za-z0-9][\w\s\-\u2019\']{0,38}?)\s+(?:vc|voice\s+channel|voice|call)\b',
+                    tail, re.I)
+                if m3:
+                    name = m3.group(1).strip()
+        if not name or len(name) < 2:
+            return None
+        # Generic words are never channel names
+        if name.lower() in ("vc", "voice", "call", "voice channel", "current",
+                            "my", "this", "your", "a", "an", "the", "active"):
+            return None
+        return find_vc_by_name(guild, name)
+
     async def _handle_vc_join(self, message: discord.Message, user_id: str, username: str):
         """
         Algorithmically handle a VC join request:
@@ -1578,8 +1609,11 @@ class AIPersonaClient(discord.Client):
         guild = message.channel.guild
         requester = message.author
 
-        # Step 1: Check if the requester is in a VC
-        user_vc = find_user_voice_channel(guild, requester.id)
+        # Step 0: explicit named target — "join the 'Your Custom' vc" /
+        # "join general vc". A named channel beats the requester-is-in-VC
+        # heuristic (they may be asking for a channel they're not in).
+        named_vc = self._extract_named_vc(message.content, guild)
+        user_vc = named_vc or find_user_voice_channel(guild, requester.id)
         if user_vc:
             # Already in a DIFFERENT VC → permission-ask flow: the bot says
             # it's occupied, then asks the current VC members "can I go?"

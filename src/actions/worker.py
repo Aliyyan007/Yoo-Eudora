@@ -121,16 +121,21 @@ class ActionWorker:
         )
 
         called: list[str] = []
+        failed: list[str] = []
 
-        # Record which tools actually ran — the agent's text is suppressed
-        # (the main bot acknowledges in its own voice), tool names are the
-        # ground truth for the context note.
+        # Record which tools actually ran AND whether their results were
+        # errors — the agent's text is suppressed (the main bot acknowledges
+        # in its own voice), so tool results are the only ground truth.
         orig_dispatch = _agent_mod.dispatch
 
         async def _spy_dispatch(c, name, args):
             called.append(name)
-            return await orig_dispatch(c, name, args)
+            result = await orig_dispatch(c, name, args)
+            if '"error"' in result[:60]:
+                failed.append(name)
+            return result
 
+        ch_name = getattr(channel, "name", None) or "the current channel"
         async with self._lock:
             # Human-ish delay before acting — user asked for a real pause,
             # not an instant bot-speed action
@@ -142,6 +147,9 @@ class ActionWorker:
                     text,
                     mode=COMMAND_MODE,
                     categories=route.categories or None,
+                    context=(f"The user is in channel #{ch_name} — 'here', "
+                             f"'this channel', or an unspecified channel "
+                             f"means #{ch_name}."),
                 )
             except Exception as e:
                 logger.warning(f"[action] worker crashed: {e}")
@@ -153,6 +161,17 @@ class ActionWorker:
             # Router said ACTION but no tool ran — don't claim anything
             logger.info(f"[action] router=ACTION but no tool ran for: '{text[:60]}'")
             return None
+
+        if failed and len(failed) == len(called):
+            # Every tool errored — the action did NOT happen. Say so rather
+            # than claiming success (e.g. slash command not found, channel
+            # didn't resolve).
+            verbs = ", ".join(dict.fromkeys(
+                _TOOL_VERBS.get(n, n.replace("_", " ")) for n in called
+            ))
+            logger.info(f"[action] all tools failed for '{text[:60]}': {called}")
+            return (f"[ACTION FAILED — tried to {verbs} but it didn't work; "
+                    f"be honest and brief about it]")
 
         verbs = ", ".join(dict.fromkeys(
             _TOOL_VERBS.get(n, n.replace("_", " ")) for n in called

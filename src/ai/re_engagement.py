@@ -394,7 +394,7 @@ def select_online_user(
 
     # Don't re-ping someone pinged recently — falls back to them only if
     # literally everyone else has been pinged too
-    recent_ping_ids = _re_engagement.recently_pinged(str(channel.id)) if channel is not None else set()
+    recent_ping_ids = _ping_controller.recently_pinged(str(channel.id)) if channel is not None else set()
 
     online_users = []
     offline_active = []

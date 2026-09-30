@@ -258,6 +258,37 @@ async def main():
         router_mod.classify_llm = orig_classify
         agent_mod.Agent = orig_agent
 
+    # ── 7. VC join detection + named extraction + select_online_user ────
+    print("\n=== vc join + select_online_user ===")
+    from src.ai.vc_manager import detect_vc_join_request
+    from src.ai.commands import detect_command
+    t1 = "okay! Eudora jon the 'Your Custom' vc rn"
+    ok("'jon' typo join detected", detect_vc_join_request(t1))
+    ok("'jon' typo -> join_vc cmd", detect_command(t1)[0] == "join_vc")
+    ok("'join the X vc' detected", detect_vc_join_request("Eudora join the general vc"))
+    ok("name Jon not a join", not detect_vc_join_request("jon is a good guy"))
+    ok("chat not join", not detect_vc_join_request("im going to vc later maybe"))
+
+    from src.ai.re_engagement import select_online_user, get_ping_controller
+    ch3 = SimpleNamespace(
+        id=556,
+        permissions_for=lambda m: SimpleNamespace(read_messages=True, view_channel=True))
+    mems = [
+        SimpleNamespace(id=10, bot=False, status=discord.Status.online,
+                        display_name="a", name="a", activities=[]),
+        SimpleNamespace(id=11, bot=False, status=discord.Status.idle,
+                        display_name="b", name="b", activities=[]),
+        SimpleNamespace(id=12, bot=True, status=discord.Status.online,
+                        display_name="bot", name="bot", activities=[]),
+    ]
+    g3 = SimpleNamespace(id=1, members=mems)
+    u = select_online_user(g3, exclude_ids={1}, channel=ch3)
+    ok("select_online_user no crash + human pick", u is not None and not u.bot)
+    get_ping_controller().record_user_ping("556", user_id=10)
+    picked = [select_online_user(g3, exclude_ids={1}, channel=ch3) for _ in range(6)]
+    ok("recently-pinged excluded", all(p is None or p.id == 11 for p in picked),
+       str([getattr(p, 'id', None) for p in picked]))
+
     fails = [n for n, c in PASS if not c]
     print(f"\n{'ALL PASS' if not fails else 'FAILURES: ' + str(fails)}")
     sys.exit(1 if fails else 0)

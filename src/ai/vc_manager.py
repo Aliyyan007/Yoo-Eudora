@@ -28,16 +28,23 @@ import discord
 
 # Patterns that indicate a VC join request
 VC_JOIN_PATTERNS = [
-    r'\b(join|hop\s+in|get\s+in|come\s+to|hop\s+on|get\s+on|come\s+to)\s+(?:the\s+)?(?:vc|voice|call)\b',
-    r'\b(join|hop\s+in|get\s+in)\s+(?:the\s+)?vc\b',
-    r'\b(vc|voice)\s+(?:join|come|hop)\b',
-    r'\b(join|come)\s+(?:vc|voice)\b',
+    # 'jon'/'jion'/'joi n' are common fast-typing variants of 'join' —
+    # they only fire here because a vc/voice/call keyword follows, so
+    # they can't match the name "Jon" in ordinary text.
+    r'\b(join|jon|jion|joi\s+n|hop\s+in|get\s+in|come\s+to|hop\s+on|get\s+on|come\s+to)\s+(?:the\s+)?(?:vc|voice|call)\b',
+    r'\b(join|jon|jion|hop\s+in|get\s+in)\s+(?:the\s+)?vc\b',
+    r'\b(vc|voice)\s+(?:join|jon|come|hop)\b',
+    r'\b(join|jon|jion|come)\s+(?:vc|voice)\b',
     r'\b(get\s+in\s+(?:the\s+)?(?:vc|voice|call))\b',
     r'\b(hop\s+in\s+(?:the\s+)?(?:vc|voice|call))\b',
-    r'\b(i\'?m\s+in\s+(?:the\s+)?vc)\b.*\b(join|come|hop)\b',
+    r'\b(i\'?m\s+in\s+(?:the\s+)?vc)\b.*\b(join|jon|come|hop)\b',
     r'\b(come\s+to\s+vc)\b',
     r'\b(vc\s+me)\b',
-    r'\b(join\s+my\s+(?:vc|voice|call))\b',
+    r'\b(join|jon|jion)\s+my\s+(?:vc|voice|call)\b',
+    # Lenient named-channel form: "join the 'Your Custom' vc" / "jon general vc"
+    # — join-verb + up to ~40 chars + vc keyword. Only fires when a vc keyword
+    # follows, so it's safe from matching the name Jon.
+    r'\b(join|jon|jion)\s+["\'\w\s\-]{2,40}?(?:vc|voice\s+channel|voice)\b',
 ]
 
 # Compiled patterns for performance
