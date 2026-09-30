@@ -1,0 +1,40 @@
+# Core
+# discord.py-self 2.2.0a0 isn't on PyPI yet (latest release is 2.1.0) —
+# pinned to the master commit matching the local install. Also required by
+# discord-native-voice>=0.1.1 which needs >=2.2.0.
+discord.py-self @ git+https://github.com/dolfies/discord.py-self.git@2ba64a9a997e151a9c259984e0a179b1fdf4aff4
+python-dotenv>=1.0.0
+pyyaml>=6.0
+loguru>=0.7.0
+
+# AI
+groq>=0.11.0
+
+# Voice (real-time voice conversation) — local/Windows only.
+# Skipped on Render (Linux): discord-native-voice requires discord.py-self>=2.2.0
+# but the git install reports 2.2.0a0 (PEP 440: a0 < 2.2.0 → unresolvable),
+# and libopus isn't available on Render anyway. The bot runs fine without
+# voice — the import is guarded in discord_client.py.
+discord-native-voice>=0.1.1; sys_platform == 'win32'
+onnxruntime-directml>=1.18.0; sys_platform == 'win32'  # Silero VAD (Windows)
+numpy>=1.24.0; sys_platform == 'win32'               # VAD/ASR audio buffers
+sherpa-onnx>=1.10.0; sys_platform == 'win32'           # Streaming ASR (zipformer)
+opuslib-next>=1.3.0; sys_platform == 'win32'           # Opus decode/encode for voice
+soxr>=0.3.0; sys_platform == 'win32'                   # High-quality audio resampling 48k→16k (prevents aliasing)
+scipy>=1.11.0; sys_platform == 'win32'                 # Fallback anti-aliased resampling for ASR
+msgpack>=1.0.0; sys_platform == 'win32'                # Fish Audio TTS WebSocket protocol
+websockets>=12.0; sys_platform == 'win32'              # Fish Audio TTS WebSocket client
+huggingface_hub>=0.20.0; sys_platform == 'win32'       # Auto-download ASR models
+davey>=0.1.0; sys_platform == 'win32'                  # DAVE E2EE — required by Discord for voice
+
+# Utilities
+tenacity>=8.0.0
+pydantic>=2.0.0
+aiohttp>=3.9.0  # for D1 REST API client
+
+# NOTE: Playwright is NO LONGER NEEDED!
+# Bumping is now done via the Discord API (slash commands) directly.
+# This is faster, more reliable, and doesn't get blocked by verification modals.
+
+# Optional (for advanced features):
+# apscheduler>=3.10.0  # Only needed if you want external scheduling
