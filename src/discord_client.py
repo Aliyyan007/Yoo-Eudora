@@ -2209,6 +2209,41 @@ class AIPersonaClient(discord.Client):
                     logger.debug(f"Skipping duplicate reply: '{reply_text[:40]}'")
                     return
 
+                # Near-repeat check against recent replies — short replies get
+                # a stricter bar ("just sketching rn" twice reads robotic even
+                # with minor word changes). One anti-repeat retry, then drop.
+                _recent_own = list(self.reply_history.get(ch_id, []))[-3:]
+                _thresh = 0.45 if len(reply_text.split()) <= 6 else 0.65
+                if _recent_own and any(
+                        ai_reply._similarity_ratio(reply_text, prev) >= _thresh
+                        for prev in _recent_own):
+                    logger.debug(f"Near-repeat reply '{reply_text[:40]}' — regenerating")
+                    try:
+                        _rr = await loop.run_in_executor(
+                            None,
+                            lambda: ai_reply.generate_reply(
+                                transcript + "\n\n[CRITICAL: you already said this. Reply with something DIFFERENT — new angle, shorter, or just react vibe-wise. Never repeat yourself.]",
+                                username, user_id, trigger_text or "[shared something]",
+                                self.mood_engine.current_mood, recent_replies, rules_text,
+                                channel_style, self.my_profile_text, channel_lessons,
+                                channel_topic, ch_name, discord_topic, image_urls,
+                                my_name=self.user.display_name,
+                                mentioned_users=mentioned_other_names,
+                            )
+                        )
+                        _cand = ai_reply.humanize(str(_rr.get("reply") or "").strip())[:2000] if _rr else ""
+                        if _cand and _cand not in ("null", "None") and not any(
+                                ai_reply._similarity_ratio(_cand, prev) >= _thresh
+                                for prev in _recent_own):
+                            reply_text = _cand
+                            reaction_emoji = _rr.get("reaction") or reaction_emoji
+                        else:
+                            logger.debug("Repeat regeneration still similar — dropping")
+                            return
+                    except Exception as e:
+                        logger.debug(f"Anti-repeat retry failed: {e}")
+                        return
+
                 # React with emoji — use algorithmic reaction system
                 # First check if AI suggested a reaction, then use our algorithm
                 # to decide whether to actually send it (not on every message)

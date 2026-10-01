@@ -41,6 +41,7 @@ async def use_slash_command(
     channel_query: str = "here",
     application_id: str | None = None,
     bot_name: str | None = None,
+    options: dict | None = None,
 ) -> dict:
     """Use a slash command (e.g. /bump) in a channel.
 
@@ -75,6 +76,7 @@ async def use_slash_command(
     # Find the command by name (and optionally by application_id).
     slash_cmds = [c for c in cmds if isinstance(c, discord.SlashCommand)]
     cmd = None
+    targeted = bool(application_id)
     if application_id:
         # Target a specific bot by application_id.
         cmd = next(
@@ -83,6 +85,13 @@ async def use_slash_command(
              and str(getattr(c, "application_id", "")) == str(application_id)),
             None,
         )
+        if cmd is None:
+            # A specific bot was asked for — do NOT fall back to a same-name
+            # command owned by a different bot (wrong bot = wrong action).
+            available = {str(getattr(c, "application_id", "")): c.name for c in slash_cmds}
+            return {"error": f"Bot '{bot_name or application_id}' has no "
+                             f"'/{command_name}' command here.",
+                    "available": available}
     if cmd is None:
         # Fall back to first match by name.
         cmd = next((c for c in slash_cmds if c.name.lower() == command_name.lower()), None)
@@ -96,7 +105,10 @@ async def use_slash_command(
         return {"error": f"No slash command '{command_name}'. Available: {available}"}
 
     try:
-        interaction = await cmd(ch)
+        if options:
+            interaction = await cmd(ch, **options)
+        else:
+            interaction = await cmd(ch)
         return {
             "ok": True,
             "command": cmd.name,

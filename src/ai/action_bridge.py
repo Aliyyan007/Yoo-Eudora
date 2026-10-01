@@ -102,9 +102,34 @@ _ACTION_LABELS = {
 
 
 def _note_for(performed: list) -> Optional[str]:
-    """('send_message', True), ... -> 'sent the message; reacted' summary."""
+    """('send_message', True), ... -> 'sent the message; reacted' summary.
+    Returns an honest 'tried but failed' note when tools ran but all failed."""
     done = [_ACTION_LABELS.get(n, n.replace("_", " ")) for n, ok in performed if ok]
-    return "; ".join(dict.fromkeys(done)) or None
+    if done:
+        return "; ".join(dict.fromkeys(done))
+    if performed:
+        tried = [_ACTION_LABELS.get(n, n.replace("_", " ")) for n, _ in performed]
+        return f"tried to {'; '.join(dict.fromkeys(tried))} but it didn't work"
+    return None
+
+
+# Stricter confirmation prompt — the heuristic router flags anything with an
+# action word, including declarative statements ("users with X can use @everyone
+# ping"). This second check kills those: only an imperative instruction
+# directed AT the bot may reach the worker.
+_CONFIRM_PROMPT = (
+    "You decide if a Discord message is a direct instruction TO the bot to DO "
+    "something right now. Answer only YES or NO.\n"
+    "YES examples: 'send a msg to #general', 'ping sarah', 'react with fire to "
+    "that', 'join my vc', 'use /bump in here', 'delete your last message'.\n"
+    "NO examples: statements, questions or chatter that merely MENTION actions "
+    "— 'users with the member role can use @everyone ping once a week', 'he "
+    "pinged me yesterday', 'how do I send a gif', 'can people ping roles here', "
+    "'im gonna go', gossip, jokes, or talk aimed at someone else.\n"
+    "Answer with only YES or NO."
+)
+
+_CONFIRM_ENABLED = os.getenv("ACTION_CONFIRM_LLM", "1").strip() != "0"
 
 # Silently-delegated to the host's voice system — these SHOULD still work for
 # anyone (joining/muting are ordinary VC requests the host already honors).
@@ -207,6 +232,35 @@ class ActionWorker:
         return True, args
 
     # ------------------------------------------------------------------ #
+    async def _confirm_action(self, text: str) -> bool:
+        """Second-opinion check: is this a direct imperative TO the bot?
+        The heuristic flags anything containing action words — this cheap
+        YES/NO arbiter rejects declarative statements that merely mention
+        actions ("users with X role can use @everyone ping once a week").
+        Fails OPEN → a Groq outage never breaks actions."""
+        if not _CONFIRM_ENABLED:
+            return True
+        try:
+            from src.action_engine.core.groq_pool import get_pool
+            from src.action_engine.config.settings import settings as _ae_settings
+            resp = await get_pool().chat(
+                model=_ae_settings.router_model,
+                messages=[
+                    {"role": "system", "content": _CONFIRM_PROMPT},
+                    {"role": "user", "content": text[:400]},
+                ],
+                tools=None, tool_choice="none",
+                temperature=0.0, max_tokens=8,
+            )
+            verdict = (resp.choices[0].message.content or "").strip().upper()
+            if "NO" in verdict:
+                logger.info(f"[actions] heuristic said ACTION but arbiter said NO: '{text[:60]}'")
+                return False
+            return True
+        except Exception as e:
+            logger.debug(f"[actions] confirm arbiter failed, allowing: {e}")
+            return True
+
     async def _classify(self, text: str):
         """ACTION route or None. Heuristic first (free), LLM arbiter only
         for genuinely ambiguous utterances."""
@@ -230,6 +284,8 @@ class ActionWorker:
             logger.debug(f"[actions] classify failed: {e}")
             return None
         if route.kind != "action":
+            return None
+        if not await self._confirm_action(trigger_text):
             return None
 
         key = (str(message.channel.id), str(message.author.id))
@@ -306,6 +362,8 @@ class ActionWorker:
             logger.debug(f"[actions] voice classify failed: {e}")
             return None
         if route.kind != "action":
+            return None
+        if not await self._confirm_action(transcript):
             return None
 
         guild = getattr(voice_channel, "guild", None)

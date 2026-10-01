@@ -17,8 +17,10 @@ Algorithmic approach:
 - Track all pings to prevent over-pinging
 """
 import os
+import json
 import time
 import random
+from pathlib import Path
 from typing import Optional, List, Dict, Set
 from collections import deque
 from loguru import logger
@@ -69,6 +71,55 @@ class PingController:
         self._role_daily_limit = _ei("PING_ROLE_DAILY_LIMIT", 4)
         self._user_cooldown_s = _ei("PING_USER_COOLDOWN_MIN", 10) * 60
         self._total_daily_limit = _ei("PING_TOTAL_DAILY_LIMIT", 15)
+
+        # Persisted ping timelines — cooldowns survive restarts
+        self._state_path = Path("data/ping_state.json")
+        self._load_state()
+
+    # ── Persistence ──────────────────────────────────────────────────────
+    def _load_state(self):
+        """Restore ping timestamps from disk so cooldowns survive restarts.
+        Drops entries older than 8 days (all windows are shorter)."""
+        try:
+            if not self._state_path.exists():
+                return
+            data = json.loads(self._state_path.read_text())
+            now = time.time()
+            keep = 8 * 24 * 3600
+            for name, tracker in [("here", self._here_pings),
+                                  ("everyone", self._everyone_pings),
+                                  ("role", self._role_pings),
+                                  ("user", self._user_pings)]:
+                for ch_id, ts_list in (data.get(name) or {}).items():
+                    fresh = [float(t) for t in ts_list if now - float(t) < keep]
+                    if fresh:
+                        tracker[ch_id] = deque(fresh, maxlen=50)
+            for ch_id, pairs in (data.get("recently") or {}).items():
+                fresh = [(int(u), float(t)) for u, t in pairs
+                         if now - float(t) < keep]
+                if fresh:
+                    self._recently_pinged[ch_id] = deque(fresh, maxlen=30)
+            logger.debug(f"Ping state restored from {self._state_path}")
+        except Exception as e:
+            logger.debug(f"Ping state load failed (starting fresh): {e}")
+
+    def _save_state(self):
+        """Atomically persist all ping timelines to disk."""
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "here": {c: list(q) for c, q in self._here_pings.items()},
+                "everyone": {c: list(q) for c, q in self._everyone_pings.items()},
+                "role": {c: list(q) for c, q in self._role_pings.items()},
+                "user": {c: list(q) for c, q in self._user_pings.items()},
+                "recently": {c: [[u, t] for u, t in q]
+                             for c, q in self._recently_pinged.items()},
+            }
+            tmp = self._state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(self._state_path)
+        except Exception as e:
+            logger.debug(f"Ping state save failed: {e}")
 
     def _clean_old(self, channel_id: str, tracker: Dict[str, deque], max_age_s: float):
         """Remove timestamps older than max_age_s from a tracker."""
@@ -168,6 +219,7 @@ class PingController:
         if channel_id not in self._here_pings:
             self._here_pings[channel_id] = deque(maxlen=50)
         self._here_pings[channel_id].append(time.time())
+        self._save_state()
         logger.info(f"@here ping recorded in #{channel_id}")
 
     def record_everyone_ping(self, channel_id: str):
@@ -175,6 +227,7 @@ class PingController:
         if channel_id not in self._everyone_pings:
             self._everyone_pings[channel_id] = deque(maxlen=50)
         self._everyone_pings[channel_id].append(time.time())
+        self._save_state()
         logger.info(f"@everyone ping recorded in #{channel_id}")
 
     def record_role_ping(self, channel_id: str):
@@ -182,6 +235,7 @@ class PingController:
         if channel_id not in self._role_pings:
             self._role_pings[channel_id] = deque(maxlen=50)
         self._role_pings[channel_id].append(time.time())
+        self._save_state()
         logger.info(f"Role ping recorded in #{channel_id}")
 
     def record_user_ping(self, channel_id: str, user_id: int = None):
@@ -192,6 +246,7 @@ class PingController:
         if user_id is not None:
             dq = self._recently_pinged.setdefault(channel_id, deque(maxlen=30))
             dq.append((int(user_id), time.time()))
+        self._save_state()
         logger.info(f"User ping recorded in #{channel_id}")
 
     def recently_pinged(self, channel_id: str) -> set:

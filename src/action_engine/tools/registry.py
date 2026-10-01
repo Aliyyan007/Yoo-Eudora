@@ -194,7 +194,7 @@ TOOL_SCHEMAS: list[dict] = [
         "parameters": {"type": "object", "properties": {"channel_query": {"type": "string"}}}}},
     {"type": "function", "function": {
         "name": "use_slash_command", "description": "Use a slash command (e.g. /bump) in a channel. If multiple bots register the same command, pass bot_name or application_id to target a specific one.",
-        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by its application ID (use list_slash_commands to find it)"}, "bot_name": {"type": "string", "description": "Target a specific bot by fuzzy display name (e.g. 'Global Bot')"}}, "required": ["command_name"]}}},
+        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by its application ID (use list_slash_commands to find it)"}, "bot_name": {"type": "string", "description": "Target a specific bot by fuzzy display name (e.g. 'Global Bot')"}, "options": {"type": "object", "description": "Optional slash-command arguments as {name: value}"}}, "required": ["command_name"]}}},
     # --- Message management ---
     {"type": "function", "function": {
         "name": "delete_message", "description": "Delete the bot's own message by link or message_id.",
@@ -341,7 +341,7 @@ _CHAT_TOOL_SCHEMAS: list[dict] = [
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "use_slash_command", "description": "Use a slash command like /bump. Pass bot_name or application_id to target a specific bot when multiple bots have the same command.",
-        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by application ID"}, "bot_name": {"type": "string", "description": "Target a specific bot by fuzzy display name"}}, "required": ["command_name"]}}},
+        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by application ID"}, "bot_name": {"type": "string", "description": "Target a specific bot by fuzzy display name"}, "options": {"type": "object", "description": "Optional slash-command arguments as {name: value}"}}, "required": ["command_name"]}}},
     {"type": "function", "function": {
         "name": "delete_message", "description": "Delete your own message by link or ID.",
         "parameters": {"type": "object", "properties": {"message_link": {"type": "string"}, "channel_query": {"type": "string"}, "message_id": {"type": "string"}}}}},

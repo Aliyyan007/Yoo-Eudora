@@ -50,7 +50,7 @@ class VoiceManager:
         self._silence_nudge_threshold_s = 120  # 2 min silence → text members
         self._nudge_cooldown_s = 600           # 10 min between nudges
         self._empty_check_interval_s = 30      # check every 30s
-        self._join_grace_s = 150               # don't empty-leave within 2.5min of joining
+        self._join_grace_s = 60                # don't empty-leave within 60s of joining
         self._auto_join_chance = 0.15          # ~15% per tick — more engaged joining
         self._min_users_to_join = 1            # even 1 person = someone to talk to
 
@@ -78,6 +78,24 @@ class VoiceManager:
     ) -> bool:
         """Join a voice channel and start listening."""
         guild_id = channel.guild.id
+
+        # Already connected in this guild? Same channel = no-op; different
+        # channel = move in place (keeps the VoiceClient + listener alive).
+        existing = discord.utils.get(client.voice_clients, guild=channel.guild)
+        if existing is not None and getattr(existing, "is_connected", lambda: True)():
+            cur_ch = getattr(existing, "channel", None)
+            if cur_ch is not None and cur_ch.id == channel.id:
+                return True
+            try:
+                await existing.move_to(channel)
+                self._current_vcs[guild_id] = channel.id
+                self._last_speaking[guild_id] = time.time()
+                self._vc_joined_at[guild_id] = time.time()
+                logger.info(f"Moved VC to '{channel.name}' in guild '{channel.guild.name}'")
+                return True
+            except Exception as e:
+                logger.debug(f"move_to failed — reconnecting cleanly: {e}")
+                await self.leave_vc(client, channel.guild)
 
         # Try discord-native-voice first (enables voice receive), fall back to regular VoiceClient
         native_vc = None
@@ -111,7 +129,7 @@ class VoiceManager:
                 pipeline._leave_cb = lambda g=channel.guild: self.leave_vc(client, g)
                 # Outsider action worker — spoken action requests go to the
                 # isolated engine (leave stays native via _leave_cb above).
-                pipeline._action_cb = lambda uid, txt, ch=channel: self._run_voice_action(client, uid, txt, ch)
+                pipeline._action_cb = lambda uid, txt, g=channel.guild: self._run_voice_action(client, uid, txt, g)
                 self._pipelines[guild_id] = pipeline
 
                 # Start comfort noise to keep voice indicator active
@@ -178,15 +196,23 @@ class VoiceManager:
             return False
 
     async def _run_voice_action(self, client: discord.Client, user_id: int,
-                                text: str, channel) -> str | None:
+                                text: str, guild) -> str | None:
         """Delegate a spoken action request to the outsider action worker.
         Returns a short summary note when it performed something — the
         pipeline injects it into the reply directive so she acknowledges
-        it aloud; None → not an action / failed → normal reply continues."""
+        it aloud; None → not an action / failed → normal reply continues.
+        Resolves the LIVE voice channel (stays correct across move_to)."""
         try:
+            vc = discord.utils.get(client.voice_clients, guild=guild)
+            ch = getattr(vc, "channel", None)
+            if ch is None:
+                cid = self._current_vcs.get(guild.id)
+                ch = guild.get_channel(cid) if cid else None
+            if ch is None:
+                return None
             from ..ai.action_bridge import get_action_worker
             return await get_action_worker(client).try_handle_voice(
-                user_id, text, channel)
+                user_id, text, ch)
         except Exception as e:
             logger.debug(f"[voice] action worker call failed: {e!r}")
             return None

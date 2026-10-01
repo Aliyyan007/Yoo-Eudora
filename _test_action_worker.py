@@ -133,11 +133,14 @@ class _Resp:
 
 
 class FakePool:
-    """Scripted chat() — returns canned responses in order."""
-    def __init__(self, script):
-        self.script = list(script); self.calls = []
+    """Scripted chat() — returns canned responses in order.
+    Calls WITHOUT tools (the confirm arbiter) get `arbiter` as the verdict."""
+    def __init__(self, script, arbiter="YES"):
+        self.script = list(script); self.calls = []; self.arbiter = arbiter
     async def chat(self, **kw):
         self.calls.append(kw)
+        if not kw.get("tools"):  # confirm-arbiter call
+            return _Resp(_Msg(content=self.arbiter))
         step = self.script.pop(0) if self.script else ("content", "(done)")
         kind = step[0]
         if kind == "tools":
@@ -175,10 +178,10 @@ async def main():
     cmd, _ = detect_command("eudora leave the vc")
     check("detect_command catches leave_vc", cmd == "leave_vc")
 
-    def set_script(worker, script):
+    def set_script(worker, script, arbiter="YES"):
         """Swap the pool the worker's agent will use next (agent caches the
-        pool object at construction)."""
-        gp._pool = FakePool(script)
+        pool object at construction). `arbiter` = confirm-gate verdict."""
+        gp._pool = FakePool(script, arbiter=arbiter)
         worker._agent = None
 
     print("== 3. text action end-to-end (silent) ==")
@@ -202,7 +205,19 @@ async def main():
     check("NO 'done'/reply sent", all(c[0] != "done" for c in ch.sent))
     check(f"human delay applied ({dt:.1f}s)", dt >= 1.5)
 
-    print("== 4. chat request -> False (falls through) ==")
+    print("== 3b. declarative statement -> arbiter rejects (leak fix) ==")
+    # "users with X role can use @everyone ping" trips the heuristic but is
+    # NOT an instruction — the confirm arbiter must block it before the
+    # worker can send anything.
+    set_script(worker, [], arbiter="NO")
+    ch.sent.clear()
+    decl = FakeMessage("Users with <@&1432293> role can use @everyone ping once in a week",
+                       author, ch)
+    ok = await worker.try_handle_text(decl, decl.clean_content)
+    check("declarative -> None (no worker run)", ok is None)
+    check("nothing leaked to channel", not ch.sent)
+
+    print("== 4. chat request -> None (falls through) ==")
     gp._pool = FakePool([("content", "chat")])
     worker2 = ActionWorker(client)
     ch.sent.clear()
@@ -274,13 +289,18 @@ async def main():
                                           "application_id": None}})}}
 
     class RescuePool(FakePool):
+        def __init__(self):
+            super().__init__([]); self._raised = False
         async def chat(self, **kw):
+            if not kw.get("tools"):          # arbiter call → allow
+                return _Resp(_Msg(content="YES"))
             self.calls.append(kw)
-            if len(self.calls) == 1:
+            if not self._raised:             # first real agent call → 400
+                self._raised = True
                 raise FakeBadReq()
             return _Resp(_Msg(content="ok"))
 
-    gp._pool = RescuePool([])
+    gp._pool = RescuePool()
     worker._agent = None
     ch.sent.clear()
     note = await worker.try_handle_text(
