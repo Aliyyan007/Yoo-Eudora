@@ -181,6 +181,13 @@ class Agent:
                     extra=extra,
                 )
             except Exception as e:  # noqa: BLE001
+                # Rescue: Groq 400 'tool_use_failed' means the model emitted a
+                # malformed tool call (hallucinated name like
+                # 'search_channels<|channel|>commentary' or null for a string
+                # param). Parse the failed generation, sanitize, run the tool
+                # ourselves and keep the loop alive instead of dying.
+                if await self._rescue_failed_tool_call(e, messages, round_idx):
+                    continue
                 # If Groq fails (e.g. tool call validation error), try one
                 # more round without tools to get a text reply.
                 logger.warning(f"Groq call failed in round {round_idx}: {e}")
@@ -273,6 +280,55 @@ class Agent:
                 )
 
         return "" if mode == VOICE_MODE else "(reached max tool rounds without a final answer)"
+
+    # ------------------------------------------------------------------ #
+    async def _rescue_failed_tool_call(self, e: Exception, messages: list, round_idx: int) -> bool:
+        """Recover from Groq's 'tool_use_failed' 400s.
+
+        The model emitted a tool call Groq rejected (name not in tools —
+        e.g. 'search_channels<|channel|>commentary', or a null arg where the
+        schema wants a string). The error body's failed_generation still
+        contains what the model MEANT — parse it, sanitize, dispatch it
+        ourselves, append the result, and let the loop continue.
+        Returns True if a tool call was recovered and executed.
+        """
+        try:
+            body = getattr(e, "body", None)
+            failed = None
+            if isinstance(body, dict):
+                failed = (body.get("error") or {}).get("failed_generation")
+            if not failed:
+                import re as _re
+                m = _re.search(r'"failed_generation"\s*:\s*"((?:[^"\\]|\\.)*)"', str(e))
+                if m:
+                    failed = m.group(1).encode().decode("unicode_escape")
+            if not failed:
+                return False
+            gen = json.loads(failed) if isinstance(failed, str) else failed
+            name = str(gen.get("name") or "")
+            args = gen.get("arguments") or {}
+            if isinstance(args, str):
+                args = json.loads(args)
+            # Sanitize: strip hallucinated suffixes + null/empty args.
+            name = name.split("<")[0].split("|")[0].strip()
+            args = {k: v for k, v in args.items() if k and v not in ("", None)}
+            if not name:
+                return False
+            tc_id = f"rescued_{round_idx}_{int(time.time())}"
+            logger.info(f"Rescued malformed tool call -> {name}({args})")
+            messages.append({"role": "assistant", "tool_calls": [{
+                "id": tc_id, "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            }]})
+            result = await dispatch(self.ctx, name, args)
+            messages.append({
+                "role": "tool", "tool_call_id": tc_id,
+                "name": name, "content": result,
+            })
+            return True
+        except Exception as e2:  # noqa: BLE001
+            logger.debug(f"tool_use_failed rescue failed: {e2}")
+            return False
 
     # ------------------------------------------------------------------ #
     async def run_stream(

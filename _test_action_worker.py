@@ -195,9 +195,9 @@ async def main():
     worker = ActionWorker(client)
     msg = FakeMessage("eudora send a message saying hello", author, ch)
     t0 = time.monotonic()
-    ok = await worker.try_handle_text(msg, msg.clean_content)
+    note = await worker.try_handle_text(msg, msg.clean_content)
     dt = time.monotonic() - t0
-    check("worker handled (True)", ok)
+    check("worker handled (note)", isinstance(note, str) and "sent" in note, f"note={note!r}")
     check("action content sent once", len(ch.sent) == 1 and ch.sent[0][0] == "hello from worker", f"{ch.sent}")
     check("NO 'done'/reply sent", all(c[0] != "done" for c in ch.sent))
     check(f"human delay applied ({dt:.1f}s)", dt >= 1.5)
@@ -208,7 +208,7 @@ async def main():
     ch.sent.clear()
     msg2 = FakeMessage("how are you", author, ch)
     ok = await worker2.try_handle_text(msg2, msg2.clean_content)
-    check("chat -> False", ok is False)
+    check("chat -> None", ok is None)
     check("nothing sent", not ch.sent)
 
     print("== 5. non-owner permission gate ==")
@@ -233,12 +233,8 @@ async def main():
     ch.sent.clear()
     msg3 = FakeMessage("dm bob saying hi", author, ch)
     ok = await worker.try_handle_text(msg3, msg3.clean_content)
-    check("denied action -> not counted as performed",
-          not any(ok_ for _, ok_ in getattr(msg3, "_x", [])) or True)
-    # the tool itself never ran -> check the dispatch-level denial is recorded
-    # (performed contains entries only for allowed calls; denied returns early
-    #  so the list stays empty AND did_send stays False -> False)
-    check("denied run -> False (falls back to reply)", ok is False)
+    # denied tool never ran -> performed empty -> None -> normal reply continues
+    check("denied run -> None (falls back to reply)", ok is None)
 
     print("== 6. owner can run denied tools ==")
     import src.ai.owner_system as owners
@@ -252,7 +248,7 @@ async def main():
     print("== 7. voice path ==")
     vc = FakeVoiceChannel(300, "lounge", guild)
     ok = await worker.try_handle_voice(author.id, "eudora leave the vc", vc)
-    check("leave-vc short-circuits (False)", ok is False)
+    check("leave-vc short-circuits (None)", ok is None)
 
     set_script(worker, [
         ("tools", [("send_vc_text", {"channel_query": "here", "content": "on it"})]),
@@ -263,16 +259,41 @@ async def main():
     async def _fake_vc(ctx, q): return vc
     ae_voice._resolve_voice_channel = _fake_vc
     ok = await worker.try_handle_voice(author.id, "send that to the vc chat", vc)
-    check("voice action handled", ok)
+    check("voice action handled", isinstance(ok, str) and "sent" in ok, f"note={ok!r}")
     check("vc text sent", vc.sent and vc.sent[-1][0] == "on it", f"{vc.sent}")
     check("no spoken/done reply forwarded", all(c[0] != "sure thing" for c in vc.sent))
 
-    print("== 8. engine failure -> False, no crash ==")
+    print("== 7b. malformed tool-call rescue (the Groq 400 bug) ==")
+    class FakeBadReq(Exception):
+        def __init__(self):
+            super().__init__("400 tool_use_failed")
+            self.body = {"error": {"failed_generation":
+                json.dumps({"name": "send_message<|channel|>commentary",
+                            "arguments": {"channel_query": "here",
+                                          "content": "rescued call",
+                                          "application_id": None}})}}
+
+    class RescuePool(FakePool):
+        async def chat(self, **kw):
+            self.calls.append(kw)
+            if len(self.calls) == 1:
+                raise FakeBadReq()
+            return _Resp(_Msg(content="ok"))
+
+    gp._pool = RescuePool([])
+    worker._agent = None
+    ch.sent.clear()
+    note = await worker.try_handle_text(
+        FakeMessage("send a message", author, ch), "send a message")
+    check("rescued hallucinated tool name", isinstance(note, str))
+    check("rescued call actually ran", ch.sent and ch.sent[-1][0] == "rescued call", f"{ch.sent}")
+
+    print("== 8. engine failure -> None, no crash ==")
     set_script(worker, [("content", "done")])
     async def boom(**kw): raise RuntimeError("groq down")
     gp._pool.chat = boom
     ok = await worker.try_handle_text(FakeMessage("send hello", author, ch), "send hello")
-    check("engine crash -> False (reply path continues)", ok is False)
+    check("engine crash -> None (reply path continues)", ok is None)
 
     print()
     n = sum(1 for _, ok in passed if ok)

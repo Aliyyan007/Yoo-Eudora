@@ -67,6 +67,38 @@ async def join_voice(ctx: ToolContext, channel_query: str, self_mute: bool = Fal
     """Join a voice or stage channel and start the live voice-chat session."""
     ch = await _resolve_voice_channel(ctx, channel_query)
     if ch is None:
+        guild = ctx.require_guild()
+        # The model often passes a PERSON's name here ("join Mr. Alien") —
+        # resolve it as a member and use the VC they're sitting in.
+        try:
+            from src.action_engine.tools.members import resolve_member
+            mres = await resolve_member(ctx, channel_query)
+            if mres.get("id"):
+                member = guild.get_member(mres["id"])
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(mres["id"])
+                    except Exception:
+                        member = None
+                vs = getattr(member, "voice", None)
+                if vs is not None and getattr(vs, "channel", None):
+                    ch = vs.channel
+        except Exception:
+            pass
+    if ch is None and ctx.author_id:
+        # "join the vc" / "join my vc" with no resolvable target → the
+        # asker's own voice channel is almost always what they mean.
+        guild = ctx.require_guild()
+        asker = guild.get_member(ctx.author_id)
+        if asker is None:
+            try:
+                asker = await guild.fetch_member(ctx.author_id)
+            except Exception:
+                asker = None
+        vs = getattr(asker, "voice", None)
+        if vs is not None and getattr(vs, "channel", None):
+            ch = vs.channel
+    if ch is None:
         # "join my vc" means wherever the asker is — when the name lookup
         # fails, fall back to the channel that has people in it (only if
         # the query was vague or there's exactly one occupied channel)

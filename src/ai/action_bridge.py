@@ -79,6 +79,33 @@ _STRIP_PING_ROLES = {
     "send_multiple_gifs",
 }
 
+# Human-readable labels for performed tools — fed back into the main reply
+# context so the bot can acknowledge the action naturally.
+_ACTION_LABELS = {
+    "send_message": "sent the message", "send_dm": "sent the DM",
+    "send_vc_text": "sent the VC text", "send_gif": "sent the GIF",
+    "send_sticker": "sent the sticker", "send_multiple_gifs": "sent the GIFs",
+    "send_multiple_stickers": "sent the stickers",
+    "react_to_message": "reacted", "react_to_user_latest": "reacted",
+    "react_to_recent": "reacted to the messages",
+    "join_voice": "joined the voice channel", "move_voice": "moved voice channels",
+    "mute_self": "muted", "deafen_self": "deafened",
+    "delete_message": "deleted the message", "delete_last_message": "deleted the messages",
+    "edit_message": "edited the message", "cleanup_my_messages": "cleaned up the messages",
+    "use_slash_command": "ran the slash command", "bump_with_bot": "bumped",
+    "bump_all": "bumped with all bump bots", "schedule_message": "scheduled it",
+    "stop_scheduled": "stopped the scheduled task",
+    "change_nickname": "changed the nickname", "change_status": "changed the status",
+    "change_custom_status": "changed the status", "change_bio": "changed the bio",
+    "say_in_vc": "spoke in the VC", "speak_in_stage": "spoke on stage",
+}
+
+
+def _note_for(performed: list) -> Optional[str]:
+    """('send_message', True), ... -> 'sent the message; reacted' summary."""
+    done = [_ACTION_LABELS.get(n, n.replace("_", " ")) for n, ok in performed if ok]
+    return "; ".join(dict.fromkeys(done)) or None
+
 # Silently-delegated to the host's voice system — these SHOULD still work for
 # anyone (joining/muting are ordinary VC requests the host already honors).
 # leave_voice is unreachable: schema-removed in vendored registry.
@@ -190,22 +217,24 @@ class ActionWorker:
         return route
 
     # ------------------------------------------------------------------ #
-    async def try_handle_text(self, message, trigger_text: str) -> bool:
-        """True → an action ran (caller must NOT also reply). False →
-        normal reply path continues."""
+    async def try_handle_text(self, message, trigger_text: str) -> Optional[str]:
+        """Returns a human-readable summary of what was done (str) when an
+        action ran — the caller should inject it into the reply context and
+        continue to the normal reply path so the bot acknowledges it. None →
+        not an action / nothing performed → normal reply path continues."""
         if not _ENABLED or not self._ensure_ready():
-            return False
+            return None
         try:
             route = await self._classify(trigger_text)
         except Exception as e:
             logger.debug(f"[actions] classify failed: {e}")
-            return False
+            return None
         if route.kind != "action":
-            return False
+            return None
 
         key = (str(message.channel.id), str(message.author.id))
         if key in self._inflight:
-            return False
+            return None
         self._inflight.add(key)
         try:
             guild = message.guild
@@ -238,45 +267,51 @@ class ActionWorker:
                     )
             except asyncio.TimeoutError:
                 logger.warning(f"[actions] worker timed out for: '{trigger_text[:60]}'")
-                return bool(getattr(ctx, "performed", [])) or ctx.did_send
+                performed = getattr(ctx, "performed", [])
+                return _note_for(performed) or ("did what you asked" if ctx.did_send else None)
             logger.info(
                 f"[actions] text request '{trigger_text[:60]}' → performed="
                 f"{getattr(ctx, 'performed', [])} (agent said: {str(reply)[:60]!r} — suppressed)"
             )
             performed = getattr(ctx, "performed", [])
-            return ctx.did_send or any(ok for _, ok in performed)
+            note = _note_for(performed)
+            if note is None and ctx.did_send:
+                note = "did what you asked"
+            return note
         except Exception as e:
             logger.error(f"[actions] worker error: {e!r}")
-            return False
+            return None
         finally:
             self._inflight.discard(key)
 
     # ------------------------------------------------------------------ #
     async def try_handle_voice(self, user_id: int, transcript: str,
-                               voice_channel) -> bool:
-        """Same worker, fed by a VC transcript. Never touches leave-vc —
-        the pipeline's leave_cmd path already returned before this runs,
-        and leave_vc_score is re-checked here as a second line of defence."""
+                               voice_channel) -> Optional[str]:
+        """Same worker, fed by a VC transcript. Returns a summary note when
+        an action ran (caller injects it into the reply directive), else None.
+        Never touches leave-vc — the pipeline's leave_cmd path already
+        returned before this runs, and leave_vc_score is re-checked here as
+        a second line of defence."""
         if not _ENABLED or not self._ensure_ready():
-            return False
+            return None
         try:
             from src.voice.vc_intent import leave_vc_score
             if leave_vc_score(transcript) >= 0.5:
-                return False
+                return None
         except Exception:
             pass
         try:
             route = await self._classify(transcript)
         except Exception as e:
             logger.debug(f"[actions] voice classify failed: {e}")
-            return False
+            return None
         if route.kind != "action":
-            return False
+            return None
 
         guild = getattr(voice_channel, "guild", None)
         key = (str(getattr(voice_channel, "id", 0)), str(user_id))
         if key in self._inflight:
-            return False
+            return None
         self._inflight.add(key)
         try:
             member = guild.get_member(user_id) if guild else None
@@ -305,16 +340,20 @@ class ActionWorker:
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[actions] voice worker timed out: '{transcript[:60]}'")
-                return bool(getattr(ctx, "performed", []))
+                performed = getattr(ctx, "performed", [])
+                return _note_for(performed) or ("did what they asked" if ctx.did_send else None)
             logger.info(
                 f"[actions] voice request '{transcript[:60]}' → performed="
                 f"{getattr(ctx, 'performed', [])} (agent said: {str(reply)[:60]!r} — suppressed)"
             )
             performed = getattr(ctx, "performed", [])
-            return ctx.did_send or any(ok for _, ok in performed)
+            note = _note_for(performed)
+            if note is None and ctx.did_send:
+                note = "did what they asked"
+            return note
         except Exception as e:
             logger.error(f"[actions] voice worker error: {e!r}")
-            return False
+            return None
         finally:
             self._inflight.discard(key)
 

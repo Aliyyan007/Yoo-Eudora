@@ -40,14 +40,29 @@ async def use_slash_command(
     command_name: str,
     channel_query: str = "here",
     application_id: str | None = None,
+    bot_name: str | None = None,
 ) -> dict:
     """Use a slash command (e.g. /bump) in a channel.
 
     If `application_id` is provided, targets a specific bot's command
     (useful when multiple bots register the same /bump command).
+    `bot_name` resolves a bot by fuzzy display name — a bot's user ID
+    IS its application ID.
     """
     # Strip leading '/' if the agent included it (e.g. "/bump" -> "bump").
     command_name = command_name.lstrip("/").strip()
+
+    # "of Global Bot" — resolve a bot name to its application_id
+    # (a bot's user id equals its application id).
+    if not application_id and bot_name:
+        try:
+            from src.action_engine.tools.members import resolve_member
+            res = await resolve_member(ctx, bot_name)
+            if res.get("id"):
+                application_id = str(res["id"])
+        except Exception:
+            pass
+
     from src.action_engine.tools.messaging import _resolve_text_channel
     ch = await _resolve_text_channel(ctx, channel_query)
     if ch is None:

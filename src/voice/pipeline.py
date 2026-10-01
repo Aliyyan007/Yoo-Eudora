@@ -1399,13 +1399,19 @@ class VoicePipeline:
             logger.info("[voice] Sing failed — falling back to normal reply")
 
         # ── Outsider action worker — spoken action requests ("ping john in
-        # general", "react to that") run through the isolated engine and come
-        # back silent. leave_cmd already returned above (native path keeps
-        # it); the worker never sees it.
+        # general", "react to that") run through the isolated engine. When
+        # something was done we steer the reply to acknowledge it aloud —
+        # the user hears "done, pinged him" not the engine's "done" text.
+        # leave_cmd already returned above (native path keeps it).
         if getattr(self, "_action_cb", None):
             try:
-                if await self._action_cb(user_id, final_text):
-                    return
+                _act_note = await self._action_cb(user_id, final_text)
+                if _act_note:
+                    hints["directive"] = (
+                        (hints.get("directive") or "")
+                        + f" You just performed what they asked ({_act_note}). "
+                          "Acknowledge it briefly and naturally, like you just did it."
+                    ).strip()
             except Exception as e:
                 logger.debug(f"[voice] action worker error: {e}")
 

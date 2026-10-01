@@ -193,8 +193,8 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "list_slash_commands", "description": "List all available slash commands in a channel.",
         "parameters": {"type": "object", "properties": {"channel_query": {"type": "string"}}}}},
     {"type": "function", "function": {
-        "name": "use_slash_command", "description": "Use a slash command (e.g. /bump) in a channel. If multiple bots register the same command, pass application_id to target a specific bot.",
-        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by its application ID (use list_slash_commands to find it)"}}, "required": ["command_name"]}}},
+        "name": "use_slash_command", "description": "Use a slash command (e.g. /bump) in a channel. If multiple bots register the same command, pass bot_name or application_id to target a specific one.",
+        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by its application ID (use list_slash_commands to find it)"}, "bot_name": {"type": "string", "description": "Target a specific bot by fuzzy display name (e.g. 'Global Bot')"}}, "required": ["command_name"]}}},
     # --- Message management ---
     {"type": "function", "function": {
         "name": "delete_message", "description": "Delete the bot's own message by link or message_id.",
@@ -340,8 +340,8 @@ _CHAT_TOOL_SCHEMAS: list[dict] = [
         "name": "identify_bots", "description": "List all bot accounts in the server.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
-        "name": "use_slash_command", "description": "Use a slash command like /bump. Pass application_id to target a specific bot when multiple bots have the same command.",
-        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by application ID"}}, "required": ["command_name"]}}},
+        "name": "use_slash_command", "description": "Use a slash command like /bump. Pass bot_name or application_id to target a specific bot when multiple bots have the same command.",
+        "parameters": {"type": "object", "properties": {"command_name": {"type": "string"}, "channel_query": {"type": "string"}, "application_id": {"type": "string", "description": "Target a specific bot by application ID"}, "bot_name": {"type": "string", "description": "Target a specific bot by fuzzy display name"}}, "required": ["command_name"]}}},
     {"type": "function", "function": {
         "name": "delete_message", "description": "Delete your own message by link or ID.",
         "parameters": {"type": "object", "properties": {"message_link": {"type": "string"}, "channel_query": {"type": "string"}, "message_id": {"type": "string"}}}}},
@@ -557,9 +557,10 @@ async def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
     fn = _DISPATCH.get(name)
     if fn is None:
         return json.dumps({"error": f"Unknown tool: {name}"})
-    # Filter out empty-string keys that the model sometimes hallucinates.
+    # Filter out empty-string keys AND nulls that the model sometimes
+    # emits for optional params (null breaks Groq's schema validation).
     if args:
-        args = {k: v for k, v in args.items() if k != "" and v != ""}
+        args = {k: v for k, v in args.items() if k != "" and v != "" and v is not None}
     try:
         result = await fn(ctx, **(args or {}))
         if isinstance(result, (str, bytes)):

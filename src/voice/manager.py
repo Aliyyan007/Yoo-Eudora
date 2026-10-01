@@ -50,6 +50,7 @@ class VoiceManager:
         self._silence_nudge_threshold_s = 120  # 2 min silence → text members
         self._nudge_cooldown_s = 600           # 10 min between nudges
         self._empty_check_interval_s = 30      # check every 30s
+        self._join_grace_s = 150               # don't empty-leave within 2.5min of joining
         self._auto_join_chance = 0.15          # ~15% per tick — more engaged joining
         self._min_users_to_join = 1            # even 1 person = someone to talk to
 
@@ -177,17 +178,18 @@ class VoiceManager:
             return False
 
     async def _run_voice_action(self, client: discord.Client, user_id: int,
-                                text: str, channel) -> bool:
+                                text: str, channel) -> str | None:
         """Delegate a spoken action request to the outsider action worker.
-        Returns True when the engine actually performed something — the
-        pipeline then stays silent (no spoken confirmation)."""
+        Returns a short summary note when it performed something — the
+        pipeline injects it into the reply directive so she acknowledges
+        it aloud; None → not an action / failed → normal reply continues."""
         try:
             from ..ai.action_bridge import get_action_worker
             return await get_action_worker(client).try_handle_voice(
                 user_id, text, channel)
         except Exception as e:
             logger.debug(f"[voice] action worker call failed: {e!r}")
-            return False
+            return None
 
     @staticmethod
     def _log_pipeline_error(fut) -> None:
@@ -289,8 +291,13 @@ class VoiceManager:
 
         non_bot_members = [m for m in vc_channel.members if not m.bot and m.id != self._bot_id]
 
-        # Leave if empty
+        # Leave if empty — but give a join grace window first. Members can
+        # lag behind the connect event in the gateway cache (and people need
+        # a moment to actually show up after asking us to join).
         if len(non_bot_members) == 0:
+            joined_at = self._vc_joined_at.get(guild.id, 0)
+            if time.time() - joined_at < self._join_grace_s:
+                return
             await self._auto_leave(client, guild, "vc's empty, dipping out 👋")
             return
 

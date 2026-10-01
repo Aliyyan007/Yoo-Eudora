@@ -1969,12 +1969,13 @@ class AIPersonaClient(discord.Client):
             # ── Outsider action worker ────────────────────────────────────
             # The native regex commands above stayed untouched. Whatever they
             # DON'T cover (send/ping X in #Y, gifs, reactions, slash cmds,
-            # voice ops, ...) goes to the isolated action engine, which
-            # executes silently — no "done" message, no extra reply.
+            # voice ops, ...) goes to the isolated action engine. When it
+            # performs something we note it in the transcript — the normal
+            # reply then acknowledges the action naturally (no "done" text).
+            action_note = None
             if not cmd_type:
                 try:
-                    if await get_action_worker(self).try_handle_text(message, trigger_text):
-                        return
+                    action_note = await get_action_worker(self).try_handle_text(message, trigger_text)
                 except Exception as e:
                     logger.debug(f"[actions] text handoff failed: {e}")
 
@@ -2098,6 +2099,11 @@ class AIPersonaClient(discord.Client):
             # Add command context if a command was detected
             if cmd_type:
                 transcript = f"[COMMAND DETECTED: {cmd_type} — already handled, acknowledge naturally]\n" + transcript
+
+            # If the outsider action worker just performed what they asked,
+            # tell the reply engine so she acknowledges it like a person.
+            if action_note:
+                transcript = f"[ACTION DONE: you just {action_note} for them — acknowledge briefly and naturally, don't describe the mechanics]\n" + transcript
 
             # ── Add unanswered questions context ────────────────────────────
             # If there are unanswered questions from recent messages, prepend them
