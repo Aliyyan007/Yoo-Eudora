@@ -1,0 +1,35 @@
+# Render (Linux/Docker) — full dependency set INCLUDING voice.
+# discord-native-voice is installed separately in the Dockerfile with
+# --no-deps because its metadata requires discord.py-self>=2.2.0 while
+# the git build reports 2.2.0a0 (PEP 440: a0 < 2.2.0 → unresolvable).
+
+# Core
+discord.py-self @ git+https://github.com/dolfies/discord.py-self.git@2ba64a9a997e151a9c259984e0a179b1fdf4aff4
+python-dotenv>=1.0.0
+pyyaml>=6.0
+loguru>=0.7.0
+
+# AI
+groq>=0.11.0
+
+# Voice (real-time voice conversation)
+numpy>=1.24.0               # VAD/ASR audio buffers
+onnxruntime>=1.18.0         # Silero VAD
+sherpa-onnx>=1.10.0         # Streaming ASR (zipformer)
+opuslib-next>=1.3.0         # Opus decode/encode — needs libopus0 from Dockerfile
+soxr>=0.3.0                 # High-quality audio resampling 48k→16k
+scipy>=1.11.0               # Fallback anti-aliased resampling for ASR
+msgpack>=1.0.0              # Fish Audio TTS WebSocket protocol
+websockets>=12.0            # Fish Audio TTS WebSocket client
+huggingface_hub>=0.20.0     # Auto-download ASR models
+PyNaCl>=1.5.0               # Voice encryption fallback (regular VoiceClient path)
+davey>=0.1.0                # DAVE E2EE protocol — REQUIRED by Discord for voice (4017 without it)
+webrtcvad-wheels>=2.0.14    # C VAD ~50x cheaper than silero per frame; prebuilt wheels
+uvloop>=0.21.0              # Faster asyncio event loop on Linux (~20-40% cheaper overhead)
+
+# Utilities
+tenacity>=8.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0    # action engine typed settings (src/action_engine)
+rapidfuzz>=3.0.0            # action engine fuzzy name resolution
+aiohttp>=3.9.0              # for D1 REST API client
