@@ -30,7 +30,7 @@ import discord
 from loguru import logger
 
 from .llm import call_fast
-from .prompts import PERSONA
+from . import prompts
 from .channel_nature import get_cached_nature
 
 
@@ -391,7 +391,7 @@ class WelcomeSystem:
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the LLM."""
-        return f"""{PERSONA}
+        return f"""{prompts.PERSONA}
 
 You are deciding how to welcome a new member to a Discord server.
 
@@ -404,7 +404,7 @@ DECISION FRAMEWORK:
    - Prefer general/chat/main channels
    - Avoid rules/announcements/bot-command channels
    - Choose where the greeting will be seen and responded to
-3. WHAT MESSAGE? Generate a greeting in Eudora's voice:
+3. WHAT MESSAGE? Generate a greeting in {prompts._ACTIVE.name.capitalize()}'s voice:
    - Casual, warm, not overly enthusiastic
    - Reference the server name or vibe if known
    - Maybe ask a question to start conversation

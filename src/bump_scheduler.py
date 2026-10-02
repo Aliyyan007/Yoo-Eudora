@@ -15,6 +15,8 @@ are ready to bump, and bumps only those whose cooldown has expired.
 This maximizes bump frequency without wasting commands on cooling bots.
 """
 import asyncio
+import json
+import os
 import random
 import time
 from typing import List, Dict, Optional, Callable, Tuple
@@ -66,18 +68,43 @@ class BumpScheduler:
         self._cache_refresh_interval = 300  # Refresh command cache every 5 min
 
         # Per-bot last bump time tracking (bot_name -> timestamp)
-        self._last_bump_time: Dict[str, float] = {}
+        # PERSISTED to data/bump_state.json — persona rotation rebuilds this
+        # scheduler under a new account, but bump cooldowns are server-wide
+        # and must NOT reset when the active persona switches.
+        self._last_bump_time: Dict[str, float] = self._load_state()
         # Per-bot next eligible bump time (bot_name -> timestamp)
         self._next_bump_time: Dict[str, float] = {}
 
         # Initialize: all bots eligible immediately (first run)
         now = time.time()
         for name, _app_id, _cooldown in self.bump_bots:
-            self._last_bump_time[name] = 0
+            self._last_bump_time.setdefault(name, 0)
             self._next_bump_time[name] = now  # ready immediately on first run
 
         # Track recent bumps for post-bump callback (only fire once per cycle)
         self._bumps_this_cycle = 0
+
+    # ── persisted cooldown state (survives restarts + persona rotation) ──
+    _STATE_FILE = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "data", "bump_state.json")
+
+    def _load_state(self) -> Dict[str, float]:
+        try:
+            with open(self._STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {k: float(v) for k, v in data.get("last_bump", {}).items()}
+        except Exception:
+            return {}
+
+    def _save_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._STATE_FILE), exist_ok=True)
+            tmp = self._STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"last_bump": self._last_bump_time}, f)
+            os.replace(tmp, self._STATE_FILE)
+        except Exception as e:
+            logger.debug(f"Bump state save failed: {e}")
 
     async def start(self):
         """Start the per-bot bump loop."""
@@ -160,6 +187,7 @@ class BumpScheduler:
 
             if success:
                 self._last_bump_time[bot_name] = time.time()
+                self._save_state()
                 next_ready = self._bot_ready_time(bot_name, cooldown)
                 next_in_h = (next_ready - time.time()) / 3600
                 logger.info(f"{bot_name} bumped. Next eligible in {next_in_h:.1f}h")
@@ -277,6 +305,7 @@ class BumpScheduler:
 
             if success:
                 self._last_bump_time[bot_name] = time.time()
+                self._save_state()
 
             # Human-like delay between bumps (5-15 seconds)
             if i < len(self.bump_bots):

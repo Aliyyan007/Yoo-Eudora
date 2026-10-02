@@ -34,6 +34,8 @@ from .discord_client import AIPersonaClient
 from .bump_scheduler import BumpScheduler, DEFAULT_BUMP_BOTS
 from .proactive_messaging import ProactiveMessenger
 from .persona import load_persona
+from .persona.manager import PersonaSupervisor
+from .persona.profiles import PROFILES, get_profile
 from .ai import llm
 
 
@@ -113,70 +115,74 @@ async def main():
     # Load persona from YAML config
     persona = load_persona(YAML_CONFIG)
 
-    # Initialize Discord client
-    # discord.py-self (user accounts) doesn't use Intents like bot accounts do
-    client = AIPersonaClient()
+    # ── Client factory: builds + fully wires one persona's client ──────────
+    async def build_client(profile):
+        """Create a wired AIPersonaClient for `profile` and return
+        (client, client.start(token) coroutine). Every subsystem that holds
+        a client reference is rebuilt per activation so it can't straddle
+        two accounts; server-wide state (ping cooldowns, bump timers,
+        engagement walls) lives in process-level stores and persists."""
+        token = (os.getenv(profile.token_env) or "").strip()
+        if not token:
+            raise RuntimeError(f"{profile.token_env} not set for {profile.id}")
 
-    # Initialize proactive messenger
-    proactive = ProactiveMessenger(
-        client=client,
-        channel_ids=config["text_channel_ids"],
-        ping_role_id=config["ping_role_id"],
-        dead_chat_threshold_min=int(os.getenv("DEAD_CHAT_THRESHOLD_MIN", "20")),
-        check_interval_min=int(os.getenv("PROACTIVE_CHECK_MIN", "5")),
-        proactive_interval_min=(
-            int(os.getenv("PROACTIVE_MIN_MIN", "40")),
-            int(os.getenv("PROACTIVE_MAX_MIN", "80")),
-        ),
-        auto_chat_chance=float(os.getenv("AUTO_CHAT_CHANCE", "0.10")),
-    )
-    client.proactive_messenger = proactive
-    logger.info("Proactive messenger initialized")
+        client = AIPersonaClient(persona=profile)
 
-    # Initialize bump scheduler (API-based, no browser!)
-    async def post_bump_callback():
-        """Called after each bump batch to trigger text channel activity."""
-        await proactive.send_post_bump_messages()
+        proactive = ProactiveMessenger(
+            client=client,
+            channel_ids=config["text_channel_ids"],
+            ping_role_id=config["ping_role_id"],
+            dead_chat_threshold_min=int(os.getenv("DEAD_CHAT_THRESHOLD_MIN", "20")),
+            check_interval_min=int(os.getenv("PROACTIVE_CHECK_MIN", "5")),
+            proactive_interval_min=(
+                int(os.getenv("PROACTIVE_MIN_MIN", "40")),
+                int(os.getenv("PROACTIVE_MAX_MIN", "80")),
+            ),
+            auto_chat_chance=float(os.getenv("AUTO_CHAT_CHANCE", "0.10")),
+        )
+        client.proactive_messenger = proactive
 
-    bump_scheduler = BumpScheduler(
-        client=client,
-        channel_id=config["bump_channel_id"],
-        base_interval_hours=config["base_interval"],
-        jitter_hours=config["jitter_hours"],
-        post_bump_callback=post_bump_callback,
-    )
-    client.bump_scheduler = bump_scheduler
-    logger.info("Bump scheduler initialized (API-based, no browser)")
+        async def post_bump_callback():
+            await proactive.send_post_bump_messages()
 
-    # Start bump scheduler in background
-    asyncio.create_task(bump_scheduler.start())
+        bump_scheduler = BumpScheduler(
+            client=client,
+            channel_id=config["bump_channel_id"],
+            base_interval_hours=config["base_interval"],
+            jitter_hours=config["jitter_hours"],
+            post_bump_callback=post_bump_callback,
+        )
+        client.bump_scheduler = bump_scheduler
+        client._spawn(bump_scheduler.start())
 
-    # Auto-join server if invite is configured
-    if config["server_invite"]:
-        async def join_server():
-            await client.wait_until_ready()
-            invite_code = config["server_invite"].split("/")[-1]
-            try:
-                # Already inside? Skip the join attempt entirely — Discord
-                # rejects accept_invite for existing members and it just
-                # logs noise every restart.
+        # Auto-join server if invite is configured (each account joins once)
+        if config["server_invite"]:
+            async def join_server():
+                await client.wait_until_ready()
+                invite_code = config["server_invite"].split("/")[-1]
                 try:
-                    invite = await client.fetch_invite(invite_code)
-                    gid = getattr(getattr(invite, "guild", None), "id", None)
-                    if gid and any(g.id == gid for g in client.guilds):
-                        return
-                except Exception:
-                    pass
-                logger.info(f"Attempting to join server with invite code: {invite_code}")
-                await client.accept_invite(invite_code)
-                logger.info(f"Successfully joined server with invite code: {invite_code}")
-            except Exception as e:
-                logger.warning(f"Could not join server (may already be a member): {e}")
-        asyncio.create_task(join_server())
+                    try:
+                        invite = await client.fetch_invite(invite_code)
+                        gid = getattr(getattr(invite, "guild", None), "id", None)
+                        if gid and any(g.id == gid for g in client.guilds):
+                            return
+                    except Exception:
+                        pass
+                    logger.info(f"[{profile.id}] Attempting to join server: {invite_code}")
+                    await client.accept_invite(invite_code)
+                    logger.info(f"[{profile.id}] Joined server: {invite_code}")
+                except Exception as e:
+                    logger.warning(f"[{profile.id}] Could not join server (may already be a member): {e}")
+            client._spawn(join_server())
 
-    # Run the bot
-    logger.info("Connecting to Discord...")
-    await client.start(config["token"])
+        return client, client.start(token)
+
+    supervisor = PersonaSupervisor(build_client)
+    logger.info(
+        f"Connecting to Discord — {len(supervisor._accounts)} persona "
+        "account(s) configured, rotation active"
+    )
+    await supervisor.run()
 
 
 def run():

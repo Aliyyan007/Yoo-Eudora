@@ -22,7 +22,7 @@ import os
 import random
 import time
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 import discord
 from loguru import logger
@@ -58,6 +58,9 @@ class EngagementLog:
         # revive/auto-chat/post-bump/proactive/re-engage each had own timers,
         # which is how walls formed)
         self._last_send: Dict[str, float] = {}
+        # ALL persona account ids — engagement walls and cooldowns are
+        # server-wide, so another persona's unanswered posts count too.
+        self._own_ids: Set[int] = set()
 
         # ── tunables (env) ──
         self.stale_s = _env_int("ENGAGE_STALE_MINUTES", 15) * 60
@@ -78,6 +81,16 @@ class EngagementLog:
         self.max_deletes_per_sweep = _env_int("ENGAGE_MAX_DELETES", 3)
         # min gap between sweeps per channel
         self.sweep_cooldown_s = 120
+
+    def register_own_ids(self, ids) -> None:
+        """Register every persona account's user id — called on activation so
+        walls count engagement posts from ALL personas (not just this one),
+        keeping the limit genuinely server-wide across rotation."""
+        self._own_ids = {int(i) for i in ids if i}
+
+    def _own(self, author_id, bot_id) -> bool:
+        """True if a message was authored by ANY of our persona accounts."""
+        return author_id == bot_id or author_id in self._own_ids
 
     # ── recording ────────────────────────────────────────────────────────
     def record(self, ch_id: str, msg: discord.Message, kind: str = "engage") -> None:
@@ -114,10 +127,10 @@ class EngagementLog:
             now = time.time()
             human_tss = sorted(
                 m.created_at.timestamp() for m in history_msgs
-                if not m.author.bot and m.author.id != bot_id
+                if not m.author.bot and not self._own(m.author.id, bot_id)
             )
             for m in history_msgs:
-                if m.author.id != bot_user.id or m.id in tracked_ids:
+                if not self._own(m.author.id, bot_user.id) or m.id in tracked_ids:
                     continue
                 # Same engagement-only rule as the sweep — conversation
                 # replies and interacted messages never count toward the wall
@@ -202,8 +215,8 @@ class EngagementLog:
                     continue
                 if m.author.bot:
                     continue
-                if bot_id is not None and m.author.id == bot_id:
-                    continue  # our own message — not a human response
+                if bot_id is not None and self._own(m.author.id, bot_id):
+                    continue  # our own message (any persona) — not a human response
                 # direct reply to this specific message
                 ref = getattr(m, "reference", None)
                 if ref is not None and getattr(ref, "message_id", None) == rec["msg_id"]:
@@ -264,7 +277,7 @@ class EngagementLog:
         if hist:
             last_human_ts = max(
                 (m.created_at.timestamp() for m in hist
-                 if not m.author.bot and m.author.id != bot_id),
+                 if not m.author.bot and not self._own(m.author.id, bot_id)),
                 default=0.0,
             )
         else:
@@ -294,10 +307,10 @@ class EngagementLog:
         tracked_ids = {rec["msg_id"] for rec in tracked}
         human_tss = sorted(
             m.created_at.timestamp() for m in hist
-            if not m.author.bot and m.author.id != bot_id
+            if not m.author.bot and not self._own(m.author.id, bot_id)
         )
         for m in hist:
-            if bot_user is None or m.author.id != bot_user.id:
+            if bot_user is None or not self._own(m.author.id, bot_user.id):
                 continue
             if m.id in tracked_ids:
                 continue
@@ -330,7 +343,10 @@ class EngagementLog:
         for ts, rec, msg in stale_all:
             age = now - ts
             very_old = age > self.stale_s * 3
-            if deleted < self.max_deletes_per_sweep and \
+            # Foreign persona's message — counts toward the wall, but this
+            # account can't delete it (it'll clean its own on rotation).
+            can_delete = getattr(getattr(msg, "author", None), "id", None) == bot_id
+            if deleted < self.max_deletes_per_sweep and can_delete and \
                     (total_unanswered - deleted > self.max_unanswered or very_old):
                 try:
                     await msg.delete()

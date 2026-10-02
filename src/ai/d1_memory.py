@@ -24,6 +24,26 @@ from loguru import logger
 # Import the original JSON-backed memory as a fallback.
 from . import memory as _json_fallback
 
+# ── Persona memory isolation ────────────────────────────────────────────────
+# User-scoped keys (facts, profiles, memorable chats) are namespaced by the
+# ACTIVE persona so one persona's private memory never bleeds into another's.
+# Channel-scoped data (topics, styles, lessons, instructions) stays shared —
+# that's public server context every persona can see.
+_NS = ""
+
+
+def set_namespace(persona_id: str) -> None:
+    """Scope user-memory keys to the active persona (rotation calls this)."""
+    global _NS
+    _NS = f"{persona_id}:" if persona_id else ""
+
+
+def _u(user_id) -> str:
+    """Persona-namespace a user id. Cached lookups and stored rows all key
+    off the result, so each persona's memory is fully independent."""
+    return f"{_NS}{user_id}"
+
+
 # Lazy import of the D1 client (created in parallel at src/ai/d1_client.py).
 _d1_client = None
 
@@ -221,6 +241,7 @@ async def get_user_memory_text_async(user_id: str, username: str) -> str:
 
 def get_user_memory_text(user_id: str, username: str) -> str:
     """Sync wrapper — drop-in replacement for memory.get_user_memory_text."""
+    user_id = _u(user_id)
     try:
         return _run_async(get_user_memory_text_async(user_id, username))
     except Exception:
@@ -309,6 +330,7 @@ async def update_user_memory_async(user_id: str, username: str, new_facts: list)
 
 def update_user_memory(user_id: str, username: str, new_facts: list):
     """Sync wrapper — drop-in replacement for memory.update_user_memory."""
+    user_id = _u(user_id)
     try:
         return _run_async(update_user_memory_async(user_id, username, new_facts))
     except Exception:
@@ -405,6 +427,7 @@ async def update_user_profile_async(user_id: str, username: str, field: str, val
 
 def update_user_profile(user_id: str, username: str, field: str, value: str):
     """Sync wrapper — drop-in replacement for memory.update_user_profile."""
+    user_id = _u(user_id)
     try:
         return _run_async(update_user_profile_async(user_id, username, field, value))
     except Exception:
@@ -471,6 +494,7 @@ async def get_user_profile_async(user_id: str) -> dict:
 
 def get_user_profile(user_id: str) -> dict:
     """Sync wrapper — drop-in replacement for memory.get_user_profile."""
+    user_id = _u(user_id)
     try:
         return _run_async(get_user_profile_async(user_id))
     except Exception:
@@ -512,6 +536,7 @@ async def get_all_user_facts_async(user_id: str) -> str:
 
 def get_all_user_facts(user_id: str) -> str:
     """Sync wrapper — drop-in replacement for memory.get_all_user_facts."""
+    user_id = _u(user_id)
     try:
         return _run_async(get_all_user_facts_async(user_id))
     except Exception:
@@ -700,6 +725,7 @@ async def add_memorable_chat_async(user_id: str, username: str, chat_summary: st
 
 def add_memorable_chat(user_id: str, username: str, chat_summary: str, channel_id: str = ""):
     """Sync wrapper — drop-in replacement for memory.add_memorable_chat."""
+    user_id = _u(user_id)
     try:
         return _run_async(add_memorable_chat_async(user_id, username, chat_summary, channel_id))
     except Exception:
@@ -728,6 +754,7 @@ async def get_memorable_chats_async(user_id: str) -> List[dict]:
 
 def get_memorable_chats(user_id: str) -> List[dict]:
     """Sync wrapper — drop-in replacement for memory.get_memorable_chats."""
+    user_id = _u(user_id)
     try:
         return _run_async(get_memorable_chats_async(user_id))
     except Exception:

@@ -156,9 +156,17 @@ class AIPersonaClient(discord.Client):
     Simulates a real human user with moods, memory, and human-like behavior.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, persona=None, **kwargs):
         # Stealth: don't chunk guilds at startup (minimizes API traffic)
         super().__init__(chunk_guilds_at_startup=False, **kwargs)
+
+        # Which persona this client instance is running as. Rotation creates
+        # a fresh client per account — everything below is per-persona state.
+        if persona is None:
+            from .persona.runtime import active as _active_persona
+            persona = _active_persona()
+        self.persona = persona
+        self._pending_processed = False   # pending catch-up runs once per activation
 
         # Mood engine
         self.mood_engine = MoodEngine()
@@ -268,6 +276,9 @@ class AIPersonaClient(discord.Client):
         self._sending_in_channel: Set[str] = set()
         # Per-channel message queue (messages that arrive while bot is typing)
         self._pending_messages: Dict[str, deque] = {}
+        # Long-lived tasks spawned for this activation — cancelled on
+        # teardown so rotation never leaves loops running on a dead client
+        self._spawned_tasks: list = []
 
     # ── Daily cap management ───────────────────────────────────────────────
 
@@ -323,6 +334,50 @@ class AIPersonaClient(discord.Client):
 
     # ── Event handlers ─────────────────────────────────────────────────────
 
+    def _spawn(self, coro) -> asyncio.Task:
+        """Create a task tracked for teardown — rotation calls teardown() so
+        loops never leak onto a closed client."""
+        t = asyncio.create_task(coro)
+        self._spawned_tasks.append(t)
+        return t
+
+    async def teardown(self):
+        """Cancel this persona's long-lived tasks before client.close().
+        Called by the rotation supervisor before the next account connects."""
+        for t in self._spawned_tasks:
+            t.cancel()
+        for t in self._spawned_tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                cur = asyncio.current_task()
+                if cur is not None and cur.cancelling() > 0:
+                    raise          # WE were cancelled — don't swallow it
+            except Exception:
+                pass
+        self._spawned_tasks.clear()
+        # Leave voice cleanly — a stranded voice connection would keep the
+        # account visibly in-call while another persona is live
+        try:
+            if self.voice_manager:
+                for gid in list(getattr(self.voice_manager, "_pipelines", {}) or {}):
+                    try:
+                        await self.voice_manager.leave_voice(self, gid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Proactive messenger holds a running loop against this client
+        try:
+            if self.proactive_messenger:
+                stop = getattr(self.proactive_messenger, "stop", None)
+                if stop:
+                    res = stop()
+                    if asyncio.iscoroutine(res):
+                        await res
+        except Exception:
+            pass
+
     async def on_ready(self):
         """Called when the bot is logged in and ready."""
         logger.info(f"Logged in as {self.user.name} (ID: {self.user.id})")
@@ -335,16 +390,10 @@ class AIPersonaClient(discord.Client):
         self.engagement.start()
 
         # ── Set up persona profile (bio + display name) ───────────────────
-        # Update the Discord profile to match the Eudora Edward persona
+        # Update the Discord profile to match the ACTIVE persona
         try:
-            from .persona import load_persona
-            import yaml, os
-            _cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "config.yaml")
-            with open(_cfg_path, "r", encoding="utf-8") as _f:
-                _cfg = yaml.safe_load(_f) or {}
-            _persona = _cfg.get("persona", {})
-            _bio = _persona.get("bio", "")
-            _display_name = _persona.get("full_name", _persona.get("name", ""))
+            _bio = self.persona.bio or ""
+            _display_name = self.persona.full_name or self.persona.name
 
             # Update display name (global name) and bio
             if _bio or _display_name:
@@ -376,10 +425,10 @@ class AIPersonaClient(discord.Client):
             bio = getattr(profile, "bio", "") or ""
             pronouns = getattr(profile, "pronouns", "") or ""
             self.my_profile_text = f"My display name: {self.user.display_name}\n"
-            self.my_profile_text += f"My name: Eudora Edward (goes by Eudora)\n"
-            self.my_profile_text += f"My age: 22\n"
-            self.my_profile_text += f"My location: London, England\n"
-            self.my_profile_text += f"My heritage: Half-French, British\n"
+            self.my_profile_text += f"My name: {self.persona.full_name} (goes by {self.persona.name.capitalize()})\n"
+            self.my_profile_text += f"My age: {self.persona.age}\n"
+            self.my_profile_text += f"My location: {self.persona.location}\n"
+            self.my_profile_text += f"My heritage: {self.persona.heritage}\n"
             if pronouns:
                 self.my_profile_text += f"My pronouns: {pronouns}\n"
             if bio:
@@ -388,7 +437,7 @@ class AIPersonaClient(discord.Client):
         except Exception as e:
             logger.warning(f"Failed to fetch own profile: {e}")
             self.my_profile_text = f"My display name: {self.user.display_name}\n"
-            self.my_profile_text += f"My name: Eudora Edward (goes by Eudora)\n"
+            self.my_profile_text += f"My name: {self.persona.full_name} (goes by {self.persona.name.capitalize()})\n"
 
         # Scan all guilds: discover channels, fetch rules, learn styles
         for guild in self.guilds:
@@ -396,19 +445,24 @@ class AIPersonaClient(discord.Client):
 
         # Start proactive messaging
         if self.proactive_messenger:
-            asyncio.create_task(self.proactive_messenger.start_monitoring())
-            asyncio.create_task(self.proactive_messenger.proactive_loop())
+            self._spawn(self.proactive_messenger.start_monitoring())
+            self._spawn(self.proactive_messenger.proactive_loop())
 
         # Start periodic status/bio updates
-        asyncio.create_task(self._status_update_loop())
+        self._spawn(self._status_update_loop())
 
         # Start re-engagement loop (check if no one replied to bot's messages)
-        asyncio.create_task(self._re_engagement_loop())
+        self._spawn(self._re_engagement_loop())
 
         # ── Initialize voice manager (real-time voice conversation) ────────
         try:
             fish_api_key = os.getenv("FISH_AUDIO_API_KEY", "")
-            fish_voice_id = os.getenv("FISH_AUDIO_VOICE_ID", "")
+            # Per-persona voice (FISH_AUDIO_VOICE_ID_ROWAN etc.) with the
+            # shared default as fallback — each account sounds like itself
+            fish_voice_id = (
+                os.getenv(f"FISH_AUDIO_VOICE_ID_{self.persona.id.upper()}", "")
+                or os.getenv("FISH_AUDIO_VOICE_ID", "")
+            )
             if fish_api_key and fish_voice_id and VoiceManager is not None:
                 tts_config = TTSConfig(
                     api_key=fish_api_key,
@@ -422,7 +476,7 @@ class AIPersonaClient(discord.Client):
                     bot_id=self.user.id,
                     on_transcript_stream=self._stream_voice_transcript,
                 )
-                asyncio.create_task(self.voice_manager.monitor_vcs(self))
+                self._spawn(self.voice_manager.monitor_vcs(self))
                 logger.info("Voice manager initialized (Fish Audio TTS + VAD + ASR)")
             else:
                 if VoiceManager is None:
@@ -432,7 +486,54 @@ class AIPersonaClient(discord.Client):
         except Exception as e:
             logger.warning(f"Voice manager init failed: {e}")
 
+        # ── Persona registry + pending catch-up ──────────────────────────
+        try:
+            from .persona import runtime as _prt
+            _prt.register_self(self.user.id, self.user.display_name)
+            get_engagement_log().register_own_ids(_prt.own_user_ids())
+            if not self._pending_processed:
+                self._pending_processed = True
+                self._spawn(self._process_pending_interactions())
+        except Exception as e:
+            logger.debug(f"[persona] registry/pending init failed: {e}")
+
         logger.info("Bot is ready and listening for messages.")
+
+    async def _process_pending_interactions(self):
+        """Catch up on messages that were aimed at THIS persona while it was
+        offline (mentions/replies/name-drops recorded by whichever persona was
+        active at the time). Fresh ones get a natural reply-quote; older ones
+        just get marked handled so they never resurface."""
+        from .persona import runtime as prt
+        try:
+            await asyncio.sleep(8)   # let the connection settle
+            fresh = prt.fresh_pending(self.persona.id)
+            stale = prt.stale_pending(self.persona.id)
+            if not fresh and not stale:
+                return
+            # Old ones are silently retired — replying hours later is weird.
+            prt.mark_pending_handled(self.persona.id,
+                                     [it["message_id"] for it in stale])
+            # Per-channel cap — never dump a backlog
+            by_channel = {}
+            for it in fresh:
+                by_channel.setdefault(it["channel_id"], []).append(it)
+            for ch, items in by_channel.items():
+                for it in items[-prt.pending_reply_cap():]:
+                    try:
+                        channel = self.get_channel(it["channel_id"])
+                        if channel is None:
+                            continue
+                        msg = await channel.fetch_message(it["message_id"])
+                        await self._on_message_impl(msg)
+                        prt.mark_pending_handled(self.persona.id,
+                                                 [it["message_id"]])
+                        await asyncio.sleep(random.uniform(4, 10))
+                    except Exception as e:
+                        logger.debug(f"[persona] pending {it['message_id']} skipped: {e}")
+            logger.info(f"[persona] pending catch-up done ({len(fresh)} fresh, {len(stale)} stale)")
+        except Exception as e:
+            logger.debug(f"[persona] pending processing failed: {e}")
 
     async def _status_update_loop(self):
         """Periodically update Discord status and bio."""
@@ -604,7 +705,7 @@ class AIPersonaClient(discord.Client):
             # Record the cleaned full reply in conversation history
             full = clean_for_speech("".join(pieces))
             if full.strip():
-                history.append(("Eudora", full))
+                history.append((self.persona.name.capitalize(), full))
                 logger.info(f"[voice] Streamed reply to {username}: {full[:80]}")
         except Exception as e:
             logger.error(f"Voice stream handler error: {e}")
@@ -684,7 +785,7 @@ class AIPersonaClient(discord.Client):
 
             if response:
                 # Record our reply in the conversation history
-                history.append(("Eudora", response))
+                history.append((self.persona.name.capitalize(), response))
                 logger.info(f"[voice] LLM response to {username}: {response[:80]}")
                 return response
             return ""
@@ -896,6 +997,53 @@ class AIPersonaClient(discord.Client):
 
         # Define ch_id early (needed by tracking systems below)
         ch_id = str(message.channel.id)
+
+        # ── Cross-persona pending capture ─────────────────────────────────
+        # A message aimed at an OFFLINE persona (mention, reply to their
+        # message, or their name in text) gets recorded for them — when that
+        # persona rotates in, it picks these up and acknowledges naturally.
+        try:
+            from .persona import runtime as _prt
+            from .persona.profiles import PROFILES as _PROFILES
+            if not message.author.bot:
+                others = _prt.other_persona_ids()
+                hit_kind = hit_pid = None
+                ref = getattr(message, "reference", None)
+                ref_author = getattr(getattr(ref, "resolved", None), "author", None)
+                _txt = (message.clean_content or "").lower()
+                # id-based: mentions + replies to an offline persona's msgs
+                for other_id, pid in others.items():
+                    if any(u.id == other_id for u in message.mentions):
+                        hit_kind, hit_pid = "mention", pid
+                        break
+                    if ref_author is not None and ref_author.id == other_id:
+                        hit_kind, hit_pid = "reply", pid
+                        break
+                # name-based: works even before that persona's first login
+                # (no registry id yet) — any offline persona's casual name
+                # appearing in the message is worth recording for them.
+                if hit_kind is None:
+                    for pid, prof in _PROFILES.items():
+                        if pid == self.persona.id:
+                            continue
+                        _n = prof.name
+                        if _n and len(_n) >= 3 and re.search(
+                                r"\b" + re.escape(_n) + r"\b", _txt):
+                            hit_kind, hit_pid = "name", pid
+                            break
+                if hit_kind:
+                    _prt.add_pending(
+                        hit_pid,
+                        guild_id=getattr(getattr(message, "guild", None), "id", 0),
+                        channel_id=message.channel.id,
+                        message_id=message.id,
+                        author_id=message.author.id,
+                        author_name=message.author.display_name,
+                        text=message.clean_content,
+                        kind=hit_kind,
+                    )
+        except Exception:
+            pass
 
         # ── User behavior tracking (algorithmic) ────────────────────────────
         # Track engagement and classify message value for memory storage
@@ -1202,7 +1350,8 @@ class AIPersonaClient(discord.Client):
             # bot from replying to "hey daniel how are you" in a sticky convo.
             our_name = self.user.display_name.lower()
             our_username = self.user.name.lower()
-            msg_has_our_name = (our_name in txt_low or our_username in txt_low or "eudora" in txt_low)
+            our_names_all = {our_name, our_username, self.persona.name.lower()}
+            msg_has_our_name = any(n in txt_low for n in our_names_all)
             msg_has_other_name = False
             if hasattr(message.channel, 'guild') and message.channel.guild:
                 # Check recent chatters in cache
@@ -1223,7 +1372,7 @@ class AIPersonaClient(discord.Client):
 
                 for name in recent_names:
                     # Use word boundary check to avoid partial matches
-                    if len(name) >= 3 and name != our_name and name != our_username and name != "eudora":
+                    if len(name) >= 3 and name not in our_names_all:
                         if re.search(r'\b' + re.escape(name) + r'\b', txt_low):
                             msg_has_other_name = True
                             logger.debug(f"Name match: '{name}' found in message")
@@ -1242,7 +1391,7 @@ class AIPersonaClient(discord.Client):
                     if match:
                         # Extract the name and check it's not us
                         name_found = match.group(2) if match.lastindex >= 2 else match.group(1)
-                        if name_found.lower() not in (our_name, our_username, "eudora"):
+                        if name_found.lower() not in our_names_all:
                             msg_has_other_name = True
                             logger.debug(f"Addressing pattern matched: '{name_found}'")
                             break
@@ -1309,7 +1458,7 @@ class AIPersonaClient(discord.Client):
         our_name_lower = self.user.display_name.lower()
         our_username_lower = self.user.name.lower()
         # Use word boundary matching to avoid false positives
-        name_patterns = [our_name_lower, our_username_lower, "eudora"]
+        name_patterns = [our_name_lower, our_username_lower, self.persona.name.lower()]
         name_patterns = list(set([p for p in name_patterns if len(p) >= 3]))
         for name_pat in name_patterns:
             if re.search(r'\b' + re.escape(name_pat) + r'\b', txt_low):
@@ -2075,7 +2224,7 @@ class AIPersonaClient(discord.Client):
             lookahead = []
             try:
                 now_ts = time.time()
-                our_names = {self.user.display_name.lower(), self.user.name.lower(), "eudora"}
+                our_names = {self.user.display_name.lower(), self.user.name.lower(), self.persona.name.lower()}
                 for m in list(self.history_cache.get(ch_id, []))[-10:]:
                     if m.id == message.id or m.author == self.user or m.author.bot:
                         continue

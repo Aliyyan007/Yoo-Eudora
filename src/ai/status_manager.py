@@ -113,6 +113,16 @@ def generate_status(mood: str, time_of_day: Optional[str] = None) -> str:
     if time_of_day is None:
         time_of_day = get_time_of_day()
 
+    # Persona-flavored statuses sometimes win so each account's presence
+    # reads like THAT person, not a shared generic vibe
+    try:
+        from ..persona.runtime import active as _active_persona
+        _ps = _active_persona().statuses
+        if _ps and random.random() < 0.3:
+            return random.choice(_ps)
+    except Exception:
+        pass
+
     if random.random() < 0.6:
         # Mood-based status
         statuses = MOOD_STATUSES.get(mood, MOOD_STATUSES["chill"])
@@ -197,12 +207,22 @@ class StatusManager:
 
     async def update_bio(self, client: discord.Client):
         """
-        Update the Discord bio (monthly rotation).
+        Update the Discord bio. Eudora keeps her monthly rotation; other
+        personas hold their pinned profile bio (rotating generic bios onto
+        a different person would break identity).
         """
         if not self.should_update_bio():
             return
 
-        new_bio = get_current_month_bio()
+        try:
+            from ..persona.runtime import active as _active_persona
+            _p = _active_persona()
+        except Exception:
+            _p = None
+        if _p is not None and _p.id != "eudora":
+            new_bio = _p.bio or ""
+        else:
+            new_bio = get_current_month_bio()
 
         # Don't update if same as current
         if new_bio == self._current_bio:

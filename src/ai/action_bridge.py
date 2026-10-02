@@ -538,4 +538,15 @@ def get_action_worker(client) -> ActionWorker:
     global _worker
     if _worker is None:
         _worker = ActionWorker(client)
+    elif _worker.client is not client:
+        # Persona rotation — rebind the worker to the NEW account's client so
+        # tools never run through a closed connection. Inflight state and the
+        # scheduler singleton survive (they're process-wide).
+        _worker.client = client
+        try:
+            from src.action_engine.core import scheduler as _sched
+            if _sched.scheduler is not None:
+                _sched.scheduler.bot = client
+        except Exception:
+            pass
     return _worker

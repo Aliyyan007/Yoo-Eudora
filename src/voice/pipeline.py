@@ -733,6 +733,8 @@ class VoicePipeline:
         subject = request_text.strip()
         try:
             from ..ai import llm
+            from ..persona.runtime import active as _active_persona
+            _p = _active_persona()
             loop = asyncio.get_event_loop()
             resp = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -740,8 +742,8 @@ class VoicePipeline:
                     lambda: llm.call_voice(
                         "songwriter",
                         (
-                            "You are Eudora — a 22yo London art student with a cheeky, "
-                            "playful energy. You write songs that sound like real people "
+                            f"You are {_p.name.capitalize()} — {_p.short_identity} "
+                            "You write songs that sound like real people "
                             "singing in a VC — casual, rhyming, a bit silly, full of heart."
                         ),
                         (
@@ -780,7 +782,7 @@ class VoicePipeline:
              "singing in the vc nice and slow,",
              "[break]",
              "la la la, that's how it goes,",
-             "eudora's singing, now you know!"],
+             "that was my song, now you know!"],
             ["[singing] Oi oi, listen up innit,",
              "got a little tune for you, one minute,",
              "[break]",

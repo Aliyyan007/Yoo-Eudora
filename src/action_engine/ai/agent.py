@@ -38,9 +38,9 @@ from src.action_engine.config.prompts import (
     VOICE_MODE,
     EVENT_PREAMBLE,
     EVENT_SYSTEM_PROMPT,
-    CHAT_SYSTEM_PROMPT_PLAIN,
     system_prompt_for,
 )
+from src.action_engine.config import prompts as _prompts_mod
 from src.action_engine.config.settings import settings
 from src.action_engine.core.groq_pool import get_pool
 from src.action_engine.tools.context import ToolContext
@@ -92,7 +92,7 @@ class Agent:
         # Tool-free runs get a tool-free prompt — mentioning tools makes the
         # model hallucinate calls and burn retries on tool_use_failed errors.
         sys_prompt = (
-            CHAT_SYSTEM_PROMPT_PLAIN
+            _prompts_mod.CHAT_SYSTEM_PROMPT_PLAIN
             if (no_tools and mode == CHAT_MODE)
             else system_prompt_for(mode)
         )

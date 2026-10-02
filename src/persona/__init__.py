@@ -1,9 +1,18 @@
 """
 Persona module — loads and manages the bot's personality configuration.
+
+Package layout:
+- profiles.py  — the three persona definitions (eudora/isla/rowan) + prompt blocks
+- runtime.py   — the active-persona registry, cross-persona pending store,
+                 rotation state persistence
+- manager.py   — the rotation supervisor (one account online at a time,
+                 ~2-3h jittered rotation, restart recovery)
 """
 from loguru import logger
 from pydantic import BaseModel, Field
 from typing import List, Optional
+
+from .profiles import PersonaProfile, PROFILES, DEFAULT_ID, get_profile
 
 
 class Persona(BaseModel):

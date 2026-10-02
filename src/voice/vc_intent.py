@@ -113,7 +113,6 @@ def vc_invite_score(text: str) -> float:
 _VC_LEAVE_CMD_PATTERNS = [
     r"\bleave\s+(?:the|this|our|my|their)?\s*(?:vc|voice|call|channel)\b",
     r"\bget\s+out\s+of\s+(?:the|this|our|my|their)?\s*(?:vc|voice|call|channel)\b",
-    r"\b(?:eudora|bot)\s+leave\b",
     r"\bleave\s+(?:this|the)\s+(?:channel|call)\b",
     r"\bdisconnect\b",
     r"\bhop\s+off\b",
@@ -121,6 +120,15 @@ _VC_LEAVE_CMD_PATTERNS = [
     r"\bfuck\s+off\s+(?:the\s+)?vc\b",
     r"\bbuzz\s+off\b",
 ]
+
+
+def _active_name() -> str:
+    """The currently-online persona's casual name (for '<name> leave')."""
+    try:
+        from ..persona.runtime import active
+        return active().name.lower()
+    except Exception:
+        return ""
 
 
 def leave_vc_score(text: str) -> float:
@@ -137,12 +145,15 @@ def leave_vc_score(text: str) -> float:
     for pat in _VC_LEAVE_CMD_PATTERNS:
         if re.search(pat, t):
             return 0.85
+    name = _active_name()
+    if name and re.search(rf"\b(?:{re.escape(name)}|bot)\s+leave\b", t):
+        return 0.85
     # Bare "leave" imperatives — the WHOLE utterance must be the command
-    # ("leave", "eudora leave", "you leave", "leave now"). Never fire on
+    # ("leave", "<name> leave", "you leave", "leave now"). Never fire on
     # "leave it", "i'll leave", "don't leave" or Whisper garbles containing
     # the word mid-sentence — a false positive drops the call mid-chat.
     if re.fullmatch(
-            r"(?:(?:eudora|bot|hey|please|pls|you|just|oi)\s+)*leave"
+            rf"(?:(?:{re.escape(name) if name else 'xxnoname'}|bot|hey|please|pls|you|just|oi)\s+)*leave"
             r"(?:\s+(?:now|already|please|pls))*[.!]*", t):
         return 0.6
     return 0.0
