@@ -119,6 +119,15 @@ class EngagementLog:
             for m in history_msgs:
                 if m.author.id != bot_user.id or m.id in tracked_ids:
                     continue
+                # Same engagement-only rule as the sweep — conversation
+                # replies and interacted messages never count toward the wall
+                if getattr(m, "reference", None) is not None:
+                    continue
+                try:
+                    if any(r.count > 0 for r in getattr(m, "reactions", None) or []):
+                        continue
+                except Exception:
+                    continue
                 ts = m.created_at.timestamp()
                 if now - ts >= self.stale_s and not any(ht > ts for ht in human_tss):
                     n += 1
@@ -176,6 +185,15 @@ class EngagementLog:
             bot_id = getattr(getattr(rec.get("msg"), "author", None), "id", None)
         if history_msgs is not None:
             for m in history_msgs:
+                # Reactions on the tracked message itself = interaction —
+                # never treat it as unanswered even if nobody replied in text
+                if m.id == rec["msg_id"]:
+                    try:
+                        if any(r.count > 0 for r in getattr(m, "reactions", None) or []):
+                            return True
+                    except Exception:
+                        pass
+                    continue
                 if m.created_at.timestamp() <= ts:
                     continue
                 if m.author.bot:
@@ -278,6 +296,16 @@ class EngagementLog:
             if bot_user is None or m.author.id != bot_user.id:
                 continue
             if m.id in tracked_ids:
+                continue
+            # Only ENGAGEMENT-looking messages are deletable — a standalone
+            # post with no reply reference and no reactions. Conversation
+            # replies and anything users interacted with are never swept.
+            if getattr(m, "reference", None) is not None:
+                continue
+            try:
+                if any(r.count > 0 for r in getattr(m, "reactions", None) or []):
+                    continue
+            except Exception:
                 continue
             ts = m.created_at.timestamp()
             if (now - ts) < self.stale_s:

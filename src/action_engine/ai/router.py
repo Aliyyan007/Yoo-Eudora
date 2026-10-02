@@ -47,8 +47,8 @@ _ACTION_VERBS = re.compile(
     r"\b(send|say|tell|ping|mention|tag|dm|delete|edit|react|join|leave|"
     r"move|mute|deafen|bump|post|write|read|check|search|find|list|show|"
     r"fetch|get|count|use|invoke|play|sticker|gif|change|set|update|"
-    r"make|spam|announce|welcome|greet|give|assign|schedule|remind|"
-    r"repeat|stop|cancel)\b",
+    r"make|create|spawn|click|press|spam|announce|welcome|greet|give|"
+    r"assign|schedule|remind|repeat|stop|cancel)\b",
     re.I,
 )
 
@@ -122,6 +122,11 @@ def classify(text: str) -> Route | None:
     verb_exact = bool(_ACTION_VERBS.search(t))
     verb_fuzzy, fuzzy_cats = _fuzzy(t)
     cats |= fuzzy_cats
+
+    # "join(ed) the server" is a member-lookup context, not a voice action —
+    # prune the voice category that the bare "join" cue pulled in.
+    if re.search(r"\bjoin(ing|ed)?\b.*\b(server|guild|discord)\b|\b(joined|newest|latest|recent)\b.*\b(join|member|joiner)\b", t, re.I):
+        cats.discard("voice")
 
     # action verb present (exact or near-typo) AND we mapped at least one
     # category -> action

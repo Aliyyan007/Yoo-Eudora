@@ -1,4 +1,4 @@
-"""
+﻿"""
 Reply generation, humanization post-processor, burst replies, and dedup logic.
 """
 import re
@@ -12,7 +12,7 @@ from . import prompts
 from . import d1_memory as mem_module  # D1-backed memory (falls back to JSON if D1 unavailable)
 
 
-# ── Stopwords for word analysis ───────────────────────────────────────────────
+# â”€â”€ Stopwords for word analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _STOP = {
     "a", "an", "the", "i", "you", "it", "is", "to", "in", "of", "and", "or", "for",
@@ -43,7 +43,7 @@ def _similarity_ratio(a: str, b: str) -> float:
     return len(wa & wb) / len(wa | wb)
 
 
-# ── Humanization post-processor ───────────────────────────────────────────────
+# â”€â”€ Humanization post-processor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _ABBREVS = [
     (r'\byou\b',          'u',      0.35),
@@ -105,9 +105,9 @@ def humanize(text: str) -> str:
         text += random.choice([' lol', ' lmao', ' fr', ' ngl', ' tho', ' rn'])
 
     # 6. Anti-detection: Remove AI tells (em-dashes, semicolons, "moreover", etc.)
-    # AI text overuses em-dashes and semicolons — humans rarely use them in chat
-    text = text.replace('—', '-')   # em-dash -> hyphen
-    text = text.replace('–', '-')   # en-dash -> hyphen
+    # AI text overuses em-dashes and semicolons â€” humans rarely use them in chat
+    text = text.replace('â€”', '-')   # em-dash -> hyphen
+    text = text.replace('â€“', '-')   # en-dash -> hyphen
     if r() < 0.80:
         text = text.replace(';', ',')  # semicolons -> commas (80% of the time)
     # Remove AI transition words
@@ -130,13 +130,13 @@ def humanize(text: str) -> str:
             words[idx] = ''.join(word)
             text = ' '.join(words)
 
-    # 8. Occasional double space (3% chance — very common human typing error)
+    # 8. Occasional double space (3% chance â€” very common human typing error)
     if r() < 0.03 and ' ' in text:
         pos = text.find(' ')
         text = text[:pos] + '  ' + text[pos + 1:]
 
     # 9. Vary punctuation: sometimes add "..." for trailing thought (10% chance)
-    if r() < 0.10 and not text.endswith(('?', '!', '...', '😂', '💀', '😭')):
+    if r() < 0.10 and not text.endswith(('?', '!', '...', 'ðŸ˜‚', 'ðŸ’€', 'ðŸ˜­')):
         text += '...'
 
     # 10. Occasionally lowercase everything (15% chance for short casual msgs)
@@ -146,11 +146,11 @@ def humanize(text: str) -> str:
     return text.strip()
 
 
-# ── Spoken-language cleanup for voice / TTS ────────────────────────────────────
+# â”€â”€ Spoken-language cleanup for voice / TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Text abbreviations that look fine in a text chat but sound wrong when read
 # aloud by TTS. These are expanded to full words so the synthesised voice sounds
-# natural. Order matters — longer patterns are checked first to avoid partial
+# natural. Order matters â€” longer patterns are checked first to avoid partial
 # replacements (e.g. "tbh" before "tho").
 _SPEECH_ABBREVS = [
     # Greetings / check-ins
@@ -218,14 +218,14 @@ _SPEECH_ABBREVS = [
     (r'\bikr\b',           "i know right"),
     (r'\birl\b',           'in real life'),
     (r'\btbh\b',           'to be honest'),
-    # "w/" → "with"
+    # "w/" â†’ "with"
     (r'\bw/\b',            'with'),
     (r'\bw\/',             'with '),
-    # "b/c" → "because"
+    # "b/c" â†’ "because"
     (r'\bb/c\b',           'because'),
 ]
 
-# Markdown / formatting artifacts that TTS can't speak — strip entirely
+# Markdown / formatting artifacts that TTS can't speak â€” strip entirely
 _SPEECH_STRIP_RE = re.compile(
     r'[*_~`#>|]|'                    # markdown emphasis / code / headers / quote
     r'\[[^\]]+\]\([^)]+\)|'          # markdown links [text](url) -> keep text
@@ -239,12 +239,12 @@ def clean_for_speech(text: str) -> str:
     Expands text abbreviations into full words (e.g. "ngl" -> "not gonna lie"),
     strips markdown / emojis / formatting that a synthesiser can't speak, and
     tidies up spacing. This is the OPPOSITE of ``humanize`` (which *adds* chat
-    abbreviations for text channels) — voice responses need full words.
+    abbreviations for text channels) â€” voice responses need full words.
     """
     if not text:
         return text
 
-    # 0. Strip model control tokens ("<|constrain|>", "<|end_of_text|>") —
+    # 0. Strip model control tokens ("<|constrain|>", "<|end_of_text|>") â€”
     # they occasionally leak from the LLM and must never reach TTS
     text = re.sub(r'<\|[^|]*\|>', '', text)
 
@@ -262,7 +262,7 @@ def clean_for_speech(text: str) -> str:
         text,
     )
 
-    # 4. Expand text abbreviations → full words (case-insensitive, keep as-is)
+    # 4. Expand text abbreviations â†’ full words (case-insensitive, keep as-is)
     for pattern, replacement in _SPEECH_ABBREVS:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
@@ -290,7 +290,7 @@ def split_into_bursts(text: str) -> list:
     sentences = _re.split(r'(?<=[.!?])\s+', text.strip())
 
     if len(sentences) <= 1:
-        # No sentence boundaries — try splitting on commas or conjunctions
+        # No sentence boundaries â€” try splitting on commas or conjunctions
         parts = _re.split(r'\s+(?:but|and|so|bc|because|plus)\s+', text, flags=_re.IGNORECASE)
         if len(parts) > 1:
             sentences = parts
@@ -313,7 +313,7 @@ def split_into_bursts(text: str) -> list:
     return bursts if bursts else [text]
 
 
-# ── Reply generation ──────────────────────────────────────────────────────────
+# â”€â”€ Reply generation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def generate_reply(
     transcript: str,
@@ -351,7 +351,7 @@ def generate_reply(
             user=prompt,
             image_urls=image_urls,
             temperature=0.9,
-            max_tokens=800,
+            max_tokens=1100,
             want_json=True,
         )
     else:
@@ -361,7 +361,7 @@ def generate_reply(
             system=prompts.REPLY_SYSTEM,
             user=prompt,
             temperature=0.92,
-            max_tokens=800,
+            max_tokens=1100,
             want_json=True,
         )
         if not raw or not raw.strip():
@@ -371,14 +371,14 @@ def generate_reply(
                 system=prompts.REPLY_SYSTEM,
                 user=prompt,
                 temperature=0.92,
-                max_tokens=300,
+                max_tokens=450,
                 want_json=True,
             )
 
     if not raw or not raw.strip():
         # Retry up to 2 more times with different keys
         for attempt in range(2):
-            logger.warning(f"LLM returned empty response — retry {attempt + 1}/2")
+            logger.warning(f"LLM returned empty response â€” retry {attempt + 1}/2")
             # Force key rotation before retry
             llm.rotate_key()
             raw = llm.call_smart(
@@ -386,7 +386,7 @@ def generate_reply(
                 system=prompts.REPLY_SYSTEM,
                 user=prompt,
                 temperature=0.92,
-                max_tokens=800,
+                max_tokens=1100,
                 want_json=True,
             )
             if raw and raw.strip():
@@ -397,7 +397,7 @@ def generate_reply(
                 system=prompts.REPLY_SYSTEM,
                 user=prompt,
                 temperature=0.92,
-                max_tokens=300,
+                max_tokens=450,
                 want_json=True,
             )
             if raw and raw.strip():
@@ -435,7 +435,7 @@ def generate_reply_with_search(prompt: str, search_result: str) -> Optional[dict
     """Second-pass: given a search result, generate an informed casual reply."""
     augmented = (
         f"{prompt}\n\n"
-        f"[WEB SEARCH RESULT — use this to give an accurate answer, but phrase it casually]\n"
+        f"[WEB SEARCH RESULT â€” use this to give an accurate answer, but phrase it casually]\n"
         f"{search_result[:500]}\n"
         f"[END SEARCH RESULT]\n\n"
         f"Now write your reply knowing the above. Casual tone. Up to 50 words."
@@ -445,7 +445,7 @@ def generate_reply_with_search(prompt: str, search_result: str) -> Optional[dict
         system=prompts.REPLY_SYSTEM,
         user=augmented,
         temperature=0.85,
-        max_tokens=800,
+        max_tokens=1100,
         want_json=True,
     )
     return llm.parse_json_response(raw)
@@ -462,7 +462,7 @@ def is_duplicate(reply_text: str, last_sent: str) -> bool:
     return _similarity_ratio(reply_text, last_sent) > 0.65
 
 
-# ── Background analysis functions ─────────────────────────────────────────────
+# â”€â”€ Background analysis functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def extract_memory(transcript: str, username: str) -> list:
     """Extract facts about a user from conversation."""
@@ -485,7 +485,7 @@ def extract_channel_topic(transcript: str) -> str:
         system=prompts.TOPIC_SUMMARY_SYSTEM,
         user=transcript[-1500:],
         temperature=0.3,
-        max_tokens=300,
+        max_tokens=450,
         want_json=False,
     )
     if raw:
@@ -519,22 +519,38 @@ def self_reflect(transcript: str) -> list:
     return llm.parse_json_array(raw)
 
 
-def generate_proactive_message(channel_topic: str = "") -> str:
-    """Generate a proactive message to start a conversation."""
+def generate_proactive_message(channel_topic: str = "", for_user: str = None) -> str:
+    """Generate a proactive message to start a conversation.
+    for_user: display name of the user the message will ping — keeps the
+    text generic (no assumed facts) and stops the model freehand-writing
+    '@name' mentions that render as garbage."""
     topic_hint = f"[channel topic: {channel_topic}]\n" if channel_topic else ""
+    ping_hint = (
+        f"[this message pings '{for_user}' — you know nothing personal about "
+        "them: no assumed hobbies, location or facts. ask an open question or "
+        "keep it about the shared space. NEVER write '@', usernames or mentions "
+        "yourself — the ping is added for you.]\n"
+        if for_user else
+        "[NEVER write '@', usernames or mentions in the message — pings are "
+        "added separately.]\n"
+    )
     raw = llm.call_fast(
         task="proactive",
         system=prompts.PROACTIVE_SYSTEM,
-        user=f"{topic_hint}Start a casual conversation. Single short message only.",
+        user=f"{topic_hint}{ping_hint}Start a casual conversation. Single short message only.",
         temperature=1.0,
-        max_tokens=300,
+        max_tokens=450,
         want_json=False,
     )
     if raw:
         text = raw.strip().strip('"').strip("'")
         # Strip model control tokens that occasionally leak ("<|constrain|>",
-        # "<|end_of_text|>") — they render as literal garbage in the channel
+        # "<|end_of_text|>") â€” they render as literal garbage in the channel
         text = re.sub(r'<\|[^|]*\|>', '', text)
+        # Freehand '@name' mentions render as literal garbage — pings are
+        # added by the caller, drop any the model wrote anyway
+        text = re.sub(r'@[^\s]+', '', text)
+        text = ' '.join(text.split())  # collapse the gaps left behind
         text = text.split("\n")[0].strip()
         return text if len(text) > 2 else ""
     return ""

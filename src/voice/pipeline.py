@@ -1405,13 +1405,20 @@ class VoicePipeline:
         # leave_cmd already returned above (native path keeps it).
         if getattr(self, "_action_cb", None):
             try:
-                _act_note = await self._action_cb(user_id, final_text)
-                if _act_note:
-                    hints["directive"] = (
-                        (hints.get("directive") or "")
-                        + f" You just performed what they asked ({_act_note}). "
-                          "Acknowledge it briefly and naturally, like you just did it."
-                    ).strip()
+                _act = await self._action_cb(user_id, final_text)
+                if _act:
+                    kind, note = _act
+                    if kind == "info" and note:
+                        hints["directive"] = (
+                            (hints.get("directive") or "")
+                            + f" You looked it up for them: {note} — relay it naturally."
+                        ).strip()
+                    elif kind == "exec":
+                        hints["directive"] = (
+                            (hints.get("directive") or "")
+                            + " You're about to do what they asked — tell them "
+                              "you're on it, brief and natural."
+                        ).strip()
             except Exception as e:
                 logger.debug(f"[voice] action worker error: {e}")
 

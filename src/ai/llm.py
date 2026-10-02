@@ -322,7 +322,7 @@ def call_voice(task: str, system: str, user: str, **kwargs) -> str:
     monologues that shouldn't be spoken aloud anyway.
     """
     if 'max_tokens' not in kwargs:
-        kwargs['max_tokens'] = 240  # ~150 reasoning headroom + ~90 reply tokens
+        kwargs['max_tokens'] = 340  # ~150 reasoning headroom + ~190 reply tokens
     if 'temperature' not in kwargs:
         kwargs['temperature'] = 0.8
     if 'reasoning_effort' not in kwargs:
@@ -366,7 +366,7 @@ def call_voice_stream(task: str, system: str, user: str, **kwargs):
     if not _groq_clients:
         return None
 
-    max_tokens = kwargs.pop('max_tokens', 240)
+    max_tokens = kwargs.pop('max_tokens', 340)
     temperature = kwargs.pop('temperature', 0.8)
     reasoning_effort = kwargs.pop('reasoning_effort', 'low')
 

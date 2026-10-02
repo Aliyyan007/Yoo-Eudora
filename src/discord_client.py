@@ -650,7 +650,7 @@ class AIPersonaClient(discord.Client):
                     None,
                     lambda: llm.call_smart(
                         "voice_reply", system_prompt, user_prompt,
-                        max_tokens=500, temperature=0.8, want_json=False,
+                        max_tokens=700, temperature=0.8, want_json=False,
                         max_wait_s=8,
                     )
                 )
@@ -794,38 +794,48 @@ class AIPersonaClient(discord.Client):
                         if action == "none":
                             continue
 
+                        # Pick the ping target FIRST — the message is then
+                        # generated knowing WHO it addresses, so it never
+                        # attributes facts to a user it doesn't know.
+                        ping_prefix = ""
+                        pinged_user = None
+                        if action == "everyone":
+                            ping_prefix = "@everyone "
+                        elif action == "here":
+                            ping_prefix = "@here "
+                        elif action == "user_ping":
+                            pinged_user = select_online_user(
+                                guild, exclude_ids={self.user.id}, channel=channel,
+                                history_msgs=self.history_cache.get(ch_id))
+                            if not pinged_user:
+                                continue
+                            ping_prefix = f"<@{pinged_user.id}> "
+
                         # Generate re-engagement message (in executor to not block)
                         topic = mem.get_channel_topic(ch_id)
                         loop = asyncio.get_running_loop()
                         msg = await loop.run_in_executor(
-                            None, lambda: ai_reply.generate_proactive_message(topic)
+                            None, lambda: ai_reply.generate_proactive_message(
+                                topic, for_user=getattr(pinged_user, "display_name", None))
                         )
                         if not msg or len(msg) < 3:
                             msg = random.choice([
                                 "anyone there?", "yo someone talk to me",
                                 "chat's dead fr", "hello?? anyone alive",
                             ])
+                        msg = ping_prefix + msg
 
-                        # Apply ping based on action
+                        # Apply ping bookkeeping for the chosen action
                         if action == "everyone":
-                            msg = f"@everyone {msg}"
                             ping_ctrl.record_everyone_ping(ch_id)
                         elif action == "here":
-                            msg = f"@here {msg}"
                             ping_ctrl.record_here_ping(ch_id)
-                        elif action == "user_ping":
-                            user = select_online_user(guild, exclude_ids={self.user.id}, channel=channel,
-                                                      history_msgs=self.history_cache.get(ch_id))
-                            if user:
-                                msg = f"<@{user.id}> {msg}"
-                                ping_ctrl.record_user_ping(ch_id, user_id=user.id)
-                                # Track conversation with this user
-                                if ch_id not in self.conversation_tracker:
-                                    self.conversation_tracker[ch_id] = {}
-                                self.conversation_tracker[ch_id][str(user.id)] = time.time()
-                            else:
-                                # No user to ping, skip
-                                continue
+                        elif pinged_user:
+                            ping_ctrl.record_user_ping(ch_id, user_id=pinged_user.id)
+                            # Track conversation with this user
+                            if ch_id not in self.conversation_tracker:
+                                self.conversation_tracker[ch_id] = {}
+                            self.conversation_tracker[ch_id][str(pinged_user.id)] = time.time()
 
                         # Send with typing simulation
                         typing_dur = random.uniform(1.5, 3.5)
@@ -1973,9 +1983,21 @@ class AIPersonaClient(discord.Client):
             # performs something we note it in the transcript — the normal
             # reply then acknowledges the action naturally (no "done" text).
             action_note = None
+            info_facts = None
             if not cmd_type:
                 try:
-                    action_note = await get_action_worker(self).try_handle_text(message, trigger_text)
+                    worker = get_action_worker(self)
+                    action_kind = await worker.classify_request(trigger_text)
+                    if action_kind == "exec":
+                        # Reply FIRST, then the action runs in the background
+                        # after a human-like delay — like a person saying
+                        # "on it" and then actually doing it.
+                        worker.queue_text_action(message, trigger_text)
+                        action_note = "queued"
+                    elif action_kind == "info":
+                        # Look it up BEFORE replying so the answer lands in
+                        # the reply itself instead of an "idk".
+                        info_facts = await worker.run_text_info(message, trigger_text)
                 except Exception as e:
                     logger.debug(f"[actions] text handoff failed: {e}")
 
@@ -2100,10 +2122,15 @@ class AIPersonaClient(discord.Client):
             if cmd_type:
                 transcript = f"[COMMAND DETECTED: {cmd_type} — already handled, acknowledge naturally]\n" + transcript
 
-            # If the outsider action worker just performed what they asked,
-            # tell the reply engine so she acknowledges it like a person.
-            if action_note:
-                transcript = f"[ACTION DONE: you just {action_note} for them — acknowledge briefly and naturally, don't describe the mechanics]\n" + transcript
+            # Action worker coordination: info lookups already ran (facts are
+            # injected to be relayed); exec actions are queued to run after
+            # the reply — so acknowledge like you accepted, not like it's done.
+            if info_facts:
+                transcript = (f"[LOOKED UP for them — the answer: {info_facts} — "
+                              "relay it naturally, like you just checked]\n" + transcript)
+            elif action_note:
+                transcript = ("[ACTION QUEUED: you're about to do what they asked — "
+                              "reply like you accepted and you're on it, don't describe mechanics]\n" + transcript)
 
             # ── Add unanswered questions context ────────────────────────────
             # If there are unanswered questions from recent messages, prepend them
@@ -2162,10 +2189,22 @@ class AIPersonaClient(discord.Client):
                         logger.debug(f"Status change failed: {e}")
 
             # Retry with stronger instruction if reply was null — BUT only
-            # force a reply when the bot is directly addressed (mention/DM/reply).
-            # For random/sticky participation, RESPECT the LLM's null decision
-            # (it correctly decided the message wasn't directed at the bot).
-            is_directly_addressed = is_dm or (self.user in message.mentions) or (message.reference is not None and message.reference.resolved == self.user)
+            # force a reply when the bot is directly addressed (mention/DM/reply
+            # to the bot) or mid active-conversation with this user. NOTE:
+            # reference.resolved is the referenced *Message* — comparing it to
+            # self.user is always False (that bug silently dropped every
+            # reply-quote addressed to the bot).
+            _ref_msg = getattr(message.reference, "resolved", None)
+            _reply_to_me = (
+                _ref_msg is not None
+                and getattr(getattr(_ref_msg, "author", None), "id", None) == self.user.id
+            )
+            _convo_ts = self.conversation_tracker.get(ch_id, {}).get(str(message.author.id), 0)
+            _in_convo = (time.time() - _convo_ts) < 240
+            is_directly_addressed = (
+                is_dm or (self.user in message.mentions)
+                or _reply_to_me or _in_convo
+            )
 
             if not reply_text or str(reply_text).strip() in ("null", "None", ""):
                 if is_directly_addressed:
@@ -2209,11 +2248,13 @@ class AIPersonaClient(discord.Client):
                     logger.debug(f"Skipping duplicate reply: '{reply_text[:40]}'")
                     return
 
-                # Near-repeat check against recent replies — short replies get
-                # a stricter bar ("just sketching rn" twice reads robotic even
-                # with minor word changes). One anti-repeat retry, then drop.
+                # Near-repeat check against recent replies — regenerates once
+                # with an anti-repeat nudge when the reply is too similar to
+                # something she just said. Only a true near-duplicate of the
+                # LAST reply drops outright — in ongoing convos about the same
+                # topic, word overlap is normal and silence reads worse.
                 _recent_own = list(self.reply_history.get(ch_id, []))[-3:]
-                _thresh = 0.45 if len(reply_text.split()) <= 6 else 0.65
+                _thresh = 0.62 if len(reply_text.split()) <= 6 else 0.78
                 if _recent_own and any(
                         ai_reply._similarity_ratio(reply_text, prev) >= _thresh
                         for prev in _recent_own):
@@ -2232,17 +2273,15 @@ class AIPersonaClient(discord.Client):
                             )
                         )
                         _cand = ai_reply.humanize(str(_rr.get("reply") or "").strip())[:2000] if _rr else ""
-                        if _cand and _cand not in ("null", "None") and not any(
-                                ai_reply._similarity_ratio(_cand, prev) >= _thresh
-                                for prev in _recent_own):
+                        # only a genuine repeat of the immediately-previous
+                        # reply is worse than silence — topic-overlap is fine
+                        if _cand and _cand not in ("null", "None") and not (
+                                _recent_own and
+                                ai_reply._similarity_ratio(_cand, _recent_own[-1]) >= 0.75):
                             reply_text = _cand
                             reaction_emoji = _rr.get("reaction") or reaction_emoji
-                        else:
-                            logger.debug("Repeat regeneration still similar — dropping")
-                            return
                     except Exception as e:
                         logger.debug(f"Anti-repeat retry failed: {e}")
-                        return
 
                 # React with emoji — use algorithmic reaction system
                 # First check if AI suggested a reaction, then use our algorithm

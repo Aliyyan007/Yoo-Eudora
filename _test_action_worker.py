@@ -139,7 +139,10 @@ class FakePool:
         self.script = list(script); self.calls = []; self.arbiter = arbiter
     async def chat(self, **kw):
         self.calls.append(kw)
-        if not kw.get("tools"):  # confirm-arbiter call
+        if not kw.get("tools"):  # arbiter call — discriminate by system prompt
+            sys_msg = ((kw.get("messages") or [{}])[0].get("content") or "").lower()
+            if "route short discord" in sys_msg:
+                return _Resp(_Msg(content="ACTION"))
             return _Resp(_Msg(content=self.arbiter))
         step = self.script.pop(0) if self.script else ("content", "(done)")
         kind = step[0]
@@ -184,7 +187,12 @@ async def main():
         gp._pool = FakePool(script, arbiter=arbiter)
         worker._agent = None
 
-    print("== 3. text action end-to-end (silent) ==")
+    async def drain(w):
+        """Wait for all queued background action tasks to finish."""
+        while w._tasks:
+            await asyncio.gather(*list(w._tasks), return_exceptions=True)
+
+    print("== 3. text action end-to-end (reply-first + bg exec, silent) ==")
     gp._pool = FakePool([
         ("tools", [("send_message", {"channel_query": "here", "content": "hello from worker"})]),
         ("content", "done"),
@@ -197,10 +205,13 @@ async def main():
 
     worker = ActionWorker(client)
     msg = FakeMessage("eudora send a message saying hello", author, ch)
+    kind = await worker.classify_request(msg.clean_content)
+    check("classified exec", kind == "exec", f"kind={kind!r}")
     t0 = time.monotonic()
-    note = await worker.try_handle_text(msg, msg.clean_content)
+    queued = worker.queue_text_action(msg, msg.clean_content)
+    check("queued for bg exec", queued)
+    await drain(worker)
     dt = time.monotonic() - t0
-    check("worker handled (note)", isinstance(note, str) and "sent" in note, f"note={note!r}")
     check("action content sent once", len(ch.sent) == 1 and ch.sent[0][0] == "hello from worker", f"{ch.sent}")
     check("NO 'done'/reply sent", all(c[0] != "done" for c in ch.sent))
     check(f"human delay applied ({dt:.1f}s)", dt >= 1.5)
@@ -208,22 +219,34 @@ async def main():
     print("== 3b. declarative statement -> arbiter rejects (leak fix) ==")
     # "users with X role can use @everyone ping" trips the heuristic but is
     # NOT an instruction — the confirm arbiter must block it before the
-    # worker can send anything.
+    # worker can queue anything.
     set_script(worker, [], arbiter="NO")
     ch.sent.clear()
     decl = FakeMessage("Users with <@&1432293> role can use @everyone ping once in a week",
                        author, ch)
-    ok = await worker.try_handle_text(decl, decl.clean_content)
-    check("declarative -> None (no worker run)", ok is None)
+    kind = await worker.classify_request(decl.clean_content)
+    check("declarative -> None (no worker run)", kind is None)
     check("nothing leaked to channel", not ch.sent)
+
+    print("== 3c. info lookup -> 'info', answer returned for relay ==")
+    set_script(worker, [
+        ("tools", [("get_recent_joins", {})]),
+        ("content", "most recent joiner is Sarah"),
+    ])
+    kind = await worker.classify_request("who's the most recent person to join the server")
+    check("lookup classified 'info'", kind == "info", f"kind={kind!r}")
+    answer = await worker.run_text_info(
+        FakeMessage("who's the most recent person to join the server", author, ch),
+        "who's the most recent person to join the server")
+    check("info answer relayed", answer == "most recent joiner is Sarah", f"answer={answer!r}")
 
     print("== 4. chat request -> None (falls through) ==")
     gp._pool = FakePool([("content", "chat")])
     worker2 = ActionWorker(client)
     ch.sent.clear()
     msg2 = FakeMessage("how are you", author, ch)
-    ok = await worker2.try_handle_text(msg2, msg2.clean_content)
-    check("chat -> None", ok is None)
+    kind = await worker2.classify_request(msg2.clean_content)
+    check("chat -> None", kind is None)
     check("nothing sent", not ch.sent)
 
     print("== 5. non-owner permission gate ==")
@@ -247,9 +270,10 @@ async def main():
     ])
     ch.sent.clear()
     msg3 = FakeMessage("dm bob saying hi", author, ch)
-    ok = await worker.try_handle_text(msg3, msg3.clean_content)
-    # denied tool never ran -> performed empty -> None -> normal reply continues
-    check("denied run -> None (falls back to reply)", ok is None)
+    kind = await worker.classify_request(msg3.clean_content)
+    worker.queue_text_action(msg3, msg3.clean_content)
+    await drain(worker)
+    check("denied run -> nothing sent", not ch.sent, f"{ch.sent}")
 
     print("== 6. owner can run denied tools ==")
     import src.ai.owner_system as owners
@@ -262,8 +286,10 @@ async def main():
 
     print("== 7. voice path ==")
     vc = FakeVoiceChannel(300, "lounge", guild)
-    ok = await worker.try_handle_voice(author.id, "eudora leave the vc", vc)
-    check("leave-vc short-circuits (None)", ok is None)
+    # leave-vc is defanged at the schema level — the model can't even see it
+    from src.action_engine.tools import registry as ae_registry
+    names = {s["function"]["name"] for s in ae_registry.build_tools("command")}
+    check("leave_voice not in tool schemas", "leave_voice" not in names)
 
     set_script(worker, [
         ("tools", [("send_vc_text", {"channel_query": "here", "content": "on it"})]),
@@ -273,8 +299,9 @@ async def main():
     # send_vc_text resolves its own channel — patch the resolver to our fake VC
     async def _fake_vc(ctx, q): return vc
     ae_voice._resolve_voice_channel = _fake_vc
-    ok = await worker.try_handle_voice(author.id, "send that to the vc chat", vc)
-    check("voice action handled", isinstance(ok, str) and "sent" in ok, f"note={ok!r}")
+    kind = await worker.classify_request("send that to the vc chat")
+    worker.queue_voice_action(author.id, "send that to the vc chat", vc)
+    await drain(worker)
     check("vc text sent", vc.sent and vc.sent[-1][0] == "on it", f"{vc.sent}")
     check("no spoken/done reply forwarded", all(c[0] != "sure thing" for c in vc.sent))
 
@@ -303,17 +330,23 @@ async def main():
     gp._pool = RescuePool()
     worker._agent = None
     ch.sent.clear()
-    note = await worker.try_handle_text(
-        FakeMessage("send a message", author, ch), "send a message")
-    check("rescued hallucinated tool name", isinstance(note, str))
+    m = FakeMessage("send a message", author, ch)
+    kind = await worker.classify_request(m.clean_content)
+    worker.queue_text_action(m, m.clean_content)
+    await drain(worker)
     check("rescued call actually ran", ch.sent and ch.sent[-1][0] == "rescued call", f"{ch.sent}")
 
     print("== 8. engine failure -> None, no crash ==")
-    set_script(worker, [("content", "done")])
     async def boom(**kw): raise RuntimeError("groq down")
     gp._pool.chat = boom
-    ok = await worker.try_handle_text(FakeMessage("send hello", author, ch), "send hello")
-    check("engine crash -> None (reply path continues)", ok is None)
+    worker._agent = None
+    ch.sent.clear()
+    m = FakeMessage("send hello", author, ch)
+    kind = await worker.classify_request(m.clean_content)
+    if kind:
+        worker.queue_text_action(m, m.clean_content)
+        await drain(worker)
+    check("engine crash -> nothing sent, no crash", not ch.sent)
 
     print()
     n = sum(1 for _, ok in passed if ok)

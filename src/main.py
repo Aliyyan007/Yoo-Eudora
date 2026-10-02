@@ -156,8 +156,18 @@ async def main():
         async def join_server():
             await client.wait_until_ready()
             invite_code = config["server_invite"].split("/")[-1]
-            logger.info(f"Attempting to join server with invite code: {invite_code}")
             try:
+                # Already inside? Skip the join attempt entirely — Discord
+                # rejects accept_invite for existing members and it just
+                # logs noise every restart.
+                try:
+                    invite = await client.fetch_invite(invite_code)
+                    gid = getattr(getattr(invite, "guild", None), "id", None)
+                    if gid and any(g.id == gid for g in client.guilds):
+                        return
+                except Exception:
+                    pass
+                logger.info(f"Attempting to join server with invite code: {invite_code}")
                 await client.accept_invite(invite_code)
                 logger.info(f"Successfully joined server with invite code: {invite_code}")
             except Exception as e:

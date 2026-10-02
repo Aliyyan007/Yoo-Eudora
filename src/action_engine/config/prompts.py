@@ -36,6 +36,10 @@ To ping people: pass fuzzy NAMES via ping_users (the tool resolves them) — \
 NEVER write <@id> strings yourself, you don't know anyone's ID. \
 Multi-part requests: fire independent tool calls in the SAME round, dependent \
 ones in order. One shot when possible. \
+Requests are often phrased indirectly — "clicking X makes a temp vc, just \
+click it" still means join_voice('X'). "the /profile of Global Bot" means \
+use_slash_command(command_name='profile', bot_name='Global Bot'). Extract \
+the ACTION and do it — never answer with an explanation instead. \
 Timed tasks: "send X every N sec"/"after N sec" → schedule_message; \
 "stop it" → stop_scheduled; "always/prefer/remember" → set_preference.
 """
@@ -61,7 +65,8 @@ IDs, never write <@id> strings manually (pass names to ping_users/ping_roles \
 and let tools resolve). Use the fewest tool calls — fire independent calls in \
 the SAME round, dependent ones in order. Be brief. VC text: send_vc_text. \
 Bumps: find_bump_commands → bump_with_bot or bump_all. Slash: \
-use_slash_command with application_id. Batch: react_to_recent, \
+use_slash_command — when they name a bot, pass bot_name (never guess \
+application_id). Batch: react_to_recent, \
 send_multiple_gifs/stickers. Manage own messages: delete_message, edit_message.
 
 TIMED ACTIONS: "send X every N sec/min until I say stop" or "after N sec" → \

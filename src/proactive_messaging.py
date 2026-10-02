@@ -203,43 +203,56 @@ class ProactiveMessenger:
 
         ping_ctrl = get_ping_controller()
 
+        # Decide the ping target FIRST — the message text is generated with
+        # the pinged user's name in context so it never attributes personal
+        # facts to them ("got any sketches?" to someone who never sketched).
+        ping_prefix = ""
+        pinged_user = None
+        role = None
+        if self.ping_role_id and hasattr(channel, 'guild') and channel.guild:
+            role = channel.guild.get_role(self.ping_role_id)
+            if role is None:
+                # ID may be stale — fall back to a name match ("chat revive",
+                # "revive", ...) so a bad/stale id never silently disables it
+                for r in channel.guild.roles:
+                    if "revive" in (r.name or "").lower():
+                        role = r
+                        logger.info(f"[engage] revive role id stale — matched '{r.name}' by name")
+                        break
+                if role is None:
+                    logger.debug(f"[engage] CHAT_REVIVE_PING_ROLE {self.ping_role_id} not found in {channel.guild.name}")
+        if role and ping_ctrl.can_ping_role(ch_id):
+            ping_prefix = f"<@&{role.id}> "
+        elif ping_ctrl.can_ping_here(ch_id) and random.random() < 0.30:
+            ping_prefix = "@here "
+        elif ping_ctrl.can_ping_user(ch_id) and hasattr(channel, 'guild') and channel.guild:
+            pinged_user = select_online_user(
+                channel.guild, exclude_ids={self.client.user.id}, channel=channel,
+                history_msgs=self.client.history_cache.get(ch_id))
+            if pinged_user:
+                ping_prefix = f"<@{pinged_user.id}> "
+
         # Try AI-generated message first, fall back to random
         topic = mem.get_channel_topic(ch_id)
         loop = asyncio.get_running_loop()
         message = await loop.run_in_executor(
-            None, lambda: ai_reply.generate_proactive_message(topic)
+            None, lambda: ai_reply.generate_proactive_message(
+                topic, for_user=getattr(pinged_user, "display_name", None))
         )
-
         if not message or len(message) < 3:
             message = random.choice(DEAD_CHAT_MESSAGES)
+        message = ping_prefix + message
 
-        # Algorithmic ping selection — use ping controller to prevent irritation
-        # Try role ping first — only if the role actually EXISTS in this guild
-        # (a cross-guild/deleted id renders as the ugly "@unknown-role")
-        role = None
-        if self.ping_role_id and hasattr(channel, 'guild') and channel.guild:
-            role = channel.guild.get_role(self.ping_role_id)
-        if role and ping_ctrl.can_ping_role(ch_id):
-            message = f"<@&{role.id}> {message}"
+        if role and ping_prefix.startswith("<@&"):
             ping_ctrl.record_role_ping(ch_id)
-        elif ping_ctrl.can_ping_here(ch_id) and random.random() < 0.30:
-            # 30% chance to use @here instead of role ping
-            message = f"@here {message}"
+        elif ping_prefix.startswith("@here"):
             ping_ctrl.record_here_ping(ch_id)
-        elif ping_ctrl.can_ping_user(ch_id):
-            # Try to ping a random online user
-            if hasattr(channel, 'guild') and channel.guild:
-                user = select_online_user(channel.guild, exclude_ids={self.client.user.id}, channel=channel,
-                                          history_msgs=self.client.history_cache.get(ch_id))
-                if user:
-                    message = f"<@{user.id}> {message}"
-                    ping_ctrl.record_user_ping(ch_id, user_id=user.id)
-                    # Track conversation with this user in the client's tracker
-                    if hasattr(self.client, 'conversation_tracker'):
-                        if ch_id not in self.client.conversation_tracker:
-                            self.client.conversation_tracker[ch_id] = {}
-                        self.client.conversation_tracker[ch_id][str(user.id)] = time.time()
-        # If no ping allowed, just send the message without a ping
+        elif pinged_user:
+            ping_ctrl.record_user_ping(ch_id, user_id=pinged_user.id)
+            if hasattr(self.client, 'conversation_tracker'):
+                if ch_id not in self.client.conversation_tracker:
+                    self.client.conversation_tracker[ch_id] = {}
+                self.client.conversation_tracker[ch_id][str(pinged_user.id)] = time.time()
 
         # Send with typing simulation
         typing_dur = random.uniform(1.5, 3.5)

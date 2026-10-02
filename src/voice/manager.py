@@ -196,13 +196,21 @@ class VoiceManager:
             return False
 
     async def _run_voice_action(self, client: discord.Client, user_id: int,
-                                text: str, guild) -> str | None:
-        """Delegate a spoken action request to the outsider action worker.
-        Returns a short summary note when it performed something — the
-        pipeline injects it into the reply directive so she acknowledges
-        it aloud; None → not an action / failed → normal reply continues.
-        Resolves the LIVE voice channel (stays correct across move_to)."""
+                                text: str, guild) -> tuple | None:
+        """Route a spoken request through the outsider action worker.
+        Returns ("info", facts) when a lookup ran and produced an answer, or
+        ("exec", None) when an action was queued to run after the spoken
+        reply — she says "on it" then does it, like a person. None → not an
+        action / failed → normal reply continues. Resolves the LIVE voice
+        channel (stays correct across move_to)."""
         try:
+            # Leave-vc is native-only — never reaches the worker
+            try:
+                from .vc_intent import leave_vc_score
+                if leave_vc_score(text) >= 0.5:
+                    return None
+            except Exception:
+                pass
             vc = discord.utils.get(client.voice_clients, guild=guild)
             ch = getattr(vc, "channel", None)
             if ch is None:
@@ -211,8 +219,15 @@ class VoiceManager:
             if ch is None:
                 return None
             from ..ai.action_bridge import get_action_worker
-            return await get_action_worker(client).try_handle_voice(
-                user_id, text, ch)
+            worker = get_action_worker(client)
+            kind = await worker.classify_request(text)
+            if kind == "info":
+                facts = await worker.run_voice_info(user_id, text, ch)
+                return ("info", facts) if facts else None
+            if kind == "exec":
+                if worker.queue_voice_action(user_id, text, ch):
+                    return ("exec", None)
+            return None
         except Exception as e:
             logger.debug(f"[voice] action worker call failed: {e!r}")
             return None
