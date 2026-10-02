@@ -325,8 +325,10 @@ class ActionWorker:
         r"members?|online|channels?|roles?)\b",
         re.I)
 
-    async def classify_request(self, text: str) -> Optional[str]:
-        """Cheap gate â€” 'info' | 'exec' | None. No execution happens here."""
+    async def classify_request(self, text: str) -> Optional[tuple]:
+        """Cheap gate — returns (kind, categories) with kind 'info' or
+        'exec', or None for chat. Callers pass categories through to the
+        queue/run call so the agent gets the router's filtered tool set."""
         if not _ENABLED or not self._ensure_ready():
             return None
         try:
@@ -340,13 +342,13 @@ class ActionWorker:
             # recently". Info lookups are read-only: a false positive is
             # harmless (worst case a wasted lookup).
             if self._INFO_HINTS.search(text) and await self._confirm_info(text):
-                return "info"
+                return ("info", set(self._INFO_CATS))
             return None
         if route.categories and route.categories <= self._INFO_CATS:
-            return "info"  # read-only route — no imperative gate needed
+            return ("info", route.categories)  # read-only — no imperative gate
         if not await self._confirm_action(text):
             return None
-        return "exec"
+        return ("exec", route.categories or set())
 
     def _ctx_for(self, channel, author_id: int):
         guild = getattr(channel, "guild", None)
@@ -390,7 +392,8 @@ class ActionWorker:
     # ------------------------------------------------------------------ #
     #  TEXT entry points
     # ------------------------------------------------------------------ #
-    def queue_text_action(self, message, trigger_text: str) -> bool:
+    def queue_text_action(self, message, trigger_text: str,
+                          categories=None) -> bool:
         """Queue an EXEC action in the background â€” the normal reply goes
         out first, then the action fires after a human-like delay (the
         requester sees 'on it' then the thing happens, like a person).
@@ -408,11 +411,11 @@ class ActionWorker:
                 try:
                     async with message.channel.typing():
                         await self._run_agent(
-                            ctx, trigger_text, None, CHAT_MODE, "text",
+                            ctx, trigger_text, categories, CHAT_MODE, "text",
                             speaker_name=message.author.display_name)
                 except Exception:
                     await self._run_agent(
-                        ctx, trigger_text, None, CHAT_MODE, "text",
+                        ctx, trigger_text, categories, CHAT_MODE, "text",
                         speaker_name=message.author.display_name)
             finally:
                 self._inflight.discard(key)
@@ -453,7 +456,8 @@ class ActionWorker:
     # ------------------------------------------------------------------ #
     #  VOICE entry points
     # ------------------------------------------------------------------ #
-    def queue_voice_action(self, user_id: int, transcript: str, voice_channel) -> bool:
+    def queue_voice_action(self, user_id: int, transcript: str, voice_channel,
+                           categories=None) -> bool:
         key = (str(getattr(voice_channel, "id", 0)), str(user_id))
         if key in self._inflight:
             return False
@@ -469,7 +473,7 @@ class ActionWorker:
             try:
                 ctx = self._ctx_for(voice_channel, user_id)
                 await self._run_agent(
-                    ctx, f"[{speaker}]: {transcript}", None, VOICE_MODE, "voice")
+                    ctx, f"[{speaker}]: {transcript}", categories, VOICE_MODE, "voice")
             finally:
                 self._inflight.discard(key)
 

@@ -129,6 +129,10 @@ class EngagementLog:
                 except Exception:
                     continue
                 ts = m.created_at.timestamp()
+                # A human message right before ours = it was conversational,
+                # not a standalone engagement post
+                if any(0 < ts - ht < 180 for ht in human_tss):
+                    continue
                 if now - ts >= self.stale_s and not any(ht > ts for ht in human_tss):
                     n += 1
         return n
@@ -298,8 +302,10 @@ class EngagementLog:
             if m.id in tracked_ids:
                 continue
             # Only ENGAGEMENT-looking messages are deletable — a standalone
-            # post with no reply reference and no reactions. Conversation
-            # replies and anything users interacted with are never swept.
+            # post with no reply reference, no reactions, and no human
+            # message immediately before it (a human msg <3min prior means
+            # it was conversational). Anything users interacted with or
+            # replied to is never swept.
             if getattr(m, "reference", None) is not None:
                 continue
             try:
@@ -308,6 +314,8 @@ class EngagementLog:
             except Exception:
                 continue
             ts = m.created_at.timestamp()
+            if any(0 < ts - ht < 180 for ht in human_tss):
+                continue  # a human spoke right before it → conversational
             if (now - ts) < self.stale_s:
                 continue
             if any(ht > ts for ht in human_tss):

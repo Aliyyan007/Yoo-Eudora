@@ -220,13 +220,15 @@ class VoiceManager:
                 return None
             from ..ai.action_bridge import get_action_worker
             worker = get_action_worker(client)
-            kind = await worker.classify_request(text)
+            classified = await worker.classify_request(text)
+            if not classified:
+                return None
+            kind, cats = classified
             if kind == "info":
                 facts = await worker.run_voice_info(user_id, text, ch)
                 return ("info", facts) if facts else None
-            if kind == "exec":
-                if worker.queue_voice_action(user_id, text, ch):
-                    return ("exec", None)
+            if worker.queue_voice_action(user_id, text, ch, cats):
+                return ("exec", None)
             return None
         except Exception as e:
             logger.debug(f"[voice] action worker call failed: {e!r}")

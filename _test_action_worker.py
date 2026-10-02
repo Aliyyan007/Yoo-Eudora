@@ -205,10 +205,11 @@ async def main():
 
     worker = ActionWorker(client)
     msg = FakeMessage("eudora send a message saying hello", author, ch)
-    kind = await worker.classify_request(msg.clean_content)
-    check("classified exec", kind == "exec", f"kind={kind!r}")
+    classified = await worker.classify_request(msg.clean_content)
+    check("classified exec", classified and classified[0] == "exec", f"kind={classified!r}")
     t0 = time.monotonic()
-    queued = worker.queue_text_action(msg, msg.clean_content)
+    queued = worker.queue_text_action(msg, msg.clean_content,
+                                      classified[1] if classified else None)
     check("queued for bg exec", queued)
     await drain(worker)
     dt = time.monotonic() - t0
@@ -224,8 +225,8 @@ async def main():
     ch.sent.clear()
     decl = FakeMessage("Users with <@&1432293> role can use @everyone ping once in a week",
                        author, ch)
-    kind = await worker.classify_request(decl.clean_content)
-    check("declarative -> None (no worker run)", kind is None)
+    classified = await worker.classify_request(decl.clean_content)
+    check("declarative -> None (no worker run)", classified is None)
     check("nothing leaked to channel", not ch.sent)
 
     print("== 3c. info lookup -> 'info', answer returned for relay ==")
@@ -233,8 +234,8 @@ async def main():
         ("tools", [("get_recent_joins", {})]),
         ("content", "most recent joiner is Sarah"),
     ])
-    kind = await worker.classify_request("who's the most recent person to join the server")
-    check("lookup classified 'info'", kind == "info", f"kind={kind!r}")
+    classified = await worker.classify_request("who's the most recent person to join the server")
+    check("lookup classified 'info'", classified and classified[0] == "info", f"kind={classified!r}")
     answer = await worker.run_text_info(
         FakeMessage("who's the most recent person to join the server", author, ch),
         "who's the most recent person to join the server")
@@ -245,8 +246,8 @@ async def main():
     worker2 = ActionWorker(client)
     ch.sent.clear()
     msg2 = FakeMessage("how are you", author, ch)
-    kind = await worker2.classify_request(msg2.clean_content)
-    check("chat -> None", kind is None)
+    classified = await worker2.classify_request(msg2.clean_content)
+    check("chat -> None", classified is None)
     check("nothing sent", not ch.sent)
 
     print("== 5. non-owner permission gate ==")
@@ -270,8 +271,9 @@ async def main():
     ])
     ch.sent.clear()
     msg3 = FakeMessage("dm bob saying hi", author, ch)
-    kind = await worker.classify_request(msg3.clean_content)
-    worker.queue_text_action(msg3, msg3.clean_content)
+    classified = await worker.classify_request(msg3.clean_content)
+    worker.queue_text_action(msg3, msg3.clean_content,
+                             classified[1] if classified else None)
     await drain(worker)
     check("denied run -> nothing sent", not ch.sent, f"{ch.sent}")
 
@@ -299,8 +301,9 @@ async def main():
     # send_vc_text resolves its own channel — patch the resolver to our fake VC
     async def _fake_vc(ctx, q): return vc
     ae_voice._resolve_voice_channel = _fake_vc
-    kind = await worker.classify_request("send that to the vc chat")
-    worker.queue_voice_action(author.id, "send that to the vc chat", vc)
+    classified = await worker.classify_request("send that to the vc chat")
+    worker.queue_voice_action(author.id, "send that to the vc chat", vc,
+                              classified[1] if classified else None)
     await drain(worker)
     check("vc text sent", vc.sent and vc.sent[-1][0] == "on it", f"{vc.sent}")
     check("no spoken/done reply forwarded", all(c[0] != "sure thing" for c in vc.sent))
@@ -331,8 +334,9 @@ async def main():
     worker._agent = None
     ch.sent.clear()
     m = FakeMessage("send a message", author, ch)
-    kind = await worker.classify_request(m.clean_content)
-    worker.queue_text_action(m, m.clean_content)
+    classified = await worker.classify_request(m.clean_content)
+    worker.queue_text_action(m, m.clean_content,
+                             classified[1] if classified else None)
     await drain(worker)
     check("rescued call actually ran", ch.sent and ch.sent[-1][0] == "rescued call", f"{ch.sent}")
 
@@ -342,9 +346,9 @@ async def main():
     worker._agent = None
     ch.sent.clear()
     m = FakeMessage("send hello", author, ch)
-    kind = await worker.classify_request(m.clean_content)
-    if kind:
-        worker.queue_text_action(m, m.clean_content)
+    classified = await worker.classify_request(m.clean_content)
+    if classified:
+        worker.queue_text_action(m, m.clean_content, classified[1])
         await drain(worker)
     check("engine crash -> nothing sent, no crash", not ch.sent)
 

@@ -1987,14 +1987,16 @@ class AIPersonaClient(discord.Client):
             if not cmd_type:
                 try:
                     worker = get_action_worker(self)
-                    action_kind = await worker.classify_request(trigger_text)
-                    if action_kind == "exec":
+                    classified = await worker.classify_request(trigger_text)
+                    if classified and classified[0] == "exec":
                         # Reply FIRST, then the action runs in the background
                         # after a human-like delay — like a person saying
-                        # "on it" and then actually doing it.
-                        worker.queue_text_action(message, trigger_text)
-                        action_note = "queued"
-                    elif action_kind == "info":
+                        # "on it" and then actually doing it. Only claim it
+                        # when it actually queued (a dup may be inflight).
+                        if worker.queue_text_action(message, trigger_text,
+                                                    classified[1]):
+                            action_note = "queued"
+                    elif classified and classified[0] == "info":
                         # Look it up BEFORE replying so the answer lands in
                         # the reply itself instead of an "idk".
                         info_facts = await worker.run_text_info(message, trigger_text)
