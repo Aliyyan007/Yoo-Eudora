@@ -56,7 +56,7 @@ class Settings(BaseSettings):
 
     # --- Discord ---
     discord_token: str = Field(..., alias="DISCORD_TOKEN")
-    server_invite: str = Field("", alias="SERVER_INVITE")
+
     # Comma-separated list of owner IDs — "123" or "123,456" both work.
     owner_user_id: str = Field("0", alias="OWNER_USER_ID")
     command_channel_id: int = Field(0, alias="COMMAND_CHANNEL_ID")

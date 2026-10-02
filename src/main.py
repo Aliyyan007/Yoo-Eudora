@@ -75,9 +75,6 @@ def load_env_and_channels():
         ping_role_id = int(ping_role_id)
         logger.info(f"Chat revive ping role configured: {ping_role_id}")
 
-    # Server invite
-    server_invite = os.getenv("SERVER_INVITE", "")
-
     # Bump settings
     base_interval = float(os.getenv("BUMP_BASE_INTERVAL_HOURS", "3"))
     jitter_hours = float(os.getenv("BUMP_JITTER_HOURS", "2"))
@@ -87,7 +84,6 @@ def load_env_and_channels():
         "bump_channel_id": bump_channel_id,
         "text_channel_ids": text_channel_ids,
         "ping_role_id": ping_role_id,
-        "server_invite": server_invite,
         "base_interval": base_interval,
         "jitter_hours": jitter_hours,
     }
@@ -154,26 +150,6 @@ async def main():
         )
         client.bump_scheduler = bump_scheduler
         client._spawn(bump_scheduler.start())
-
-        # Auto-join server if invite is configured (each account joins once)
-        if config["server_invite"]:
-            async def join_server():
-                await client.wait_until_ready()
-                invite_code = config["server_invite"].split("/")[-1]
-                try:
-                    try:
-                        invite = await client.fetch_invite(invite_code)
-                        gid = getattr(getattr(invite, "guild", None), "id", None)
-                        if gid and any(g.id == gid for g in client.guilds):
-                            return
-                    except Exception:
-                        pass
-                    logger.info(f"[{profile.id}] Attempting to join server: {invite_code}")
-                    await client.accept_invite(invite_code)
-                    logger.info(f"[{profile.id}] Joined server: {invite_code}")
-                except Exception as e:
-                    logger.warning(f"[{profile.id}] Could not join server (may already be a member): {e}")
-            client._spawn(join_server())
 
         return client, client.start(token)
 

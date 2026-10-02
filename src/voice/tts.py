@@ -20,7 +20,6 @@ from loguru import logger
 class TTSConfig:
     api_key: str
     voice_id: str
-    fallback_voice_id: str = ""
     model: str = "s2.1-pro-free"
     latency: str = "low"
     base_url: str = "wss://api.fish.audio"
@@ -58,7 +57,7 @@ class FishAudioTTS:
         except (asyncio.TimeoutError, OSError, websockets.WebSocketException) as e:
             raise ConnectionError(f"Fish Audio connect failed: {e}") from e
 
-        voice_id = self._cfg.voice_id or self._cfg.fallback_voice_id
+        voice_id = self._cfg.voice_id
         if not voice_id:
             raise ValueError("No voice_id configured for Fish Audio TTS")
 

@@ -467,7 +467,6 @@ class AIPersonaClient(discord.Client):
                 tts_config = TTSConfig(
                     api_key=fish_api_key,
                     voice_id=fish_voice_id,
-                    fallback_voice_id=os.getenv("FISH_AUDIO_FALLBACK_VOICE_ID", ""),
                     model=os.getenv("FISH_AUDIO_MODEL", "s2.1-pro-free"),
                 )
                 self.voice_manager = VoiceManager(
