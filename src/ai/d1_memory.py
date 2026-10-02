@@ -1045,3 +1045,55 @@ def mark_channel_seen(channel_id: str, name: str, guild_id: str):
         return _run_async(mark_channel_seen_async(channel_id, name, guild_id))
     except Exception:
         return _json_fallback.mark_channel_seen(channel_id, name, guild_id)
+
+
+# -- Shared server-state KV (NEVER namespaced -- rotation-safe persistence) --
+
+async def save_server_state_async(key: str, value: dict):
+    """Persist a small JSON blob under a shared key. Used for state that must
+    survive redeploys/ephemeral filesystems (ping cooldowns, rotation meta).
+    Best-effort -- falls back to memory.json when D1 is down."""
+    if not await _d1_ok():
+        return _json_fallback.save_server_state(key, value)
+    client = _get_d1()
+    try:
+        await client.execute_write(
+            "INSERT INTO server_state (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            [str(key), json.dumps(value), time.time()],
+        )
+    except Exception as e:
+        logger.debug(f"D1 save_server_state failed: {e}")
+        return _json_fallback.save_server_state(key, value)
+
+
+async def load_server_state_async(key: str):
+    if not await _d1_ok():
+        return _json_fallback.load_server_state(key)
+    client = _get_d1()
+    try:
+        rows = await client.execute(
+            "SELECT value FROM server_state WHERE key = ?", [str(key)])
+        if rows and rows[0].get("value"):
+            return json.loads(rows[0]["value"])
+        return None
+    except Exception as e:
+        logger.debug(f"D1 load_server_state failed: {e}")
+        return _json_fallback.load_server_state(key)
+
+
+def save_server_state(key: str, value: dict):
+    """Sync wrapper."""
+    try:
+        return _run_async(save_server_state_async(key, value))
+    except Exception:
+        return _json_fallback.save_server_state(key, value)
+
+
+def load_server_state(key: str):
+    """Sync wrapper."""
+    try:
+        return _run_async(load_server_state_async(key))
+    except Exception:
+        return _json_fallback.load_server_state(key)

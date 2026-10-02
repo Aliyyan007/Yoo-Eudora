@@ -75,6 +75,7 @@ _OWNER_ONLY = {
 
 # Non-owner tools where role pings are silently stripped â€” they can resolve
 # @everyone/@here and mass-ping the whole server.
+_MASS_MENTION = re.compile(r"@everyone|@here|<@&\d+>", re.IGNORECASE)
 _STRIP_PING_ROLES = {
     "send_message", "send_dm", "send_gif", "send_vc_text",
     "send_multiple_gifs",
@@ -245,6 +246,13 @@ class ActionWorker:
         if name in _STRIP_PING_ROLES and args.get("ping_users"):
             # sanity: cap at 5 pings so "ping everyone one-by-one" loops
             args["ping_users"] = list(args["ping_users"])[:5]
+        # Mass-ping tokens in TEXT bodies bypass the arg-level strips —
+        # "@everyone"/"@here"/"<@&id>" inside `content` ping for real on a
+        # user account. Strip them for non-owner requests.
+        from .reply import sanitize_mass_mentions
+        for k in ("content", "text", "message"):
+            if isinstance(args.get(k), str) and _MASS_MENTION.search(args[k]):
+                args[k] = sanitize_mass_mentions(args[k])
         return True, args
 
     # ------------------------------------------------------------------ #

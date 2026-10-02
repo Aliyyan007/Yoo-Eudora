@@ -449,3 +449,17 @@ def mark_channel_seen(channel_id: str, name: str, guild_id: str):
         "last_seen": time.time(),
     }
     _save_memory(memory)
+
+
+def save_server_state(key: str, value: dict):
+    """Shared server-state KV fallback (D1 path when available)."""
+    memory = _load_memory()
+    if "_server_state" not in memory:
+        memory["_server_state"] = {}
+    memory["_server_state"][str(key)] = value
+    _save_memory(memory)
+
+
+def load_server_state(key: str):
+    """Shared server-state KV fallback."""
+    return _load_memory().get("_server_state", {}).get(str(key))

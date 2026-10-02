@@ -51,6 +51,12 @@ class PingController:
         # Recently-pinged users: channel_id -> deque[(user_id, ts)] — don't
         # re-ping the same person for a while (looked spammy when it happened)
         self._recently_pinged: Dict[str, deque] = {}
+        # Consecutive channel pings (any type) that got NO human reply.
+        # A dead channel otherwise gets pinged every cooldown forever —
+        # sweep deletes the unanswered msg, next cycle fires again. Streak
+        # multiplies cooldowns; ≥2 unanswered silences mass pings until a
+        # human actually speaks.
+        self._unanswered_pings: Dict[str, int] = {}
         try:
             self._ping_repeat_s = int(os.getenv("PING_REPEAT_COOLDOWN_HOURS", "2")) * 3600
         except ValueError:
@@ -99,9 +105,42 @@ class PingController:
                          if now - float(t) < keep]
                 if fresh:
                     self._recently_pinged[ch_id] = deque(fresh, maxlen=30)
+            for ch_id, streak in (data.get("unanswered") or {}).items():
+                self._unanswered_pings[ch_id] = int(streak)
             logger.debug(f"Ping state restored from {self._state_path}")
         except Exception as e:
             logger.debug(f"Ping state load failed (starting fresh): {e}")
+        # Merge D1 state — survives redeploys where data/ is wiped (Render
+        # ephemeral FS is exactly how @everyone escaped its weekly cap)
+        try:
+            from . import d1_memory as _mem
+            remote = _mem.load_server_state("ping_state")
+            if isinstance(remote, dict):
+                self._merge_remote(remote)
+        except Exception:
+            pass
+
+    def _merge_remote(self, data: dict):
+        """Union remote (D1) ping state into local — take the STRICTER view
+        (union of timestamps, max streak) so neither a wiped file nor a stale
+        file can reset cooldowns."""
+        for name, tracker in [("here", self._here_pings),
+                              ("everyone", self._everyone_pings),
+                              ("role", self._role_pings),
+                              ("user", self._user_pings)]:
+            for ch_id, ts_list in (data.get(name) or {}).items():
+                merged = sorted(set(
+                    float(t) for t in
+                    list(tracker.get(ch_id, [])) + [float(t) for t in ts_list]
+                ))[-50:]
+                tracker[ch_id] = deque(merged, maxlen=50)
+        for ch_id, pairs in (data.get("recently") or {}).items():
+            merged = list(self._recently_pinged.get(ch_id, [])) + [
+                (int(u), float(t)) for u, t in pairs]
+            self._recently_pinged[ch_id] = deque(merged[-30:], maxlen=30)
+        for ch_id, streak in (data.get("unanswered") or {}).items():
+            self._unanswered_pings[ch_id] = max(
+                self._unanswered_pings.get(ch_id, 0), int(streak))
 
     def _save_state(self):
         """Atomically persist all ping timelines to disk."""
@@ -114,10 +153,17 @@ class PingController:
                 "user": {c: list(q) for c, q in self._user_pings.items()},
                 "recently": {c: [[u, t] for u, t in q]
                              for c, q in self._recently_pinged.items()},
+                "unanswered": dict(self._unanswered_pings),
             }
             tmp = self._state_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data))
             tmp.replace(self._state_path)
+            # Mirror to D1 — best-effort, survives redeploys (ephemeral FS)
+            try:
+                from . import d1_memory as _mem
+                _mem.save_server_state("ping_state", data)
+            except Exception:
+                pass
         except Exception as e:
             logger.debug(f"Ping state save failed: {e}")
 
@@ -141,16 +187,46 @@ class PingController:
         pings = tracker.get(channel_id, deque())
         return pings[-1] if pings else 0
 
+    # ── Unanswered-ping streaks ──────────────────────────────────────────
+    # A role/@here/@everyone ping nobody responds to is a warning shot —
+    # pinging again on the next cooldown tick is what made the bot feel
+    # spammy/dangerous. Each unanswered ping multiplies the cooldown and
+    # ≥2 unanswered mutes mass pings until a human actually speaks.
+
+    def _unanswered(self, channel_id: str) -> int:
+        return self._unanswered_pings.get(channel_id, 0)
+
+    def note_human_activity(self, channel_id: str):
+        """A human spoke in the channel — pings are working; reset streak."""
+        if self._unanswered_pings.pop(channel_id, None) is not None:
+            self._save_state()
+
+    def _bump_unanswered(self, channel_id: str):
+        self._unanswered_pings[channel_id] = self._unanswered(channel_id) + 1
+
+    def _mass_ping_blocked(self, channel_id: str) -> bool:
+        """Channel pings muted after 2 consecutive unanswered pings —
+        resume only when humans actually talk again."""
+        return self._unanswered(channel_id) >= 2
+
+    def _cooldown_left(self, channel_id: str, tracker: Dict[str, deque],
+                       base_s: float) -> float:
+        """Seconds until the next ping is allowed — streak-scaled."""
+        last = self._last_ping_time(channel_id, tracker)
+        eff = base_s * (1 + 3 * self._unanswered(channel_id))
+        return (last + eff) - time.time()
+
     def can_ping_here(self, channel_id: str) -> bool:
         """Check if @here can be used in this channel."""
+        if self._mass_ping_blocked(channel_id):
+            return False
         now = time.time()
         # Check daily limit
         daily_count = self._count_recent(channel_id, self._here_pings, 24 * 3600)
         if daily_count >= self._here_daily_limit:
             return False
-        # Check cooldown
-        last = self._last_ping_time(channel_id, self._here_pings)
-        if now - last < self._here_cooldown_s:
+        # Check cooldown (streak-scaled)
+        if self._cooldown_left(channel_id, self._here_pings, self._here_cooldown_s) > 0:
             return False
         # Check total daily limit
         total = self._get_total_daily_count(channel_id)
@@ -160,14 +236,15 @@ class PingController:
 
     def can_ping_everyone(self, channel_id: str) -> bool:
         """Check if @everyone can be used in this channel."""
+        if self._mass_ping_blocked(channel_id):
+            return False
         now = time.time()
         # Check weekly limit
         weekly_count = self._count_recent(channel_id, self._everyone_pings, 7 * 24 * 3600)
         if weekly_count >= self._everyone_weekly_limit:
             return False
-        # Check cooldown
-        last = self._last_ping_time(channel_id, self._everyone_pings)
-        if now - last < self._everyone_cooldown_s:
+        # Check cooldown (streak-scaled)
+        if self._cooldown_left(channel_id, self._everyone_pings, self._everyone_cooldown_s) > 0:
             return False
         # Check total daily limit
         total = self._get_total_daily_count(channel_id)
@@ -177,14 +254,15 @@ class PingController:
 
     def can_ping_role(self, channel_id: str) -> bool:
         """Check if a role ping can be used in this channel."""
+        if self._mass_ping_blocked(channel_id):
+            return False
         now = time.time()
         # Check daily limit
         daily_count = self._count_recent(channel_id, self._role_pings, 24 * 3600)
         if daily_count >= self._role_daily_limit:
             return False
-        # Check cooldown
-        last = self._last_ping_time(channel_id, self._role_pings)
-        if now - last < self._role_cooldown_s:
+        # Check cooldown (streak-scaled: 30m → 2h → muted)
+        if self._cooldown_left(channel_id, self._role_pings, self._role_cooldown_s) > 0:
             return False
         # Check total daily limit
         total = self._get_total_daily_count(channel_id)
@@ -193,11 +271,16 @@ class PingController:
         return True
 
     def can_ping_user(self, channel_id: str) -> bool:
-        """Check if a direct user ping can be used in this channel."""
+        """Check if a direct user ping can be used in this channel.
+        User pings are lighter (one notification, one person) — they get a
+        milder streak block (4 unanswered) and a smaller cooldown scale."""
+        if self._unanswered(channel_id) >= 4:
+            return False
         now = time.time()
-        # Check cooldown
+        # Check cooldown (mild streak scale)
         last = self._last_ping_time(channel_id, self._user_pings)
-        if now - last < self._user_cooldown_s:
+        eff = self._user_cooldown_s * (1 + self._unanswered(channel_id))
+        if now - last < eff:
             return False
         # Check total daily limit
         total = self._get_total_daily_count(channel_id)
@@ -219,6 +302,7 @@ class PingController:
         if channel_id not in self._here_pings:
             self._here_pings[channel_id] = deque(maxlen=50)
         self._here_pings[channel_id].append(time.time())
+        self._bump_unanswered(channel_id)
         self._save_state()
         logger.info(f"@here ping recorded in #{channel_id}")
 
@@ -227,6 +311,7 @@ class PingController:
         if channel_id not in self._everyone_pings:
             self._everyone_pings[channel_id] = deque(maxlen=50)
         self._everyone_pings[channel_id].append(time.time())
+        self._bump_unanswered(channel_id)
         self._save_state()
         logger.info(f"@everyone ping recorded in #{channel_id}")
 
@@ -235,6 +320,7 @@ class PingController:
         if channel_id not in self._role_pings:
             self._role_pings[channel_id] = deque(maxlen=50)
         self._role_pings[channel_id].append(time.time())
+        self._bump_unanswered(channel_id)
         self._save_state()
         logger.info(f"Role ping recorded in #{channel_id}")
 
@@ -246,6 +332,7 @@ class PingController:
         if user_id is not None:
             dq = self._recently_pinged.setdefault(channel_id, deque(maxlen=30))
             dq.append((int(user_id), time.time()))
+        self._bump_unanswered(channel_id)
         self._save_state()
         logger.info(f"User ping recorded in #{channel_id}")
 
@@ -308,6 +395,9 @@ class ReEngagementTracker:
     def record_human_reply(self, channel_id: str):
         """Record that a human replied in the channel."""
         self._got_reply[channel_id] = True
+        # Humans are talking — reset the unanswered-ping streak so pings
+        # are allowed again in this channel
+        _ping_controller.note_human_activity(channel_id)
 
     def needs_re_engagement(self, channel_id: str) -> bool:
         """

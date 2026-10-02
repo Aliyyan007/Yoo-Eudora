@@ -210,3 +210,61 @@ def stale_pending(persona_id: str) -> List[dict]:
 
 def pending_reply_cap() -> int:
     return _PENDING_REPLY_LIMIT
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Deferred replies — directed messages dropped on daily-cap, answered
+#  once the counter resets (or the same persona next rotates in)
+# ─────────────────────────────────────────────────────────────────────────
+
+_DEFERRED_DIR = os.path.join(_DATA_DIR, "deferred")
+_DEFERRED_MAX_AGE_S = 20 * 3600   # a reply >20h late reads weird — expire
+_DEFERRED_LIMIT_PER_CH = 3        # at most this many per channel
+
+
+def _deferred_path(persona_id: str) -> str:
+    return os.path.join(_DEFERRED_DIR, f"{persona_id}.json")
+
+
+def add_deferred(persona_id: str, *, guild_id: int, channel_id: int,
+                 message_id: int, author_id: int, author_name: str,
+                 text: str) -> None:
+    """Queue a directed message that hit the daily cap. Deduped by
+    message_id; capped at 3 per channel / 30 total."""
+    path = _deferred_path(persona_id)
+    items = _read_json(path, [])
+    if not isinstance(items, list):
+        items = []
+    mid = int(message_id)
+    if any(int(i.get("message_id", 0)) == mid for i in items):
+        return
+    ch = int(channel_id)
+    ch_items = [i for i in items if i.get("channel_id") == ch]
+    if len(ch_items) >= _DEFERRED_LIMIT_PER_CH:
+        items = [i for i in items if i.get("channel_id") != ch] + ch_items[1:]
+    items.append({
+        "guild_id": int(guild_id) if guild_id else 0,
+        "channel_id": ch,
+        "message_id": mid,
+        "author_id": int(author_id),
+        "author_name": author_name,
+        "text": (text or "")[:300],
+        "ts": time.time(),
+    })
+    _atomic_write(path, items[-30:])
+
+
+def deferred_for(persona_id: str) -> List[dict]:
+    """Fresh deferred items for this persona (unexpired)."""
+    now = time.time()
+    return [
+        it for it in _read_json(_deferred_path(persona_id), [])
+        if now - it.get("ts", 0) < _DEFERRED_MAX_AGE_S
+    ]
+
+
+def remove_deferred(persona_id: str, message_id: int) -> None:
+    path = _deferred_path(persona_id)
+    items = _read_json(path, [])
+    items = [i for i in items if int(i.get("message_id", 0)) != int(message_id)]
+    _atomic_write(path, items)

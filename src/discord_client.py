@@ -494,6 +494,9 @@ class AIPersonaClient(discord.Client):
             if not self._pending_processed:
                 self._pending_processed = True
                 self._spawn(self._process_pending_interactions())
+            if not getattr(self, "_deferred_started", False):
+                self._deferred_started = True
+                self._spawn(self._deferred_replies_loop())
         except Exception as e:
             logger.debug(f"[persona] registry/pending init failed: {e}")
 
@@ -534,6 +537,41 @@ class AIPersonaClient(discord.Client):
             logger.info(f"[persona] pending catch-up done ({len(fresh)} fresh, {len(stale)} stale)")
         except Exception as e:
             logger.debug(f"[persona] pending processing failed: {e}")
+
+    async def _deferred_replies_loop(self):
+        """Answer directed messages that were dropped on the daily cap once
+        the counter has room again — the user gets a real reply later
+        instead of silence. One per channel per wake, natural pacing."""
+        from .persona import runtime as prt
+        await asyncio.sleep(120)   # settle after connect
+        while not self.is_closed():
+            try:
+                items = prt.deferred_for(self.persona.id)
+                if items:
+                    done_ch = set()
+                    for it in items:
+                        ch_id = str(it["channel_id"])
+                        if ch_id in done_ch or not self.can_send(ch_id):
+                            continue
+                        try:
+                            channel = self.get_channel(it["channel_id"])
+                            if channel is None:
+                                continue
+                            msg = await channel.fetch_message(it["message_id"])
+                            # Remove BEFORE replying — a fetch/process failure
+                            # must not wedge the item forever (one-shot).
+                            prt.remove_deferred(self.persona.id, it["message_id"])
+                            done_ch.add(ch_id)
+                            await asyncio.sleep(random.uniform(3, 8))
+                            await self._on_message_impl(msg)
+                            logger.info(
+                                f"[deferred] answered {it['author_name']}'s "
+                                f"queued message in #{channel.name}")
+                        except Exception as e:
+                            logger.debug(f"[deferred] {it.get('message_id')} skipped: {e}")
+            except Exception as e:
+                logger.debug(f"Deferred loop error: {e}")
+            await asyncio.sleep(90)
 
     async def _status_update_loop(self):
         """Periodically update Discord status and bio."""
@@ -1183,6 +1221,24 @@ class AIPersonaClient(discord.Client):
         logger.info(f"[{message.channel}] {message.author.name}: '{message.content[:50]}' -> {respond_reason}")
 
         if not should_respond:
+            # Daily-cap drop on a DIRECTED message (every "daily-cap" reason is
+            # post-directed-gate — mention/reply/name/dm). Queue it so the user
+            # still gets answered once the counter resets instead of silence.
+            if "daily-cap" in respond_reason and message.guild is not None:
+                try:
+                    from .persona import runtime as _prt
+                    _prt.add_deferred(
+                        self.persona.id,
+                        guild_id=message.guild.id,
+                        channel_id=message.channel.id,
+                        message_id=message.id,
+                        author_id=message.author.id,
+                        author_name=message.author.display_name,
+                        text=message.clean_content,
+                    )
+                    logger.info(f"Deferred {message.author.name}'s msg for {self.persona.id} (daily-cap)")
+                except Exception:
+                    pass
             return
 
         # Double-send guard with message queue

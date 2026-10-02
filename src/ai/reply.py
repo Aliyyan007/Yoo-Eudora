@@ -424,10 +424,13 @@ def generate_reply(
                     "new_status": None, "new_mood": None, "search_query": None}
         return None
 
-    # Strip leaked model control tokens from any text fields
+    # Strip leaked model control tokens + mass-ping tokens from text fields.
+    # @everyone/@here/<@&role> are REAL pings on user accounts — the only
+    # legit source is a PingController-chosen prefix, never generated text.
     for _k in ("reply", "burst_reply", "new_status"):
         if isinstance(data.get(_k), str):
-            data[_k] = re.sub(r'<\|[^|]*\|>', '', data[_k]).strip()
+            data[_k] = sanitize_mass_mentions(
+                re.sub(r'<\|[^|]*\|>', '', data[_k])).strip()
     return data
 
 
@@ -519,6 +522,17 @@ def self_reflect(transcript: str) -> list:
     return llm.parse_json_array(raw)
 
 
+_MASS_MENTION_RE = re.compile(r"@everyone|@here|<@&\d+>", re.IGNORECASE)
+
+
+def sanitize_mass_mentions(text: str) -> str:
+    """Strip mass-ping tokens (@everyone, @here, <@&role>) from generated
+    text. User accounts ping FOR REAL — no allowed_mentions guard — so the
+    only legit mass ping is a PingController-chosen prefix, never model text.
+    Single-user <@id> mentions are kept (normal conversation)."""
+    return _MASS_MENTION_RE.sub("", text or "")
+
+
 def generate_proactive_message(channel_topic: str = "", for_user: str = None) -> str:
     """Generate a proactive message to start a conversation.
     for_user: display name of the user the message will ping — keeps the
@@ -548,8 +562,12 @@ def generate_proactive_message(channel_topic: str = "", for_user: str = None) ->
         # "<|end_of_text|>") â€” they render as literal garbage in the channel
         text = re.sub(r'<\|[^|]*\|>', '', text)
         # Freehand '@name' mentions render as literal garbage — pings are
-        # added by the caller, drop any the model wrote anyway
+        # added by the caller, drop any the model wrote anyway. Also strip
+        # resolved-mention forms (<@id>, <@!id>, <@&role>) and mass-pings —
+        # anything that would actually ping on a user account.
         text = re.sub(r'@[^\s]+', '', text)
+        text = re.sub(r'<@!?\d+>', '', text)
+        text = sanitize_mass_mentions(text)
         text = ' '.join(text.split())  # collapse the gaps left behind
         text = text.split("\n")[0].strip()
         return text if len(text) > 2 else ""

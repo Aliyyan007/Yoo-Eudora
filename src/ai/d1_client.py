@@ -198,13 +198,21 @@ class D1Client:
                 guild_id TEXT NOT NULL,
                 last_seen REAL NOT NULL
             )""",
+
+            # Shared server-state KV — survives redeploys where the local
+            # filesystem is ephemeral (ping cooldowns, rotation counters)
+            """CREATE TABLE IF NOT EXISTS server_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )""",
         ]
         
         for sql in statements:
             await self.execute(sql)
         
         self._initialized = True
-        logger.info("D1 schema initialized (8 tables)")
+        logger.info("D1 schema initialized (9 tables)")
     
     async def is_available(self) -> bool:
         """Check if D1 is configured and accessible."""
