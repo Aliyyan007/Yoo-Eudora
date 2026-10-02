@@ -1919,6 +1919,9 @@ class VoicePipeline:
         self._user_last_response.pop(user_id, None)
         self._user_utt_start.pop(user_id, None)
         self._user_farewell_at.pop(user_id, None)
+        # Without this their stale timestamp keeps the VC "active" forever —
+        # the silence-leave would never fire after they left for real.
+        self._user_last_speech_time.pop(user_id, None)
         self._irritation.clear(user_id)
         self._finalizing.discard(user_id)
         self._user_pkt_queues.pop(user_id, None)

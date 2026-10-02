@@ -344,7 +344,19 @@ class VoiceManager:
             await self._auto_leave(client, guild, "vc's empty, dipping out 👋")
             return
 
-        # Check silence
+        # Check silence — but measure REAL activity, not just joins.
+        # _last_speaking is only written on join/user-join; the pipeline
+        # tracks actual utterances (user speech + bot TTS). Without this
+        # merge the silence timer would fire 5min after joining even while
+        # a conversation is actively running.
+        pipeline = self._pipelines.get(guild.id)
+        if pipeline:
+            last_sp = pipeline.get_last_speech_time()
+            if last_sp:
+                self._last_speaking[guild.id] = max(
+                    self._last_speaking.get(guild.id, 0), last_sp)
+            if pipeline.is_speaking:
+                self._last_speaking[guild.id] = time.time()
         silence = self.get_silence_duration(guild.id)
 
         # Leave if silent for too long
@@ -359,6 +371,9 @@ class VoiceManager:
         # keeps it here well past 2h; a dead one gets left early.
         leave_score = self._leave_score(guild.id, non_bot_members, silence)
         if leave_score >= 0.55 and random.random() < leave_score:
+            # Never disconnect mid-sentence — re-evaluate next tick instead
+            if pipeline and pipeline.is_speaking:
+                return
             await self._auto_leave(
                 client, guild,
                 random.choice([

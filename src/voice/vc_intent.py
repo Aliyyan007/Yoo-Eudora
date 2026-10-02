@@ -137,8 +137,13 @@ def leave_vc_score(text: str) -> float:
     for pat in _VC_LEAVE_CMD_PATTERNS:
         if re.search(pat, t):
             return 0.85
-    # "leave!" / "you leave" alone — very short imperatives only
-    if re.search(r"\b(?:you\s+)?leave\b", t) and len(t.split()) <= 3:
+    # Bare "leave" imperatives — the WHOLE utterance must be the command
+    # ("leave", "eudora leave", "you leave", "leave now"). Never fire on
+    # "leave it", "i'll leave", "don't leave" or Whisper garbles containing
+    # the word mid-sentence — a false positive drops the call mid-chat.
+    if re.fullmatch(
+            r"(?:(?:eudora|bot|hey|please|pls|you|just|oi)\s+)*leave"
+            r"(?:\s+(?:now|already|please|pls))*[.!]*", t):
         return 0.6
     return 0.0
 
