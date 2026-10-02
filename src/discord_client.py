@@ -1248,7 +1248,16 @@ class AIPersonaClient(discord.Client):
                             break
 
             if msg_has_other_name and not msg_has_our_name and not mentions_bot:
-                return False, "sticky-name-match (addressing another user)"
+                # Action requests ABOUT a person still name them — "greet
+                # holly molly in general", "ping sarah" — the name is the
+                # TARGET, not the addressee. Imperative messages fall
+                # through so the action worker can handle them.
+                if not re.search(
+                        r"\b(greet|welcome|ping|pings|dm|dms|message|send|"
+                        r"tell|tag|ask|say|check|give|get|find|look|kick|"
+                        r"ban|timeout|move|mute|unmute|join|invite|remind)\b",
+                        txt_low):
+                    return False, "sticky-name-match (addressing another user)"
 
             # Check permissions
             if hasattr(message.channel, 'guild') and message.channel.guild:
@@ -2132,7 +2141,10 @@ class AIPersonaClient(discord.Client):
                               "relay it naturally, like you just checked]\n" + transcript)
             elif action_note:
                 transcript = ("[ACTION QUEUED: you're about to do what they asked — "
-                              "reply like you accepted and you're on it, don't describe mechanics]\n" + transcript)
+                              "reply like you accepted and you're on it, but NEVER perform "
+                              "the action in your reply (no greeting/ping/targeted message — "
+                              "the worker does that in the right channel). Don't claim it's "
+                              "done, don't describe mechanics]\n" + transcript)
 
             # ── Add unanswered questions context ────────────────────────────
             # If there are unanswered questions from recent messages, prepend them

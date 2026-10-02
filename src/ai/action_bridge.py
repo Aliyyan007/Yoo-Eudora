@@ -364,8 +364,26 @@ class ActionWorker:
         ctx.performed = []
         return ctx
 
+    def _recent_context(self, channel) -> Optional[str]:
+        """Last few channel messages as 'name: text' lines — gives the
+        agent enough context to resolve 'him', 'the new member', 'that
+        channel' instead of guessing (and pinging the requester)."""
+        try:
+            cache = getattr(self.client, "history_cache", None) or {}
+            msgs = cache.get(str(channel.id)) or []
+            lines = []
+            for m in list(msgs)[-10:]:
+                author = getattr(getattr(m, "author", None), "display_name", None) or "?"
+                content = (getattr(m, "clean_content", "") or "").strip()
+                if content:
+                    lines.append(f"{author}: {content[:160]}")
+            return "\n".join(lines) if lines else None
+        except Exception:
+            return None
+
     async def _run_agent(self, ctx, text: str, categories, mode: str,
-                         label: str, speaker_name: Optional[str] = None) -> Optional[str]:
+                         label: str, speaker_name: Optional[str] = None,
+                         context: Optional[str] = None) -> Optional[str]:
         """Human-like delay â†’ agent.run â†’ done. The agent's reply text is
         NEVER sent to the channel (silent worker); performed tools are
         tracked on ctx.performed. Returns the agent's reply text."""
@@ -374,7 +392,7 @@ class ActionWorker:
         try:
             reply = await asyncio.wait_for(
                 agent.run(text, mode=mode, categories=categories or None,
-                          speaker_name=speaker_name),
+                          speaker_name=speaker_name, context=context),
                 timeout=_TIMEOUT,
             )
             logger.info(
@@ -405,6 +423,8 @@ class ActionWorker:
 
         from src.action_engine.config.prompts import CHAT_MODE
 
+        context = self._recent_context(message.channel)
+
         async def _job():
             try:
                 ctx = self._ctx_for(message.channel, message.author.id)
@@ -412,11 +432,13 @@ class ActionWorker:
                     async with message.channel.typing():
                         await self._run_agent(
                             ctx, trigger_text, categories, CHAT_MODE, "text",
-                            speaker_name=message.author.display_name)
+                            speaker_name=message.author.display_name,
+                            context=context)
                 except Exception:
                     await self._run_agent(
                         ctx, trigger_text, categories, CHAT_MODE, "text",
-                        speaker_name=message.author.display_name)
+                        speaker_name=message.author.display_name,
+                        context=context)
             finally:
                 self._inflight.discard(key)
 
@@ -438,15 +460,18 @@ class ActionWorker:
         try:
             from src.action_engine.config.prompts import CHAT_MODE
             ctx = self._ctx_for(message.channel, message.author.id)
+            context = self._recent_context(message.channel)
             try:
                 async with message.channel.typing():
                     answer = await self._run_agent(
                         ctx, trigger_text, self._INFO_CATS, CHAT_MODE, "info",
-                        speaker_name=message.author.display_name)
+                        speaker_name=message.author.display_name,
+                        context=context)
             except Exception:
                 answer = await self._run_agent(
                     ctx, trigger_text, self._INFO_CATS, CHAT_MODE, "info",
-                    speaker_name=message.author.display_name)
+                    speaker_name=message.author.display_name,
+                    context=context)
             if answer and not answer.startswith("(sorry"):
                 return answer
             return None

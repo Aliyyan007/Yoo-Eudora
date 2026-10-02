@@ -165,6 +165,7 @@ class Agent:
             model = settings.groq_model_text
             max_rounds = self.max_rounds
 
+        seen_calls: set = set()  # (name, args-json) — dedupe repeat sends
         for round_idx in range(1, max_rounds + 1):
             logger.debug(
                 f"Agent round {round_idx}/{max_rounds} ({mode}): {len(messages)} msgs, "
@@ -267,6 +268,22 @@ class Agent:
                 except json.JSONDecodeError as e:
                     args = {}
                     logger.warning(f"Bad tool args for {name}: {e}")
+                # Dedupe identical calls within one run — the model sometimes
+                # re-fires the same send (double-pings/double-greetings).
+                dedup_key = (name, json.dumps(args, sort_keys=True, default=str))
+                if dedup_key in seen_calls:
+                    logger.info(f"Skipping duplicate tool call: {name}({args})")
+                    result = '{"ok": true, "note": "already done — do not repeat"}'
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "name": name,
+                            "content": result,
+                        }
+                    )
+                    continue
+                seen_calls.add(dedup_key)
                 logger.info(f"Tool call ({mode}): {name}({args})")
                 result = await dispatch(self.ctx, name, args)
                 logger.debug(f"Tool {name} result: {result[:300]}")
