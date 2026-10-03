@@ -143,6 +143,7 @@ def update_user_memory(user_id: str, username: str, new_facts: list):
             existing_set.add(fact)
 
     memory["users"][user_id]["facts"] = existing_facts[-20:]
+    memory["users"][user_id]["last_seen"] = time.time()
     _save_memory(memory)
     logger.debug(f"Memory updated for {username}: {new_facts}")
 
@@ -255,6 +256,7 @@ def update_user_profile(user_id: str, username: str, field: str, value: str):
             ]
         memory["users"][user_id][field] = value
 
+    memory["users"][user_id]["last_seen"] = time.time()
     _save_memory(memory)
     logger.info(f"User profile updated: {username}.{field} = {value[:60]}")
 
@@ -450,6 +452,68 @@ def mark_channel_seen(channel_id: str, name: str, guild_id: str):
         "last_seen": time.time(),
     }
     _save_memory(memory)
+
+
+# ── Stale-data sweep ("auto reset", but surgical) ────────────────────────────
+#
+# A blind periodic wipe would make every persona forget its regulars — the
+# correct "reset" is evicting data nobody has touched in N days. Users carry
+# `last_seen` (stamped on every write); records without it get adopted with
+# a fresh timestamp on first sweep so legacy users get a full grace period
+# instead of being deleted the moment this ships.
+
+def sweep_stale_memory(max_age_days: int = 60,
+                       user_cap: int = 2000,
+                       channel_cap: int = 500) -> dict:
+    """Evict stale memory records. Returns stats for logging.
+
+    - users whose last_seen is older than max_age_days are forgotten entirely
+      (facts, profile fields, memorable chats — the whole record)
+    - users lacking last_seen (pre-sweep data) are stamped NOW, not deleted —
+      they get a full TTL before eviction
+    - discovered_channels older than the TTL are dropped, then capped at
+      channel_cap by evicting least-recently-seen
+    - total users are capped at user_cap by evicting least-recently-seen
+    """
+    memory = _load_memory()
+    now = time.time()
+    cutoff = now - max_age_days * 86400
+    stats = {"users_evicted": 0, "users_adopted": 0,
+             "users_over_cap": 0, "channels_evicted": 0,
+             "channels_over_cap": 0}
+
+    users = memory.get("users")
+    if isinstance(users, dict) and users:
+        for uid in list(users):
+            seen = users[uid].get("last_seen")
+            if seen is None:
+                users[uid]["last_seen"] = now
+                stats["users_adopted"] += 1
+            elif seen < cutoff:
+                del users[uid]
+                stats["users_evicted"] += 1
+        if len(users) > user_cap:
+            ordered = sorted(users.items(),
+                             key=lambda kv: kv[1].get("last_seen", 0))
+            for uid, _rec in ordered[: len(users) - user_cap]:
+                del users[uid]
+                stats["users_over_cap"] += 1
+
+    channels = memory.get("discovered_channels")
+    if isinstance(channels, dict) and channels:
+        for cid in list(channels):
+            if (channels[cid].get("last_seen") or 0) < cutoff:
+                del channels[cid]
+                stats["channels_evicted"] += 1
+        if len(channels) > channel_cap:
+            ordered = sorted(channels.items(),
+                             key=lambda kv: kv[1].get("last_seen") or 0)
+            for cid, _rec in ordered[: len(channels) - channel_cap]:
+                del channels[cid]
+                stats["channels_over_cap"] += 1
+
+    _save_memory(memory)
+    return stats
 
 
 def save_server_state(key: str, value: dict):

@@ -452,6 +452,9 @@ class AIPersonaClient(discord.Client):
         # Start re-engagement loop (check if no one replied to bot's messages)
         self._spawn(self._re_engagement_loop())
 
+        # Daily stale-memory sweep — bounds the context DB across time
+        self._spawn(self._memory_gc_loop())
+
         # ── Initialize voice manager (real-time voice conversation) ────────
         try:
             fish_api_key = os.getenv("FISH_AUDIO_API_KEY", "")
@@ -889,6 +892,32 @@ class AIPersonaClient(discord.Client):
                 )
             except Exception as e:
                 logger.debug(f"Voice state update error: {e}")
+
+    async def _memory_gc_loop(self):
+        """Daily stale-memory sweep — forgets users/channels nobody has
+        touched in MEMORY_MAX_AGE_DAYS (default 60). Bounds the context DB
+        across time without a destructive reset: regulars keep their facts,
+        one-off chatters fade naturally. Also sweeps the D1 mirror."""
+        await asyncio.sleep(900)  # first sweep ~15min after ready
+        while True:
+            try:
+                from .ai import d1_memory as _d1mem
+                max_age = int(os.getenv("MEMORY_MAX_AGE_DAYS", "60"))
+                user_cap = int(os.getenv("MEMORY_USER_CAP", "2000"))
+                ch_cap = int(os.getenv("DISCOVERED_CHANNEL_CAP", "500"))
+                loop = asyncio.get_running_loop()
+                stats = await loop.run_in_executor(
+                    None, lambda: _d1mem.sweep_stale_memory(
+                        max_age_days=max_age, user_cap=user_cap,
+                        channel_cap=ch_cap))
+                j = stats.get("json", {})
+                if any(j.values()):
+                    logger.info(f"[memory-gc] swept stale data: {j} (d1: {stats.get('d1')})")
+                else:
+                    logger.debug(f"[memory-gc] sweep clean (d1: {stats.get('d1')})")
+            except Exception as e:
+                logger.debug(f"[memory-gc] sweep error: {e}")
+            await asyncio.sleep(24 * 3600)
 
     async def _re_engagement_loop(self):
         """

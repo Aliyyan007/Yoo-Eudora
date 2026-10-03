@@ -1097,3 +1097,50 @@ def load_server_state(key: str):
         return _run_async(load_server_state_async(key))
     except Exception:
         return _json_fallback.load_server_state(key)
+
+
+# ── Stale-data sweep ─────────────────────────────────────────────────────────
+# The "auto reset" — surgical GC, not a wipe (a wipe would amnesia every
+# persona's regulars). Rows older than the TTL are deleted; per-user caps
+# already bound growth per person, this bounds it across time.
+
+async def sweep_stale_memory_async(max_age_days: int = 60) -> dict:
+    """Delete D1 rows older than max_age_days. Returns per-table stats.
+    Falls back to None per-table when D1 is unreachable — the JSON sweep
+    still runs either way."""
+    cutoff = time.time() - max_age_days * 86400
+    stats = {"user_facts": None, "memorable_chats": None,
+             "instructions": None, "discovered_channels": None}
+    if not await _d1_ok():
+        return stats
+    client = _get_d1()
+    for table, col in (("user_facts", "created_at"),
+                       ("memorable_chats", "timestamp"),
+                       ("instructions", "timestamp"),
+                       ("discovered_channels", "last_seen")):
+        try:
+            res = await client.execute_write(
+                f"DELETE FROM {table} WHERE {col} < ?", [cutoff])
+            stats[table] = getattr(res, "rows_affected", None) or 0
+        except Exception as e:
+            logger.debug(f"D1 sweep {table} failed: {e}")
+    return stats
+
+
+def sweep_stale_memory(max_age_days: int = 60,
+                       user_cap: int = 2000,
+                       channel_cap: int = 500) -> dict:
+    """Sweep both stores: D1 rows (when reachable) + the JSON fallback file
+    (which mirrors/holds data when D1 is down). Always safe to call."""
+    stats = {"d1": {}, "json": {}}
+    try:
+        stats["d1"] = _run_async(sweep_stale_memory_async(max_age_days))
+    except Exception as e:
+        logger.debug(f"D1 sweep failed (JSON still swept): {e}")
+    try:
+        stats["json"] = _json_fallback.sweep_stale_memory(
+            max_age_days=max_age_days, user_cap=user_cap,
+            channel_cap=channel_cap)
+    except Exception as e:
+        logger.warning(f"JSON memory sweep failed: {e}")
+    return stats
