@@ -117,9 +117,13 @@ class BumpScheduler:
         # Wait for the bot to be ready
         await self.client.wait_until_ready()
 
-        # Initial delay before first bump (2 minutes)
-        initial_delay = 120
-        logger.info(f"First bump check in {initial_delay // 60} minutes")
+        # Initial delay before first bump — adaptive: if bots are already
+        # due (restart, persona rotation, downtime) a full 2-min settle-in
+        # per activation can outlive the whole rotation window and nothing
+        # ever bumps. Short jitter when work is pending, full delay when not.
+        due = len(self._get_ready_bots())
+        initial_delay = random.uniform(20, 60) if due else 120
+        logger.info(f"First bump check in {initial_delay:.0f}s ({due} bot(s) due)")
         await asyncio.sleep(initial_delay)
 
         while self._running and not self.client.is_closed():
