@@ -171,6 +171,25 @@ class BumpScheduler:
             return (soonest_name, max(soonest_delta, 0))
         return None
 
+    async def _resolve_channel(self):
+        """Get the bump channel — cache first, live fetch on miss.
+
+        On long-running instances the gateway cache can drop the channel
+        after reconnects, leaving get_channel() returning None on every
+        check forever ("could not find bump channel" spam, zero bumps).
+        A fetch_channel() fallback self-heals instead."""
+        channel = self.client.get_channel(self.channel_id)
+        if channel:
+            return channel
+        try:
+            channel = await self.client.fetch_channel(self.channel_id)
+            if channel:
+                logger.info(f"Recovered bump channel {self.channel_id} via fetch (cache missed)")
+            return channel
+        except Exception as e:
+            logger.warning(f"Could not find/fetch bump channel {self.channel_id}: {e}")
+            return None
+
     async def _check_and_bump(self):
         """Check which bots are ready and bump them. Runs every 60 seconds."""
         ready_bots = self._get_ready_bots()
@@ -178,9 +197,8 @@ class BumpScheduler:
             # Log next ready bot occasionally (every 10 min = every 10 checks)
             return
 
-        channel = self.client.get_channel(self.channel_id)
+        channel = await self._resolve_channel()
         if not channel:
-            logger.warning(f"Could not find bump channel {self.channel_id}")
             return
 
         logger.info(f"=== Bump check: {len(ready_bots)} bot(s) ready: {[b[0] for b in ready_bots]} ===")
@@ -262,6 +280,9 @@ class BumpScheduler:
                         break
             if not bump_cmd:
                 logger.warning(f"Could not find /bump command for {bot_name} (ID: {bot_id})")
+                # Stale command cache — drop it so the next check refetches
+                # instead of failing on the same stale list for 5 minutes.
+                self._cached_commands = None
                 return False
 
         try:
@@ -294,7 +315,7 @@ class BumpScheduler:
         This bumps ALL bots regardless of cooldown status. Used when a user
         explicitly asks to bump the server.
         """
-        channel = self.client.get_channel(self.channel_id)
+        channel = await self._resolve_channel()
         if not channel:
             logger.error(f"Could not find bump channel {self.channel_id}")
             return

@@ -336,9 +336,21 @@ class AIPersonaClient(discord.Client):
 
     def _spawn(self, coro) -> asyncio.Task:
         """Create a task tracked for teardown — rotation calls teardown() so
-        loops never leak onto a closed client."""
+        loops never leak onto a closed client. A done-callback logs any
+        task that dies unexpectedly — silent task death is invisible
+        otherwise (e.g. a bump scheduler that stopped looping for good)."""
         t = asyncio.create_task(coro)
         self._spawned_tasks.append(t)
+        def _on_done(task):
+            try:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    logger.error(f"Background task died unexpectedly: {exc!r}")
+            except Exception:
+                pass
+        t.add_done_callback(_on_done)
         return t
 
     async def teardown(self):
