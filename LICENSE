@@ -1,0 +1,64 @@
+YOO EUDORA — NON-COMMERCIAL SOURCE-AVAILABLE LICENSE
+Copyright (c) 2026 Aliyyan (aliyyan.com)
+
+1. DEFINITIONS
+   "Software" means the Yoo Eudora codebase — all source code, prompts,
+   persona definitions, configuration templates, and documentation
+   contained in this repository.
+   "You" means any individual or entity that downloads, copies, modifies,
+   or uses the Software.
+   "Commercial Use" means any use of the Software intended for or directed
+   toward commercial advantage or monetary compensation, including but not
+   limited to: selling the Software or derivatives, offering it as a paid
+   service, using it to provide paid setup/hosting/support, monetized
+   Discord servers, paid communities, or use inside a product or service
+   that generates revenue.
+
+2. GRANT (NON-COMMERCIAL ONLY)
+   You are granted a non-exclusive, non-transferable, revocable license to
+   use, copy, study, and modify the Software for PERSONAL, EDUCATIONAL,
+   and NON-COMMERCIAL purposes only, provided that:
+   (a) this license text and the copyright notice are included in every
+       copy or substantial portion of the Software you distribute;
+   (b) modifications are clearly marked as such;
+   (c) credit is given to the original author — "Aliyyan"
+       (https://aliyyan.com).
+
+3. COMMERCIAL USE — PROHIBITED WITHOUT PERMISSION
+   Commercial Use of the Software is strictly prohibited without prior
+   written permission from the author. To request a commercial license,
+   contact Aliyyan via https://aliyyan.com or the project Discord.
+   UNAUTHORIZED COMMERCIAL USE MAY RESULT IN LEGAL ACTION, including
+   takedown demands, claims for damages, and pursuit of all remedies
+   available under applicable law. Do not risk it — just ask first.
+
+4. DISCORD TERMS OF SERVICE ACKNOWLEDGMENT
+   The Software automates Discord user accounts ("self-bots"), which is
+   PROHIBITED by Discord's Terms of Service. By using the Software you
+   acknowledge that:
+   (a) your account(s) may be limited, suspended, or permanently banned
+       by Discord at any time;
+   (b) the author bears no responsibility for any ban, suspension, data
+       loss, server action, or any other consequence of using the Software;
+   (c) you accept all such risk entirely. SET UP AND RUN THIS SOFTWARE
+       AT YOUR OWN RISK. Use accounts you are prepared to lose.
+
+5. NO WARRANTY / NO LIABILITY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT
+   SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, ACCOUNT ACTION,
+   DATA LOSS, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT,
+   OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE
+   OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+6. THIRD-PARTY SERVICES
+   The Software integrates with third-party services (Discord, Groq,
+   Fish Audio, Cloudflare). You are solely responsible for complying with
+   each provider's terms and for your own API keys, tokens, and usage
+   costs.
+
+7. TERMINATION
+   This license terminates automatically if you breach any of its terms.
+   Upon termination you must cease all use and distribution of the
+   Software.

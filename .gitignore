@@ -16,6 +16,15 @@ venv/
 
 # Large local artifacts
 references.zip
+*.zip
+
+# Dev/test scratch files — not part of the shipped product
+_test_*
+_patch_*
+_vendor_*
+
+# Legacy reference implementation (superseded by src/action_engine/)
+Robust Action Performer System)/
 
 # OS / editor
 Thumbs.db

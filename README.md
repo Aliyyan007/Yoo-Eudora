@@ -1,161 +1,68 @@
-# Auto Bump System
+# Yoo Eudora
 
-A Discord self-bot system that:
-- **Logs into Discord with a real user account** (not a bot account)
-- **Joins a server** via invite link
-- **Reads messages** in a specified channel
-- **Detects when messages are directed at it** using Groq AI (intent detection)
-- **Replies with human-like messages** using Groq AI (casual, slang, short, with occasional typos)
-- **Auto-bumps the server** using `/bump` slash command via Playwright browser automation (every 2 hours)
+**Three AI personas that actually live in your Discord server** — Eudora, Isla, and Rowan. Not a bot that answers commands. People who hang out: they chat, remember you, join voice calls, bump the server, and get things done when asked.
 
-## ⚠️ Warning
+> ⚠️ **This project automates Discord user accounts (self-bots), which violates Discord's Terms of Service.** Your account(s) can be banned. The author takes **no responsibility** for anything that happens. **Set up and run entirely at your own risk** — use accounts you're prepared to lose. See [LICENSE](LICENSE) (non-commercial use only).
 
-Discord's Terms of Service prohibit automating user accounts (self-bots). This can result in account bans. **Use an alt/burner account**, not your main. Only use on servers you own or have permission to automate.
+---
 
-## Stack
+## The Personas
 
-| Component | Purpose |
-|---|---|
-| `discord.py-self` | Self-bot library — Discord gateway connection with user token |
-| `playwright` | Browser automation for `/bump` slash command |
-| `groq` | AI intent detection + human-like reply generation |
-| `python-dotenv` | Load secrets from `.env` |
-| `pyyaml` | Config file parsing |
-| `apscheduler` | (Available, but we use asyncio scheduling) |
-| `loguru` | Structured logging |
-| `tenacity` | Retry logic for API calls |
-| `pydantic` | Config validation |
+| | | |
+|---|---|---|
+| **Eudora Edward** | 22, UK — art student. Dry British humor, lowercase texting, french phrases slip in | `DISCORD_TOKEN` |
+| **Isla Bennett** | 20 — social, curious, expressive. Photography, music, fashion, cafés, travel | `DISCORD_TOKEN_ISLA` |
+| **Rowan Hayes** | 21 — relaxed, witty, slightly sarcastic. Gaming, tech, guitar. Concise and deadpan | `DISCORD_TOKEN_ROWAN` |
+
+One persona is active at a time — the **rotation supervisor** switches accounts every ~2.5h (± jitter), each with its own token, memory namespace, voice, and style. To your server they look like three different people.
+
+## What Makes It Different
+
+- 🎙️ **Voice channel, for real** — full-duplex voice conversation: VAD → streaming ASR → LLM → Fish Audio TTS. Barge-in (interrupt it mid-sentence), mid-utterance backchannels ("mhm/yeah" while you talk), instant cached acks, stale-reply supersede when you keep talking, side-talk detection (won't butt into conversations that aren't for it), per-persona voices and filler sounds, and it calls people by their actual name.
+- ⚡ **Action performer** — an isolated worker detects real Discord action requests ("ping John", "react to that", "check their profile") and executes them silently with human-like delay — no "done!" spam.
+- 🧠 **Real memory** — per-user facts, hobbies, relationships, memorable chats; contradiction-aware updates; daily stale-data sweep so the DB never bloats. Persists to Cloudflare D1 with local JSON fallback.
+- 💬 **Wise engagement** — dead-chat revival, re-engagement pings with hard safety gates (cooldowns, daily caps, unanswered-streak muting), proactive conversation, welcome messages, sticker/GIF reactions.
+- 🔄 **Auto-bump** — per-bot cooldown-aware scheduler driving `/bump` across Disboard, Bumper, Carl Bot, OneBump, Bump4You — state persisted across restarts and rotation.
+- 🛡️ **Human-safe** — no IRL meetups, no DM promises, no flirty escalation, owner-exempt abuse handling, question dodging respected.
 
 ## Setup
 
-### 1. Install Python 3.12+
+> **Don't want to self-host?** Skip the pain — **talk to Aliyyan** and he'll set it up for you: [Discord server](https://discord.gg/FvVWf4a7TY) · [aliyyan.com](https://aliyyan.com)
 
-Download from [python.org](https://www.python.org/downloads/). During installation, check "Add Python to PATH".
+### Requirements
+- Python 3.12+
+- Discord user token(s) — one per persona account you want to run
+- [Groq](https://console.groq.com) API key(s) — free tier works; more keys = more capacity (10 recommended for 24/7)
+- [Fish Audio](https://fish.audio) API key — for voice (optional; text-only works without it)
 
-### 2. Install dependencies
-
+### Quick start
 ```bash
 pip install -r requirements.txt
-playwright install chromium
+copy config\.env.example config\.env    # then fill in your tokens + keys
+python src\main.py
 ```
 
-### 3. Get credentials
+`config/.env.example` is fully documented — persona voice IDs are already prefilled (they're public voice models). Only secrets (tokens, API keys, D1 creds) need your own values.
 
-#### Discord User Token
-1. Open Discord in your web browser (Chrome/Edge)
-2. Press F12 to open DevTools
-3. Go to Network tab
-4. Click any request in the list
-5. Find the `authorization` header in the request headers
-6. Copy the value — this is your user token
+### Deploy to Render
+`render.yaml` + `Dockerfile` included — point a Render service at the repo, add your env vars, done. A keep-alive HTTP server is built in for free-tier hosting.
 
-#### Discord Email/Password
-The email and password you use to log into Discord. These are used by Playwright to log into the Discord web client for the `/bump` command.
+## Find Me / Get Help
 
-#### Groq API Key
-1. Go to [console.groq.com](https://console.groq.com)
-2. Create an account
-3. Generate an API key
+**Setup requests, questions, or just want to see it live — talk to Aliyyan:**
 
-### 4. Configure
+- 🌐 Portfolio: [aliyyan.com](https://aliyyan.com)
+- 💬 Discord: [discord.gg/FvVWf4a7TY](https://discord.gg/FvVWf4a7TY)
+- 🐙 GitHub: [@Aliyyan007](https://github.com/Aliyyan007)
+- 📸 Instagram: [@aliyyan007](https://instagram.com/aliyyan007)
+- 🎮 Steam: [aliyyan007](https://steamcommunity.com/id/aliyyan007)
+- 🐦 X: [@aliyyan007](https://x.com/aliyyan007)
+- 🎧 Spotify: [Aliyyan](https://open.spotify.com/user/31gjqqqiavkbdsnthiuuim6f734a)
 
-Copy `config/.env.example` to `config/.env` and fill in:
-```
-DISCORD_TOKEN=your_user_token
-DISCORD_EMAIL=your_email
-DISCORD_PASSWORD=your_password
-GROQ_API_KEY=your_groq_key
-```
+## License
 
-Edit `config/config.yaml`:
-- `server_invite`: Your server invite link
-- `target_channel_id`: Channel ID where the bot reads and replies (right-click channel → Copy ID, requires Developer Mode in Discord settings)
-- `bump_channel_id`: Channel where `/bump` runs (usually a #bump-bot or #commands channel)
-- `persona`: Customize the bot's personality, name, style, interests
-- `triggers`: Control when the bot replies (mentions, replies, AI intent detection)
-- `bump`: Enable/disable, set interval and jitter
+**Non-commercial, source-available** — free to use, study, and modify for personal/educational purposes with credit. **No commercial use without written permission** — unauthorized monetization may result in legal action. See [LICENSE](LICENSE).
 
-### 5. Enable Discord Developer Mode
-Settings → Advanced → Developer Mode (toggle on). This lets you right-click channels and messages to copy IDs.
+---
 
-## Running
-
-```bash
-python src/main.py
-```
-
-## How it works
-
-### Message reading & AI replies
-1. The self-bot connects to Discord via gateway using your user token
-2. It listens for messages in the target channel
-3. For each message, it checks:
-   - Was the bot @mentioned or named? → reply
-   - Is it a reply to one of the bot's messages? → reply
-   - **AI intent detection**: Groq analyzes the conversation context and decides if the message is directed at the bot → reply if confidence > 60%
-4. If triggered, it sometimes stays silent (15% chance) or skips (based on reply_probability) to seem more human
-5. When replying:
-   - Shows typing indicator for a human-like duration (scales with reply length)
-   - Generates a short, casual reply using Groq with the persona's style
-   - Occasionally adds a typo (8% chance)
-   - Sends the reply referencing the original message
-
-### Auto-bump
-1. A Playwright browser launches Chromium (visible, not headless — Discord detects headless)
-2. Logs into Discord web with email/password
-3. Navigates to the bump channel
-4. Types `/bump` in the message box, selects from autocomplete, presses Enter
-5. Repeats every 2 hours ± 5 minutes jitter
-6. Browser session persists in `data/playwright_profile/` so re-logins are rare
-
-### Intent detection
-The intent model (`llama-3.1-8b-instant` — fast and cheap) receives:
-- The last 15 messages with timestamps and authors
-- The new message to evaluate
-
-It returns JSON: `{"directed_at_bot": true/false, "confidence": 0.0-1.0, "reason": "..."}`
-
-This handles slang like "hru", "wbu", "wym", and conversation flow analysis — not just @mentions.
-
-### Reply generation
-The reply model (`llama-3.3-70b-versatile` — smarter) receives:
-- The conversation context
-- The message to reply to
-- A detailed system prompt with the persona's style, slang usage, and rules
-
-It generates short, casual, human-like messages with internet slang, lowercase, minimal punctuation, and occasional typos.
-
-## Project structure
-
-```
-auto-bump-system/
-├── config/
-│   ├── config.yaml          # Main configuration
-│   └── .env.example         # Template for secrets
-├── src/
-│   ├── main.py              # Entry point
-│   ├── discord_client.py    # Self-bot: message events, replies
-│   ├── bump_scheduler.py    # Playwright: /bump on schedule
-│   ├── persona.py           # Persona config loader
-│   ├── context.py           # Message history formatting
-│   ├── ai/
-│   │   ├── intent.py        # Intent detection (Groq)
-│   │   ├── reply.py         # Reply generation (Groq)
-│   │   └── prompts.py       # System prompts
-│   └── utils/
-│       ├── delays.py        # Human-like timing
-│       └── logger.py        # Loguru setup
-├── data/
-│   └── playwright_profile/  # Browser session (auto-created)
-├── logs/
-│   └── bot.log              # Log file (auto-created)
-├── requirements.txt
-└── README.md
-```
-
-## Troubleshooting
-
-- **"Target channel not found"**: Make sure the account has joined the server and the channel ID is correct. Enable Developer Mode to copy IDs.
-- **Bump fails**: Check that email/password are correct. If Discord asks for 2FA/captcha, complete it manually in the browser window (you have 60 seconds).
-- **No replies**: Check that the Groq API key is valid and the models are available. Check logs for intent detection results.
-- **Account banned**: This is a self-bot. Use an alt account. Reduce reply frequency. Don't reply to every single message.
+*Developer: **Aliyyan** — [aliyyan.com](https://aliyyan.com)*
