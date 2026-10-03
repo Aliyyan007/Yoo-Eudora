@@ -254,6 +254,20 @@ class VoicePipeline:
         self._irritation = IrritationTracker()
         self._user_farewell_at: dict[int, float] = {}
         self._pending_vc_move: Optional[dict] = None
+        # Turn-taking extras — per-user:
+        # _user_last_transcript: dedup key (same text within 15s = hallucination
+        #   repeat). Was pipeline-global — user B's "yeah" after user A's "yeah"
+        #   got dropped in multi-user calls.
+        # _user_ack_at: scheduled mid-utterance backchannel time (inf = none).
+        #   While someone monologues, a real listener occasionally goes "mhm".
+        # _user_reply_gen: generation counter — a newer utterance endpointing
+        #   while a reply is still generating bumps it; stale replies drop
+        #   before speaking ("answer what they said LAST").
+        # _user_finalize_queued: at most one deferred finalize per user.
+        self._user_last_transcript: dict[int, tuple] = {}
+        self._user_ack_at: dict[int, float] = {}
+        self._user_reply_gen: dict[int, int] = {}
+        self._user_finalize_queued: set = set()
         self._relocate_cb = None   # set by manager — leave+join fallback for vc.move_to
         self._leave_cb = None      # set by manager — spoken "leave the vc" → disconnect
 
@@ -917,6 +931,14 @@ class VoicePipeline:
             self._user_last_voice_time[user_id] = time.time()
             self._user_mic_active[user_id] = True
             self._user_last_speech_time[user_id] = time.time()
+            # Mid-utterance backchannel — while someone monologues, a real
+            # listener occasionally goes "mhm"/"yeah" mid-speech. Decided
+            # once at speech start (~40% of utterances); _play_ack uses
+            # pre-cached frames so it costs nothing.
+            import random as _rng2
+            self._user_ack_at[user_id] = (
+                time.time() + _rng2.uniform(2.5, 6.0)
+                if _rng2.random() < 0.40 else float("inf"))
             logger.info(f"[voice] User {user_id} started speaking (pcm_48k={len(pcm_48k)})")
 
             # Drain pre-roll buffer into ASR — this is the KEY improvement
@@ -943,6 +965,12 @@ class VoicePipeline:
         if in_speech:
             # Track last time we received ANY audio packet (for watchdog)
             self._user_last_voice_time[user_id] = time.time()
+
+            # Mid-utterance backchannel fires at its scheduled moment —
+            # acknowledges without taking the floor
+            if time.time() >= self._user_ack_at.get(user_id, float("inf")):
+                self._user_ack_at[user_id] = float("inf")
+                self._play_ack()
 
             # Feed to streaming ASR
             try:
@@ -1112,15 +1140,45 @@ class VoicePipeline:
 
     async def _finalize_and_respond(self, user_id: int) -> None:
         """Guard wrapper — an utterance must never be finalized twice
-        concurrently (watchdog + VAD endpoint + length cap can race)."""
+        concurrently (watchdog + VAD endpoint + length cap can race).
+
+        NEW: if a reply for this user's previous utterance is still
+        generating, we don't drop their new words — we bump the reply
+        generation (the stale reply drops before speaking) and queue one
+        deferred finalize. Humans answer what you said LAST, not first."""
         if user_id in self._finalizing:
-            logger.debug(f"[voice] Already finalizing user {user_id} — skipping duplicate endpoint")
+            self._user_reply_gen[user_id] = self._user_reply_gen.get(user_id, 0) + 1
+            if user_id not in self._user_finalize_queued:
+                self._user_finalize_queued.add(user_id)
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._deferred_finalize(user_id))
+                except Exception:
+                    self._user_finalize_queued.discard(user_id)
+            logger.debug(f"[voice] Finalize superseded — queued re-finalize for user {user_id}")
             return
         self._finalizing.add(user_id)
         try:
             await self._finalize_inner(user_id)
         finally:
             self._finalizing.discard(user_id)
+
+    async def _deferred_finalize(self, user_id: int) -> None:
+        """Re-run finalize once the in-flight one frees. The streaming ASR
+        kept accumulating while the slot was held, so end_utterance returns
+        everything the user said since — the reply covers their LATEST
+        words, not the superseded ones."""
+        try:
+            for _ in range(80):          # ~20s ceiling, then give up
+                await asyncio.sleep(0.25)
+                if user_id not in self._finalizing:
+                    break
+            if user_id not in self._finalizing:
+                await self._finalize_and_respond(user_id)
+        except Exception as e:
+            logger.debug(f"[voice] deferred finalize failed for {user_id}: {e!r}")
+        finally:
+            self._user_finalize_queued.discard(user_id)
 
     async def _finalize_inner(self, user_id: int) -> None:
         """Get final ASR transcript, send to LLM, speak the response.
@@ -1134,6 +1192,7 @@ class VoicePipeline:
         self._user_in_speech[user_id] = False
         self._user_speaking[user_id] = False
         self._user_mic_active[user_id] = False
+        self._user_ack_at.pop(user_id, None)
 
         # Instant acknowledgment — a pre-cached "mhm/yeah" plays ~immediately
         # (~100ms perceived response) while Whisper+LLM+TTS compute the real
@@ -1320,13 +1379,11 @@ class VoicePipeline:
         # hallucinations (e.g. "Thank you." appearing 5 times in a row).
         now = time.time()
         normalized = final_text.strip().lower()
-        last_transcript = getattr(self, '_last_final_transcript', '')
-        last_transcript_time = getattr(self, '_last_final_transcript_time', 0)
-        if normalized == last_transcript and (now - last_transcript_time) < 15.0:
+        last_t, last_ts = self._user_last_transcript.get(user_id, ("", 0.0))
+        if normalized == last_t and (now - last_ts) < 15.0:
             logger.info(f"[voice] Duplicate transcript '{final_text}' within 15s — skipping")
             return
-        self._last_final_transcript = normalized
-        self._last_final_transcript_time = now
+        self._user_last_transcript[user_id] = (normalized, now)
 
         # ── Response cooldown (per-user) ──────────────────────────────────
         # Don't respond to the SAME user more than once every 2.5s — prevents
@@ -1447,6 +1504,23 @@ class VoicePipeline:
             except Exception:
                 pass
 
+        # ── Stale-reply check ────────────────────────────────────────────
+        # A newer utterance may have endpointed while the prep above ran —
+        # its finalize bumped this user's reply generation. If so, this
+        # reply is already outdated: drop it (the deferred finalize will
+        # answer their latest words instead).
+        gen = self._user_reply_gen.get(user_id, 0)
+
+        async def _drop_if_stale() -> bool:
+            if self._user_reply_gen.get(user_id, 0) != gen:
+                logger.info(f"[voice] Reply for {user_id} superseded by newer speech — dropping")
+                await _close_prewarm()
+                return True
+            return False
+
+        if await _drop_if_stale():
+            return
+
         # ── Streaming path: LLM deltas → sentences → TTS as they arrive ──
         if self._on_transcript_stream is not None:
             try:
@@ -1488,6 +1562,11 @@ class VoicePipeline:
         if not response or not response.strip():
             logger.warning(f"[voice] Empty LLM response for transcript: '{final_text[:50]}'")
             await _close_prewarm()
+            return
+
+        # Re-check staleness — the LLM call took seconds; they may have kept
+        # talking and their newest utterance should win, not this old reply.
+        if await _drop_if_stale():
             return
 
         logger.info(f"[voice] LLM response: {response[:100]}")
@@ -1929,6 +2008,10 @@ class VoicePipeline:
         # Without this their stale timestamp keeps the VC "active" forever —
         # the silence-leave would never fire after they left for real.
         self._user_last_speech_time.pop(user_id, None)
+        self._user_last_transcript.pop(user_id, None)
+        self._user_ack_at.pop(user_id, None)
+        self._user_reply_gen.pop(user_id, None)
+        self._user_finalize_queued.discard(user_id)
         self._irritation.clear(user_id)
         self._finalizing.discard(user_id)
         self._user_pkt_queues.pop(user_id, None)
@@ -1961,6 +2044,10 @@ class VoicePipeline:
         self._user_last_response.clear()
         self._user_utt_start.clear()
         self._user_farewell_at.clear()
+        self._user_last_transcript.clear()
+        self._user_ack_at.clear()
+        self._user_reply_gen.clear()
+        self._user_finalize_queued.clear()
         self._irritation.clear_all()
         self._pending_vc_move = None
         self._finalizing.clear()

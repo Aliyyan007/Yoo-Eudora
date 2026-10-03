@@ -48,7 +48,9 @@ Natural fillers that suit YOUR voice: {p.voice_fillers or "'like', 'well', 'you 
 
 MULTI-USER: The prompt says who else is in the call. Use the speaker's NAME sometimes — about 1 in 3 replies, or when 3+ people are talking — so others know who you're addressing ("yeah {{name}}, that's jokes"). Don't mix up who said what — read the history. If someone's been quiet, you can pull them in.
 
-ENGAGE: End with a question most of the time — dead air is awkward. React to what they said, then ask back. Be curious about their day, interests, opinions.
+NAMES: Address people the way a friend would — first name or nick only, never titles or their full display name. And don't say their name every turn — real people rarely do; once in a while is natural.
+
+ENGAGE: Ask a question back when it feels natural — dead air is awkward, but real people often just react and let the other person carry on. Don't end every single turn with a question; that's an interview, not a chat.
 
 ASR ERRORS: The transcript may have speech-recognition mistakes — infer intent from context, don't take weird words literally. If it's gibberish or fragmented, ask naturally: "sorry, what did you say?" / "wait, I didn't catch that". Never pretend to understand garbage.
 
@@ -245,8 +247,18 @@ def build_reply_prompt(
     r = random.random
 
     # 1. Memory block
-    from .d1_memory import get_user_memory_text
+    from .d1_memory import get_user_memory_text, get_user_profile
     memory_text = get_user_memory_text(user_id, username)
+
+    # 1.1. Call-name — the name a friend would actually say. Display names
+    # carry titles/decorations ("Mr. Alien", "👑 Sarah") that sound robotic
+    # when echoed verbatim; a learned real name beats the cleaned handle.
+    try:
+        from .name_utils import resolve_call_name
+        _prof = get_user_profile(user_id) or {}
+        username = resolve_call_name(user_id, username, profile=_prof)
+    except Exception:
+        pass
 
     # 1.5. Addressing context — tell the AI who it is and who the message mentions
     addressing_block = ""
@@ -395,6 +407,7 @@ def build_voice_reply_prompt(
     other_users: str = "",
     extra_directive: str = "",
     recent_texts: str = "",
+    maybe_side_talk: bool = False,
 ) -> str:
     """Build the user prompt for a voice conversation reply.
 
@@ -421,13 +434,23 @@ def build_voice_reply_prompt(
     if recent_texts and recent_texts.strip():
         parts.append(f"[{username} also texted in chat recently: {recent_texts}]")
 
+    # Side-talk detection: with 3+ people in the call and no name mention,
+    # this may be them talking to EACH OTHER, not the bot. Real people don't
+    # answer every overheard line — a brief reaction or silence is fine.
+    if maybe_side_talk:
+        parts.append(
+            f"[{username} may be talking to the others, not you — if this "
+            f"isn't aimed at you, react briefly or stay quiet (say just \"...\")]"
+        )
+
     parts.append(f"\n{username} said: \"{transcript}\"")
 
     if is_greeting:
         parts.append(f"\nThis is a greeting — {username} might be joining or just arrived. Welcome them naturally and ask how they're doing.")
     else:
         parts.append(
-            f"\nReply naturally in 1-3 sentences. Use full words. End with a question. "
+            f"\nReply naturally in 1-3 sentences. Use full words. "
+            f"Ask a question back only if it feels natural — often just reacting is enough. "
             f"Say ONLY what you'd speak out loud."
         )
 

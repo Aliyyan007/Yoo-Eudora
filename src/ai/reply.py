@@ -251,6 +251,10 @@ def clean_for_speech(text: str) -> str:
     # 1. Keep markdown link text but drop the URL
     text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
 
+    # 1.5. Drop bare URLs entirely — TTS reads "h t t p s colon slash
+    # slash..." letter by letter; a real person just doesn't say the link
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+
     # 2. Strip markdown / formatting characters
     text = _SPEECH_STRIP_RE.sub(' ', text)
 

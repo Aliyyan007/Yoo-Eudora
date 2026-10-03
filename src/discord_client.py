@@ -617,6 +617,7 @@ class AIPersonaClient(discord.Client):
         conversation history, greeting/other-user detection, and the final
         system + user prompts. Returns (username, history, system, user)."""
         from .ai import prompts as ai_prompts
+        from .ai.name_utils import resolve_call_name, clean_display_name
 
         user = self.get_user(user_id)
         username = user.display_name if user else f"user_{user_id}"
@@ -625,9 +626,17 @@ class AIPersonaClient(discord.Client):
 
         # Kick off the D1 memory lookup in a worker thread FIRST so the
         # remote query overlaps with the (instant) local prep below.
-        memory_task = loop.run_in_executor(
-            None, mem.get_user_memory_text, str(user_id), username
-        )
+        # Returns (memory_text, real_name) — the profile comes along for
+        # free so the bot can address them by their actual name, not the
+        # decorated display name ("Mr. Alien" → "Alien").
+        def _mem_batch():
+            mt = mem.get_user_memory_text(str(user_id), username)
+            try:
+                rn = (mem.get_user_profile(str(user_id)) or {}).get("real_name", "")
+            except Exception:
+                rn = ""
+            return mt, rn
+        memory_task = loop.run_in_executor(None, _mem_batch)
 
         # Get current mood for tone matching
         mood = self.mood_engine.current_mood if self.mood_engine else ""
@@ -639,10 +648,6 @@ class AIPersonaClient(discord.Client):
         guild_id = self._find_voice_guild_id(user_id)
         history = self._get_voice_history(guild_id) if guild_id else deque()
         history_text = self._format_voice_history(history)
-        # Record what the user just said — deduped because the streaming path
-        # may call this again via the non-streaming fallback
-        if not history or history[-1] != (username, transcript):
-            history.append((username, transcript))
 
         # Cross-modal memory: remember their recent voice lines so a later
         # text reply can reference what they said in the call
@@ -657,20 +662,36 @@ class AIPersonaClient(discord.Client):
 
         # Get other users in the call (for the bot to be aware of multi-user context)
         other_users = ""
+        others_count = 0
         if guild_id:
             for vc in self.voice_clients:
                 if vc.guild.id == guild_id and vc.channel:
-                    others = [m.display_name for m in vc.channel.members if not m.bot and m.id != user_id]
+                    others = [clean_display_name(m.display_name) for m in vc.channel.members if not m.bot and m.id != user_id]
+                    others_count = len(others)
                     if others:
                         other_users = ", ".join(others[:5])
                     break
 
         # Wait for the memory lookup — capped so a slow D1 can never stall
         # a live voice turn. On timeout the reply is just less personalised.
+        real_name = ""
         try:
-            user_memory = await asyncio.wait_for(memory_task, timeout=0.9)
+            user_memory, real_name = await asyncio.wait_for(memory_task, timeout=0.9)
         except Exception:
             user_memory = ""
+
+        # What a friend would call them — learned real name wins, else a
+        # cleaned display name. Feeding 'Mr. Alien' verbatim is how the bot
+        # ended up saying it back every turn.
+        username = resolve_call_name(
+            str(user_id), username,
+            profile={"real_name": real_name} if real_name else None)
+
+        # Record what the user just said under their call name — deduped
+        # because the streaming path may call this again via the
+        # non-streaming fallback
+        if not history or history[-1] != (username, transcript):
+            history.append((username, transcript))
 
         # Cross-modal context: pull what they recently TYPED in text channels
         # (last ~10min) so the voice reply can connect both
@@ -680,6 +701,17 @@ class AIPersonaClient(discord.Client):
             fresh = [t for ts, t in texts if time.time() - ts < 600]
             if fresh:
                 recent_texts = " / ".join(f'"{t}"' for t in fresh[-3:])
+
+        # Side-talk: with 2+ other humans in the call and no name mention,
+        # this utterance may be aimed at the group, not the bot — the prompt
+        # lets the model react briefly or stay quiet instead of answering
+        # every overheard line.
+        my_names = {self.user.display_name.lower(), self.user.name.lower(),
+                    self.persona.name.lower()}
+        import re as _re
+        named = any(n and _re.search(rf"\b{_re.escape(n)}\b", transcript_lower)
+                    for n in my_names)
+        maybe_side_talk = others_count >= 2 and not named and not is_greeting
 
         # Build prompts using the dedicated voice system + builder
         system_prompt = ai_prompts.VOICE_REPLY_SYSTEM
@@ -693,6 +725,7 @@ class AIPersonaClient(discord.Client):
             other_users=other_users,
             extra_directive=(hints or {}).get("directive", ""),
             recent_texts=recent_texts,
+            maybe_side_talk=maybe_side_talk,
         )
         return username, history, system_prompt, user_prompt
 
