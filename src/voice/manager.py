@@ -36,11 +36,13 @@ class VoiceManager:
         on_transcript: Callable[[int, str], Awaitable[Optional[str]]],
         bot_id: int,
         on_transcript_stream: Optional[Callable] = None,
+        persona_gender: str = "female",
     ):
         self._tts_config = tts_config
         self._on_transcript = on_transcript
         self._on_transcript_stream = on_transcript_stream
         self._bot_id = bot_id
+        self._persona_gender = persona_gender
 
         # Per-guild state: guild_id -> VoicePipeline
         self._pipelines: Dict[int, VoicePipeline] = {}
@@ -132,6 +134,7 @@ class VoiceManager:
                 pipeline = VoicePipeline(
                     self._tts_config, self._on_transcript, self._bot_id,
                     on_transcript_stream=self._on_transcript_stream,
+                    persona_gender=self._persona_gender,
                 )
                 pipeline.set_voice_client(vc, loop)
                 pipeline._guild_id = guild_id

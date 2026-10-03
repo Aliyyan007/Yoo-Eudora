@@ -200,6 +200,7 @@ class VoicePipeline:
         on_transcript: Callable[[int, str], Awaitable[Optional[str]]],
         bot_id: int,
         on_transcript_stream: Optional[Callable] = None,
+        persona_gender: str = "female",
     ):
         """
         Args:
@@ -210,11 +211,14 @@ class VoicePipeline:
                 (user_id, text) -> yields reply text pieces as the LLM streams
                 them. When set, replies are pipelined to TTS sentence-by-
                 sentence instead of waiting for the full response.
+            persona_gender: 'male'|'female' — picks the hmm/ack sound set so a
+                male persona gets gruff acknowledgments, not soft humming.
         """
         self._tts_config = tts_config
         self._on_transcript = on_transcript
         self._on_transcript_stream = on_transcript_stream
         self._bot_id = bot_id
+        self._persona_gender = persona_gender
 
         # Per-user state
         self._user_vads: dict[int, SileroVAD] = {}
@@ -501,8 +505,9 @@ class VoicePipeline:
         this is still playing, so it can't collide."""
         try:
             import random as _rng
-            from .hmm_sounds import _hmm_cache
-            if not _hmm_cache:
+            from .hmm_sounds import _sounds_for
+            sounds = _sounds_for(self)
+            if not sounds:
                 return
             vc = self._voice_client
             if not vc or not vc.is_connected():
@@ -515,8 +520,8 @@ class VoicePipeline:
             if _rng.random() > 0.5:
                 return
             # Prefer the short acknowledgments; long ones undercut the reply
-            acks = [s for s in _hmm_cache if len(s) <= 6]
-            packets = _hmm_cache.get(_rng.choice(acks or list(_hmm_cache)), [])
+            acks = [s for s in sounds if len(s) <= 6]
+            packets = sounds.get(_rng.choice(acks or list(sounds)), [])
             if not packets:
                 return
             self.stop_comfort_noise()

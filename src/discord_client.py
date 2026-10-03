@@ -472,6 +472,7 @@ class AIPersonaClient(discord.Client):
                     on_transcript=self._handle_voice_transcript,
                     bot_id=self.user.id,
                     on_transcript_stream=self._stream_voice_transcript,
+                    persona_gender=self.persona.gender,
                 )
                 self._spawn(self.voice_manager.monitor_vcs(self))
                 logger.info("Voice manager initialized (Fish Audio TTS + VAD + ASR)")

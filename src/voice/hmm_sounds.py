@@ -36,9 +36,12 @@ _COOLDOWN_AFTER_BOT_SPEECH_S = 30 # Don't hmm for 30s after bot spoke
 _COOLDOWN_AFTER_HMM_S = 20        # Min 20s between hmm sounds
 _CHECK_INTERVAL_S = 5             # Check every 5s
 
-# The soft "thinking" sounds the bot can make
-# These are short, soft utterances that sound like someone listening
-_HMM_SOUNDS = [
+# The soft "thinking" sounds the bot can make — TWO sets, picked by the
+# active persona's gender. The female set is the original soft/curious
+# acknowledgments; the male set is gruffer — short grunts and dry
+# acknowledgments, no humming, so a male voice model doesn't come out
+# sounding soft and feminine between turns.
+_HMM_SOUNDS_FEMALE = [
     "hm",
     "hmm",
     "mhm",
@@ -61,31 +64,70 @@ _HMM_SOUNDS = [
     "hmm, makes sense",
 ]
 
-# Cache of pre-generated TTS audio for hmm sounds
-# Key: sound text, Value: list of Opus packets
-_hmm_cache: dict[str, list[bytes]] = {}
-_hmm_cache_loaded = False
+_HMM_SOUNDS_MALE = [
+    "yeah",
+    "mm",
+    "right",
+    "huh",
+    "aight",
+    "yep",
+    "go on",
+    "fair",
+    "true",
+    "mm-hmm",
+    "heh",
+    "right, right",
+    "yeah, yeah",
+    "go on then",
+    "huh, fair",
+    "mm, true",
+    "yeah, nah fair",
+    "mm, go on",
+    "aight, yeah",
+    "right, makes sense",
+]
+
+
+def _sound_list(gender: str) -> list:
+    return _HMM_SOUNDS_MALE if gender == "male" else _HMM_SOUNDS_FEMALE
+
+
+# Cache of pre-generated TTS audio for hmm sounds.
+# Key: TTS voice_id → {sound_text: [opus packets]}.
+# CRITICAL: keyed by voice, not a single global — persona rotation reuses
+# this process, so a flat cache meant Rowan played whichever female voice
+# happened to preload first. Each voice preloads its own set on first use.
+_hmm_cache: dict[str, dict[str, list[bytes]]] = {}
+_hmm_loaded: set = set()
+
+
+def _sounds_for(pipeline: "VoicePipeline") -> dict:
+    """The pre-generated sounds matching THIS pipeline's voice — never a
+    stale voice left over from a previous persona."""
+    voice_id = getattr(pipeline._tts_config, "voice_id", "")
+    return _hmm_cache.get(voice_id, {})
 
 
 async def _preload_hmm_sounds(pipeline: "VoicePipeline"):
-    """Pre-generate TTS audio for all hmm sounds and cache them.
+    """Pre-generate TTS audio for this voice's hmm sounds and cache them.
     This avoids latency when playing them during silence."""
-    global _hmm_cache_loaded
-
-    if _hmm_cache_loaded:
-        return
-
-    from .tts import FishAudioTTS, TTSConfig
-    from .ogg_demux import OggDemuxer
-
     tts_config = pipeline._tts_config
     if not tts_config:
         logger.warning("[hmm] No TTS config, can't preload hmm sounds")
         return
 
-    logger.info(f"[hmm] Pre-generating {len(_HMM_SOUNDS)} hmm sounds...")
+    voice_id = tts_config.voice_id
+    if voice_id in _hmm_loaded:
+        return
 
-    for sound_text in _HMM_SOUNDS:
+    from .tts import FishAudioTTS
+    from .ogg_demux import OggDemuxer
+
+    sounds = _sound_list(getattr(pipeline, "_persona_gender", "female"))
+    cache = _hmm_cache.setdefault(voice_id, {})
+    logger.info(f"[hmm] Pre-generating {len(sounds)} hmm sounds (voice={voice_id[:8]}...)...")
+
+    for sound_text in sounds:
         try:
             tts = FishAudioTTS(tts_config)
             await tts.open()
@@ -111,13 +153,13 @@ async def _preload_hmm_sounds(pipeline: "VoicePipeline"):
             await tts.close()
 
             if opus_packets:
-                _hmm_cache[sound_text] = opus_packets
+                cache[sound_text] = opus_packets
 
         except Exception as e:
             logger.debug(f"[hmm] Failed to preload '{sound_text}': {e}")
 
-    _hmm_cache_loaded = True
-    logger.info(f"[hmm] Pre-generated {len(_hmm_cache)}/{len(_HMM_SOUNDS)} hmm sounds")
+    _hmm_loaded.add(voice_id)
+    logger.info(f"[hmm] Pre-generated {len(cache)}/{len(sounds)} hmm sounds")
 
 
 class HmmSoundPlayer:
@@ -220,13 +262,14 @@ class HmmSoundPlayer:
                 logger.debug(f"[hmm] Loop error: {e}")
 
     async def _play_random_hmm(self):
-        """Play a random hmm sound from the cache."""
-        if not _hmm_cache:
+        """Play a random hmm sound from THIS voice's cache."""
+        sounds = _sounds_for(self._pipeline)
+        if not sounds:
             return
 
         # Pick a random sound
-        sound_text = random.choice(list(_hmm_cache.keys()))
-        opus_packets = _hmm_cache.get(sound_text, [])
+        sound_text = random.choice(list(sounds.keys()))
+        opus_packets = sounds.get(sound_text, [])
 
         if not opus_packets:
             return
