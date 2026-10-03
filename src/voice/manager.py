@@ -24,6 +24,12 @@ from .proactive import ProactiveEngager
 class VoiceManager:
     """Manages all voice channel activity for the bot."""
 
+    # Process-global: remembers the VC ANY persona left. A fresh VoiceManager
+    # per account means an instance dict would forget — the next persona could
+    # auto-join the exact call the previous one just exited (worst possible
+    # pattern: Eudora leaves, Isla joins the same room a minute later).
+    _vc_left_at: Dict[int, tuple] = {}          # guild_id -> (channel_id, leave ts)
+
     def __init__(
         self,
         tts_config: TTSConfig,
@@ -56,7 +62,11 @@ class VoiceManager:
 
         # Stay-duration + equity bookkeeping
         self._vc_joined_at: Dict[int, float] = {}        # guild_id -> join ts
-        self._vc_left_at: Dict[int, tuple] = {}          # guild_id -> (channel_id, leave ts)
+        # _vc_left_at lives on the class — shared across persona instances
+
+        # No auto-joining right after coming online — a person lurks a bit
+        # before hopping into a call (join-by-request stays allowed).
+        self._auto_join_after = time.time() + random.uniform(600, 1500)
 
         # Track which users we've greeted in VC
         self._greeted_users: Dict[int, Set[int]] = {}  # guild_id -> set of user_ids
@@ -493,6 +503,8 @@ class VoiceManager:
         loop: asyncio.AbstractEventLoop,
     ):
         """Small chance to join an active VC independently."""
+        if time.time() < self._auto_join_after:
+            return  # just came online — lurk first
         if random.random() > self._auto_join_chance:
             return
 
@@ -522,6 +534,32 @@ class VoiceManager:
                 logger.info(f"Auto-joined VC '{best_vc.name}' in guild '{guild.name}'")
         except Exception as e:
             logger.debug(f"Auto-join failed: {e}")
+
+    async def shutdown(self, client: discord.Client):
+        """Rotation teardown — leave every VC like a person (quick bye if
+        anyone's still listening), clean up pipelines, stop the proactive
+        engager loop. Without this the connection is force-dropped by
+        client.close(): mid-sentence vanish, a leaked engager task, and the
+        next persona free to hop into the call we just left."""
+        for guild_id in set(self._current_vcs) | set(self._pipelines):
+            try:
+                guild = client.get_guild(guild_id)
+                if guild is not None:
+                    await self._auto_leave(
+                        client, guild, "gtg — catch you lot later")
+                # Fallback for whatever _auto_leave didn't cover (missing
+                # guild object, or a pipeline with no tracked VC)
+                pipeline = self._pipelines.pop(guild_id, None)
+                if pipeline:
+                    await pipeline.cleanup()
+                vc = discord.utils.get(
+                    client.voice_clients, guild__id=guild_id)
+                if vc:
+                    await vc.disconnect()
+                self._current_vcs.pop(guild_id, None)
+            except Exception as e:
+                logger.debug(f"[voice] shutdown leave failed for {guild_id}: {e}")
+        self._proactive.stop()
 
     async def _auto_leave(self, client: discord.Client, guild: discord.Guild, reason: str):
         """Leave the VC. No text announcement — just a brief spoken farewell

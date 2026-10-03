@@ -357,14 +357,12 @@ class AIPersonaClient(discord.Client):
                 pass
         self._spawned_tasks.clear()
         # Leave voice cleanly — a stranded voice connection would keep the
-        # account visibly in-call while another persona is live
+        # account visibly in-call while another persona is live. Bounded:
+        # a stuck TTS/disconnect must not stall the whole rotation.
         try:
             if self.voice_manager:
-                for gid in list(getattr(self.voice_manager, "_pipelines", {}) or {}):
-                    try:
-                        await self.voice_manager.leave_voice(self, gid)
-                    except Exception:
-                        pass
+                await asyncio.wait_for(
+                    self.voice_manager.shutdown(self), timeout=15)
         except Exception:
             pass
         # Proactive messenger holds a running loop against this client
