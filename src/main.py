@@ -149,7 +149,11 @@ async def main():
             post_bump_callback=post_bump_callback,
         )
         client.bump_scheduler = bump_scheduler
-        client._spawn(bump_scheduler.start())
+        # NOTE: do NOT spawn scheduler.start() here — it awaits
+        # client.wait_until_ready() which raises RuntimeError on a client
+        # that hasn't logged in yet. The task died ~0.2s after every
+        # activation (this was the "no bumps on Render" bug). on_ready
+        # spawns it once the client is initialized.
 
         return client, client.start(token)
 

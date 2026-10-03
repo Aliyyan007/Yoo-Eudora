@@ -467,6 +467,13 @@ class AIPersonaClient(discord.Client):
         # Daily stale-memory sweep — bounds the context DB across time
         self._spawn(self._memory_gc_loop())
 
+        # Bump scheduler — spawned HERE, not at build time: its start()
+        # awaits wait_until_ready(), which raises RuntimeError on an
+        # un-initialised client (killed it ~0.2s after every activation).
+        # The guard prevents double-spawn if on_ready fires again (resume).
+        if self.bump_scheduler and not self.bump_scheduler._running:
+            self._spawn(self.bump_scheduler.start())
+
         # ── Initialize voice manager (real-time voice conversation) ────────
         try:
             fish_api_key = os.getenv("FISH_AUDIO_API_KEY", "")
@@ -2117,8 +2124,12 @@ class AIPersonaClient(discord.Client):
 
         # ── Abuse detection — fight back if abused ────────────────────────
         # Algorithmically detect abuse and generate a response BEFORE the AI
-        # This ensures fast, deterministic, in-character pushback
-        abuse_response = self.abuse_handler.handle_abuse(message.author.id, message.content)
+        # This ensures fast, deterministic, in-character pushback.
+        # Owner is exempt — an announcement/announcement ping must never
+        # trigger a "fight back" reply at the person running the bot.
+        abuse_response = None
+        if not is_owner(message.author.id):
+            abuse_response = self.abuse_handler.handle_abuse(message.author.id, message.content)
         if abuse_response:
             # Fight back with the abuse response instead of the AI reply
             logger.info(f"Abuse detected from {message.author.name} — fighting back")
