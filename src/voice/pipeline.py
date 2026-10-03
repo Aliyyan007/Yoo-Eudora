@@ -268,6 +268,9 @@ class VoicePipeline:
         self._user_ack_at: dict[int, float] = {}
         self._user_reply_gen: dict[int, int] = {}
         self._user_finalize_queued: set = set()
+        # Per-user one-shot flag: endpoint already extended once for an
+        # incomplete-clause partial — prevents infinite deferral.
+        self._user_endpoint_extended: set = set()
         self._relocate_cb = None   # set by manager — leave+join fallback for vc.move_to
         self._leave_cb = None      # set by manager — spoken "leave the vc" → disconnect
 
@@ -939,6 +942,7 @@ class VoicePipeline:
             self._user_ack_at[user_id] = (
                 time.time() + _rng2.uniform(2.5, 6.0)
                 if _rng2.random() < 0.40 else float("inf"))
+            self._user_endpoint_extended.discard(user_id)  # fresh utterance
             logger.info(f"[voice] User {user_id} started speaking (pcm_48k={len(pcm_48k)})")
 
             # Drain pre-roll buffer into ASR — this is the KEY improvement
@@ -1012,6 +1016,60 @@ class VoicePipeline:
                 return
             self._restart_watchdog(user_id)
 
+    # Incomplete-clause tail words — if the streaming partial ends on one of
+    # these when the silence watchdog fires, the speaker almost certainly
+    # isn't finished (fast speakers pause mid-thought). Extend once instead
+    # of replying to a fragment.
+    _INCOMPLETE_TAIL = {
+        "the", "a", "an", "my", "your", "his", "her", "our", "their", "its",
+        "and", "or", "but", "so", "if", "then", "than", "that", "this",
+        "to", "of", "in", "on", "at", "for", "with", "about", "from", "by",
+        "as", "into", "like", "is", "are", "was", "were", "be", "been", "am",
+        "do", "does", "did", "have", "has", "had", "will", "would", "can",
+        "could", "shall", "should", "may", "might", "must", "gonna", "wanna",
+        "gotta", "i", "we", "you", "he", "she", "they", "i'm", "you're",
+        "we're", "they're", "it's", "he's", "she's",
+    }
+
+    async def _whisper_pass(self, user_id: int, pcm_48k: bytes):
+        """Whisper two-pass, fully off the event loop: resample + silence
+        trim + optional noise suppression + API transcribe, with a context
+        prompt that biases decoding toward this call's vocabulary."""
+        loop = asyncio.get_running_loop()
+        try:
+            audio_f32 = await loop.run_in_executor(
+                self._dsp_executor(),
+                self._resample_48k_to_16k_float32, user_id, pcm_48k)
+            if audio_f32 is None or audio_f32.size == 0:
+                return None
+            audio_f32 = self._trim_tail_silence(audio_f32)
+            if self._noise_suppressor is not None:
+                try:
+                    audio_f32 = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, self._noise_suppressor.suppress, audio_f32),
+                        timeout=8.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[voice] Noise suppression timed out — using raw audio")
+            return await self._whisper.transcribe(
+                audio_f32, prompt=self._whisper_context(user_id))
+        except Exception as e:
+            logger.error(f"[voice] Whisper pass error: {e!r}")
+            return None
+
+    def _whisper_context(self, user_id: int) -> Optional[str]:
+        """Context prompt for Whisper — fast/mumbled speech decodes far
+        better when the model knows the vocabulary: who's in the call, the
+        persona's name, and what was just said."""
+        bits = []
+        names = sorted({n for n in self._user_display_names.values() if n})
+        if names:
+            bits.append("names in the call: " + ", ".join(names[:8]))
+        last = self._user_last_transcript.get(user_id)
+        if last and last[0]:
+            bits.append(f"they just said: {last[0][:120]}")
+        return ". ".join(bits) if bits else None
+
     def _restart_watchdog(self, user_id: int) -> None:
         """Restart the wall-clock silence watchdog via loop.call_later —
         a cancelled-and-recreated Task per voice packet (~50Hz) was burning
@@ -1039,6 +1097,27 @@ class VoicePipeline:
                 return  # already finalized
 
             silence_duration = time.time() - self._user_last_voice_time.get(user_id, 0)
+
+            # Incomplete-clause check — fast speakers pause mid-thought.
+            # If the streaming partial ends on a function word ("the", "to",
+            # "gonna"), the sentence isn't done: extend once with the slow
+            # window instead of replying to a fragment.
+            if user_id not in self._user_endpoint_extended:
+                try:
+                    asr = self._user_asrs.get(user_id)
+                    partial = (asr.partial_text() if asr else "") or ""
+                    tail = partial.strip().lower().replace("'", " ").split()
+                    if len(tail) >= 2 and tail[-1].strip(".,!?") in self._INCOMPLETE_TAIL:
+                        if time.time() - self._user_utt_start.get(user_id, 0) < _MAX_UTTERANCE_S:
+                            self._user_endpoint_extended.add(user_id)
+                            logger.info(f"[voice] Partial ends mid-clause ('…{partial[-30:]}') — extending endpoint")
+                            self._user_watchdog_tasks[user_id] = self._loop.call_later(
+                                _ENDPOINT_SILENCE_MS_SLOW / 1000.0,
+                                self._watchdog_fire, user_id)
+                            return
+                except Exception:
+                    pass  # fall through to normal endpoint
+
             logger.info(f"[voice] Watchdog endpoint for user {user_id} (silence={silence_duration:.2f}s)")
             self._loop.create_task(self._finalize_and_respond(user_id))
         except Exception as e:
@@ -1222,7 +1301,20 @@ class VoicePipeline:
         preroll = self._get_preroll(user_id)
         preroll.clear()
 
-        # ── Pass 1: Streaming ASR (fast, lower accuracy) ──────────────────
+        # ── Two-pass ASR, run in PARALLEL ────────────────────────────────
+        # Whisper only needs the buffered PCM — it does NOT depend on the
+        # streaming result. Kick it off FIRST (resample + trim + suppress +
+        # API call all off the event loop), then finalize the streaming ASR
+        # alongside it. The old serial order added the whole whisper
+        # round-trip on top of every turn — this is the big latency win.
+        utterance_pcm = self._user_utterance_pcm.pop(user_id, bytearray())
+        whisper_task = None
+        if self._whisper is not None and len(utterance_pcm) > 32000:  # > 0.33s
+            whisper_task = asyncio.ensure_future(
+                self._whisper_pass(user_id, bytes(utterance_pcm)))
+
+        # ── Pass 1: Streaming ASR (fast, lower accuracy) — runs alongside
+        # the whisper pass launched above.
         # Bounded: sherpa decodes share a class-level infer lock + the default
         # executor pool — a starved/hung decode must not hang the whole turn.
         asr = self._user_asrs.get(user_id)
@@ -1244,47 +1336,14 @@ class VoicePipeline:
         if stream_text and len(stream_text.strip()) >= 2:
             logger.info(f"[voice] Stream transcript from {user_id}: {stream_text}")
 
-        # ── Pass 2: Whisper re-score (ALWAYS run for better accuracy) ──────
-        # The streaming zipformer is fast but less accurate. Whisper base.en
-        # gives much better results. We always run Whisper and pick the better
-        # result. The ~0.5s extra latency is worth the accuracy improvement.
+        # ── Pass 2 result — the whisper task has been running the whole
+        # time pass 1 was finalizing, so this await usually returns at once.
         final_text = stream_text
         from_whisper = False
-        utterance_pcm = self._user_utterance_pcm.pop(user_id, bytearray())
 
-        # Always run Whisper if available and we have enough audio
-        needs_whisper = (
-            self._whisper is not None
-            and len(utterance_pcm) > 32000  # > 0.33s of audio
-        )
-
-        if needs_whisper:
+        if whisper_task is not None:
             try:
-                # Convert 48k PCM to 16k float32 for Whisper
-                audio_f32 = self._resample_48k_to_16k_float32(user_id, bytes(utterance_pcm))
-
-                # Trim trailing silence — the endpoint wait (~0.5s) leaves dead
-                # air in the buffer; cutting it shrinks the WAV upload and
-                # Whisper's transcribe time
-                audio_f32 = self._trim_tail_silence(audio_f32)
-
-                # Apply noise suppression if available — off the event loop
-                # (it blocks for several hundred ms on multi-second utterances)
-                # and BOUNDED — a slow suppress on weak CPU must not starve the
-                # ASR decode executor and stall the whole turn.
-                if self._noise_suppressor is not None:
-                    try:
-                        audio_f32 = await asyncio.wait_for(
-                            asyncio.get_running_loop().run_in_executor(
-                                None, self._noise_suppressor.suppress, audio_f32
-                            ),
-                            timeout=8.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning("[voice] Noise suppression timed out — using raw audio")
-
-                # Run Whisper
-                whisper_text = await self._whisper.transcribe(audio_f32)
+                whisper_text = await whisper_task
 
                 if whisper_text and len(whisper_text.strip()) >= 1:
                     # Pick the better result:
@@ -1332,10 +1391,6 @@ class VoicePipeline:
                 logger.error(f"[voice] Whisper two-pass failed: {e!r}")
         elif stream_text:
             logger.info(f"[voice] Using stream result: '{stream_text}'")
-
-        # Clean up utterance PCM
-        if user_id in self._user_utterance_pcm:
-            del self._user_utterance_pcm[user_id]
 
         if not final_text or len(final_text.strip()) < 2:
             logger.info(f"[voice] Empty final transcript from user {user_id} (audio={len(utterance_pcm)/96000:.1f}s)")
@@ -1386,11 +1441,13 @@ class VoicePipeline:
         self._user_last_transcript[user_id] = (normalized, now)
 
         # ── Response cooldown (per-user) ──────────────────────────────────
-        # Don't respond to the SAME user more than once every 2.5s — prevents
-        # response stacking on rapid short utterances. Per-user so one person's
-        # reply doesn't suppress another user's turn in a multi-user call.
+        # Don't respond to the SAME user more than once every ~1.6s —
+        # rapid follow-ups now SUPERSEDE the pending reply via the
+        # generation check, so the cooldown only needs to stop true
+        # same-instant fragments, not genuine fast-speaker turns. Per-user
+        # so one person's reply doesn't suppress another's turn.
         last_response_time = self._user_last_response.get(user_id, 0)
-        if (now - last_response_time) < 2.5:
+        if (now - last_response_time) < 1.6:
             logger.info(f"[voice] Response cooldown ({now - last_response_time:.1f}s since last) — skipping '{final_text[:40]}'")
             return
 
@@ -2012,6 +2069,7 @@ class VoicePipeline:
         self._user_ack_at.pop(user_id, None)
         self._user_reply_gen.pop(user_id, None)
         self._user_finalize_queued.discard(user_id)
+        self._user_endpoint_extended.discard(user_id)
         self._irritation.clear(user_id)
         self._finalizing.discard(user_id)
         self._user_pkt_queues.pop(user_id, None)
@@ -2048,6 +2106,7 @@ class VoicePipeline:
         self._user_ack_at.clear()
         self._user_reply_gen.clear()
         self._user_finalize_queued.clear()
+        self._user_endpoint_extended.clear()
         self._irritation.clear_all()
         self._pending_vc_move = None
         self._finalizing.clear()

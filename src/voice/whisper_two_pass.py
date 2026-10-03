@@ -78,11 +78,13 @@ class WhisperTwoPass:
                 logger.error(f"[whisper] Failed to load faster-whisper: {e!r}")
                 raise
 
-    async def transcribe(self, pcm_16k_float32: np.ndarray) -> Optional[str]:
+    async def transcribe(self, pcm_16k_float32: np.ndarray,
+                         prompt: Optional[str] = None) -> Optional[str]:
         """Transcribe 16kHz float32 mono audio. Returns text or None.
 
         This is the second pass — run after the streaming ASR has detected
         utterance end. The full utterance audio is re-scored for better accuracy.
+        `prompt` maps to faster-whisper's initial_prompt — decode context.
         """
         if self._model is None:
             await self.preload()
@@ -109,6 +111,7 @@ class WhisperTwoPass:
                         speech_pad_ms=200,  # pad speech to avoid clipping
                     ),
                     without_timestamps=True,
+                    initial_prompt=(prompt or None),
                 )
                 # segments is a generator — consume it
                 text = " ".join(seg.text.strip() for seg in segments).strip()

@@ -50,11 +50,15 @@ class GroqWhisperTwoPass:
         self._init_clients()
         logger.info(f"[groq-whisper] Ready (model={self._model}, keys={len(self._groq_clients)})")
 
-    async def transcribe(self, pcm_16k_float32: np.ndarray) -> Optional[str]:
+    async def transcribe(self, pcm_16k_float32: np.ndarray,
+                         prompt: Optional[str] = None) -> Optional[str]:
         """Transcribe 16kHz float32 mono audio via Groq Whisper API.
 
         Args:
             pcm_16k_float32: 16kHz mono audio as float32 numpy array
+            prompt: optional context string — Whisper uses it to bias
+                decoding toward expected vocabulary (names, slang, the
+                previous utterance). Big accuracy win on fast/mumbled speech.
 
         Returns:
             Transcribed text or None
@@ -78,7 +82,8 @@ class GroqWhisperTwoPass:
 
         try:
             text = await asyncio.wait_for(
-                loop.run_in_executor(None, self._call_groq_api, wav_bytes),
+                loop.run_in_executor(
+                    None, lambda: self._call_groq_api(wav_bytes, prompt)),
                 timeout=10.0,
             )
             elapsed = time.time() - t0
@@ -148,10 +153,13 @@ class GroqWhisperTwoPass:
             wav.writeframes(pcm_int16.tobytes())
         return buf.getvalue()
 
-    def _call_groq_api(self, wav_bytes: bytes) -> Optional[str]:
+    def _call_groq_api(self, wav_bytes: bytes,
+                       prompt: Optional[str] = None) -> Optional[str]:
         """Call Groq Whisper API with WAV audio. Synchronous (called in executor).
 
         Rotates through Groq keys on rate limits, same as the LLM caller.
+        `prompt` is passed to the API as decode context — if a key errors
+        with it, that key is retried once without before rotating.
         """
         n = len(self._groq_clients)
         if n == 0:
@@ -173,12 +181,18 @@ class GroqWhisperTwoPass:
             try:
                 # Create a file-like object for the API
                 audio_file = ("audio.wav", wav_bytes, "audio/wav")
-                response = client.audio.transcriptions.create(
-                    model=self._model,
-                    file=audio_file,
-                    language=self._language,
-                    response_format="text",
-                )
+                kwargs = dict(model=self._model, file=audio_file,
+                              language=self._language, response_format="text")
+                if prompt:
+                    kwargs["prompt"] = prompt[:224]  # whisper prompt window is short
+                try:
+                    response = client.audio.transcriptions.create(**kwargs)
+                except Exception:
+                    if not prompt:
+                        raise
+                    # Some builds reject the prompt kwarg — retry bare once
+                    kwargs.pop("prompt", None)
+                    response = client.audio.transcriptions.create(**kwargs)
                 text = response.strip() if isinstance(response, str) else str(response).strip()
                 return text if text else None
 
