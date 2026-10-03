@@ -92,6 +92,10 @@ _COMPILED_NON_OWNER_CMDS = [re.compile(p, re.IGNORECASE) for p in NON_OWNER_COMM
 
 def detect_command_attempt(text: str) -> bool:
     """Detect if a message is attempting to give a command."""
+    # Questions aren't commands — "u gonna reply to my dm?" matches the
+    # 'reply to X' pattern but is a question, not an instruction.
+    if text.rstrip().endswith("?"):
+        return False
     for rx in _COMPILED_OWNER_CMDS:
         if rx.search(text):
             return True

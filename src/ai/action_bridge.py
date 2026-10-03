@@ -128,6 +128,9 @@ _CONFIRM_PROMPT = (
     "â€” 'users with the member role can use @everyone ping once a week', 'he "
     "pinged me yesterday', 'how do I send a gif', 'can people ping roles here', "
     "'im gonna go', gossip, jokes, or talk aimed at someone else.\n"
+    "Questions ABOUT what the bot is doing or will do are also NO — 'you gonna "
+    "reply to my dm?', 'did you send it?', 'why haven't you pinged him', 'are "
+    "you in vc?' — these ask the bot to ANSWER, not to perform a new task.\n"
     "Answer with only YES or NO."
 )
 

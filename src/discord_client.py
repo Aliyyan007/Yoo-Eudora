@@ -896,7 +896,10 @@ class AIPersonaClient(discord.Client):
         Periodically check if the bot's messages got no replies.
         If no one replied, try to re-engage by pinging users.
         """
-        await asyncio.sleep(120)  # Wait 2 min before first check
+        # Settle-in window: the re-engagement tracker is process-global, so a
+        # message the PREVIOUS persona sent counts as "unanswered" — without
+        # this a freshly-rotated account pings within seconds of logging in.
+        await asyncio.sleep(random.uniform(420, 900))
         while True:
             try:
                 re_tracker = get_re_engagement_tracker()

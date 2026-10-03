@@ -134,10 +134,11 @@ def update_user_memory(user_id: str, username: str, new_facts: list):
         # Check if this fact replaces an existing one
         replaced = _find_contradicting_fact(fact, existing_facts)
         if replaced:
-            # Remove the old contradicting fact
+            # Remove the old contradicting fact — then still add the new
+            # one below (it IS the newer value; `elif` here used to drop it)
             existing_facts = [f for f in existing_facts if f != replaced]
             logger.info(f"Fact replaced: '{replaced}' -> '{fact}'")
-        elif fact not in existing_set:
+        if fact not in existing_set:
             existing_facts.append(fact)
             existing_set.add(fact)
 
@@ -157,15 +158,15 @@ _FACT_CATEGORIES = [
     # Name facts: "their real name is X" / "name is X" / "called X"
     (r'(?:real\s+name\s+is|name\s+is|called|known\s+as)\s+(\w+)',
      lambda m: "name"),
-    # Age facts: "is X years old" / "age is X"
-    (r'(?:years?\s+old|age\s+is)\s*(\d+)',
+    # Age facts: "is 20 years old" / "age is 20" / "i'm 20"
+    (r'(?:(\d+)\s*years?\s+old|age\s+is\s*(\d+)|(?:i\'?m|am|is)\s+(\d{2})\b)',
      lambda m: "age"),
     # Location facts: "from X" / "lives in X"
     (r'(?:from|lives?\s+in|resides?\s+in)\s+(\w+)',
      lambda m: "location"),
-    # Hobby facts: "likes X" / "enjoys X" / "loves X"
-    (r'(?:likes?|enjoys?|loves?)\s+(\w+)',
-     lambda m: "hobby"),
+    # NOTE: no "hobby" category — "likes X" facts are multi-valued (a user
+    # can like music AND football); keying them the same erased all but the
+    # last interest on every update.
     # Relationship facts: "is my X" / "relationship is X"
     (r'(?:is\s+my|relationship\s+is)\s+(\w+)',
      lambda m: "relationship"),

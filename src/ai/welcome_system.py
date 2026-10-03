@@ -90,6 +90,22 @@ class WelcomeSystem:
             user_id = member.id
             guild_id = guild.id
 
+            # Never greet our own persona accounts — Eudora welcoming
+            # Isla would out the whole rotation. Registry covers accounts
+            # that have logged in; name match covers first deploy.
+            try:
+                from ..persona import runtime as _prt
+                from ..persona.profiles import PROFILES
+                if user_id in _prt.own_user_ids():
+                    return
+                uname = (member.name or "").lower()
+                dname = (member.display_name or "").lower()
+                if any(p.name in uname or p.name in dname
+                       or p.full_name.lower() in dname for p in PROFILES.values()):
+                    return
+            except Exception:
+                pass
+
             # 1 & 2 — cooldown checks
             if not self._should_greet(user_id, guild_id):
                 logger.debug(

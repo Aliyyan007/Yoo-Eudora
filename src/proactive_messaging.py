@@ -117,6 +117,10 @@ class ProactiveMessenger:
         self.last_proactive = 0
         self.last_auto_chat = time.time()
         self.last_activity: dict = {}  # channel_id -> timestamp
+        # Warmup: no proactive/revive sends for a few minutes after coming
+        # online — a person doesn't message the second they connect, and on
+        # rotation the new account inherits genuinely-quiet channels.
+        self._warmup_until = time.time() + random.uniform(360, 840)
 
     async def start_monitoring(self):
         """Start the proactive monitoring loop."""
@@ -144,6 +148,29 @@ class ProactiveMessenger:
         # NOTE: called for bot msgs too — human-only interaction marking
         # happens in discord_client's `not author.bot` tracking block
 
+    async def _last_seen(self, channel_id: int) -> float:
+        """Real last-activity timestamp for a channel. A fresh client has an
+        empty last_activity — without this every channel reads as dead-forever
+        and gets revived/pinged seconds after login (looks bot-like, and on
+        rotation the new account re-pings a channel that was already pinged)."""
+        ch_id = str(channel_id)
+        ts = self.last_activity.get(ch_id, 0)
+        if ts:
+            return ts
+        last = 0.0
+        try:
+            channel = self.client.get_channel(channel_id)
+            if channel is not None:
+                async for m in channel.history(limit=1):
+                    last = m.created_at.timestamp()
+        except Exception:
+            pass
+        # Channel with no history: count from now — a never-active channel
+        # earns its silence like any other instead of being instantly "dead".
+        ts = last or time.time()
+        self.last_activity[ch_id] = ts
+        return ts
+
     async def _monitor_loop(self):
         """
         Check all channels for:
@@ -151,11 +178,13 @@ class ProactiveMessenger:
         2. Inactive chat (silent for > 5 min but < threshold) — random auto-chat
         """
         now = time.time()
+        if now < self._warmup_until:
+            return  # just came online — lurk before posting
 
         for channel_id in self.channel_ids:
             ch_id = str(channel_id)
-            last_msg = self.last_activity.get(ch_id, 0)
-            silence_duration = now - last_msg if last_msg > 0 else 999999
+            last_msg = await self._last_seen(channel_id)
+            silence_duration = now - last_msg
 
             # 1. Dead chat revival (silent for > threshold)
             if silence_duration > self.dead_chat_threshold:
@@ -384,6 +413,9 @@ class ProactiveMessenger:
             )
             logger.debug(f"Proactive loop sleeping {wait_secs // 60}min...")
             await asyncio.sleep(wait_secs)
+
+            if time.time() < self._warmup_until:
+                continue  # still settling in — no posting right after login
 
             try:
                 # Find the most active channel across all guilds

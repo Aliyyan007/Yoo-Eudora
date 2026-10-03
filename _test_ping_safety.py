@@ -49,6 +49,21 @@ check("human activity resets streak", pc._unanswered(CH) == 0)
 pc._role_pings[CH][-1] = now - (pc._role_cooldown_s + 10)
 check("role ping allowed again", pc.can_ping_role(CH))
 
+# ── 1b. Cross-type mass-ping gap ────────────────────────────────────
+print("\n== inter-ping mass gap ==")
+from collections import deque
+CH3 = "ch-gap"
+# Inject a user ping without record_* (keeps streak at 0 — the streak
+# cooldown-scaling would otherwise exceed the gap window on its own)
+pc._user_pings[CH3] = deque([now - (pc._user_cooldown_s + 10)], maxlen=50)
+check("user ping allowed after own cooldown", pc.can_ping_user(CH3))
+check("role ping blocked by recent user ping", not pc.can_ping_role(CH3))
+check("@here blocked by recent user ping", not pc.can_ping_here(CH3))
+check("@everyone blocked by recent user ping", not pc.can_ping_everyone(CH3))
+pc._user_pings[CH3][-1] = now - (pc._min_mass_gap_s + 10)  # gap elapsed
+check("role ping allowed once gap elapsed", pc.can_ping_role(CH3))
+pc._role_pings.pop(CH3, None); pc._unanswered_pings.pop(CH3, None)
+
 # ── 2. Persistence + merge ──────────────────────────────────────────
 print("\n== persistence ==")
 pc.record_here_ping(CH)

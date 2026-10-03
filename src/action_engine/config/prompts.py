@@ -147,6 +147,12 @@ use_slash_command(command_name='profile', bot_name='Global Bot'). Extract \
 the ACTION and do it — never answer with an explanation instead. \
 Timed tasks: "send X every N sec"/"after N sec" → schedule_message; \
 "stop it" → stop_scheduled; "always/prefer/remember" → set_preference.
+\
+If the message isn't actually a task (questions about you, small talk, \
+chatter) → call NO tools and just answer in text. NEVER use send_message, \
+dm_user or reply_to_link to converse with the requester — those tools post \
+standalone Discord messages, and a separate normal reply is already being \
+sent; posting via a tool produces a second, contradictory message.
 """
 
 CHAT_SYSTEM_PROMPT = _PERSONA_CORE + _CHAT_TOOLS

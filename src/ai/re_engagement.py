@@ -77,6 +77,10 @@ class PingController:
         self._role_daily_limit = _ei("PING_ROLE_DAILY_LIMIT", 4)
         self._user_cooldown_s = _ei("PING_USER_COOLDOWN_MIN", 10) * 60
         self._total_daily_limit = _ei("PING_TOTAL_DAILY_LIMIT", 15)
+        # Mass pings (@here/@everyone/role) also need a quiet buffer after
+        # ANY ping — otherwise different cooldown pools let a user ping at
+        # :38 and an @everyone at :48 slip through back-to-back.
+        self._min_mass_gap_s = _ei("PING_MIN_MASS_GAP_MIN", 20) * 60
 
         # Persisted ping timelines — cooldowns survive restarts
         self._state_path = Path("data/ping_state.json")
@@ -216,9 +220,21 @@ class PingController:
         eff = base_s * (1 + 3 * self._unanswered(channel_id))
         return (last + eff) - time.time()
 
+    def _any_ping_recently(self, channel_id: str) -> bool:
+        """Any ping type fired within the min mass-ping gap?"""
+        last = max(
+            self._last_ping_time(channel_id, self._here_pings),
+            self._last_ping_time(channel_id, self._everyone_pings),
+            self._last_ping_time(channel_id, self._role_pings),
+            self._last_ping_time(channel_id, self._user_pings),
+        )
+        return (time.time() - last) < self._min_mass_gap_s
+
     def can_ping_here(self, channel_id: str) -> bool:
         """Check if @here can be used in this channel."""
         if self._mass_ping_blocked(channel_id):
+            return False
+        if self._any_ping_recently(channel_id):
             return False
         now = time.time()
         # Check daily limit
@@ -238,6 +254,8 @@ class PingController:
         """Check if @everyone can be used in this channel."""
         if self._mass_ping_blocked(channel_id):
             return False
+        if self._any_ping_recently(channel_id):
+            return False
         now = time.time()
         # Check weekly limit
         weekly_count = self._count_recent(channel_id, self._everyone_pings, 7 * 24 * 3600)
@@ -255,6 +273,8 @@ class PingController:
     def can_ping_role(self, channel_id: str) -> bool:
         """Check if a role ping can be used in this channel."""
         if self._mass_ping_blocked(channel_id):
+            return False
+        if self._any_ping_recently(channel_id):
             return False
         now = time.time()
         # Check daily limit

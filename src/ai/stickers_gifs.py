@@ -172,12 +172,19 @@ class StickerManager:
             if any(rx.search(text) for rx in patterns):
                 categories.append(cat)
 
-        # Filter out recently used stickers
+        # Filter out recently used stickers — and intimate-themed ones: a
+        # "Kiss"/"Love" sticker to a stranger reads as flirting and is a
+        # selfbot red flag. Only a direct romantic request could justify one,
+        # and we never get that context here.
+        _intimate = re.compile(r"kiss|love|heart|marry|flirt|babe|crush|smooch|valentine", re.I)
+        pool = [s for s in stickers if not _intimate.search(s.name or "")]
+        if not pool:
+            return None
         recent = self._recent_stickers.get(channel_id, deque(maxlen=5))
-        available = [s for s in stickers if s.id not in recent]
+        available = [s for s in pool if s.id not in recent]
 
         if not available:
-            available = stickers
+            available = pool
 
         # Try to match sticker name to content category
         if categories:
