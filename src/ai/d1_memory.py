@@ -827,6 +827,41 @@ def update_channel_topic(channel_id: str, topic: str):
         return _json_fallback.update_channel_topic(channel_id, topic)
 
 
+async def get_channel_topic_fresh_async(channel_id: str, max_age_s: int = 3600) -> str:
+    """Topic summary only if refreshed within max_age_s — a stale topic makes
+    proactive messages fixate on a conversation that ended hours ago."""
+    if not await _d1_ok():
+        return _json_fallback.get_channel_topic_fresh(channel_id, max_age_s)
+
+    client = _get_d1()
+    try:
+        rows = await client.execute(
+            "SELECT topic, updated_at FROM channel_topics WHERE channel_id = ?",
+            [str(channel_id)],
+        )
+    except Exception as e:
+        logger.warning(f"D1 get_channel_topic_fresh failed: {e}")
+        return _json_fallback.get_channel_topic_fresh(channel_id, max_age_s)
+
+    if not rows:
+        return ""
+    row = rows[0]
+    try:
+        if time.time() - float(row.get("updated_at") or 0) > max_age_s:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    return row.get("topic") or ""
+
+
+def get_channel_topic_fresh(channel_id: str, max_age_s: int = 3600) -> str:
+    """Sync wrapper — drop-in replacement for memory.get_channel_topic_fresh."""
+    try:
+        return _run_async(get_channel_topic_fresh_async(channel_id, max_age_s))
+    except Exception:
+        return _json_fallback.get_channel_topic_fresh(channel_id, max_age_s)
+
+
 # ── Channel styles ────────────────────────────────────────────────────────────
 
 async def get_channel_style_async(channel_id: str) -> str:

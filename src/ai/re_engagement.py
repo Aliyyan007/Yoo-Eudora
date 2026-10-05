@@ -445,33 +445,27 @@ class ReEngagementTracker:
         Escalation:
         1. First: ping a random online user
         2. Second: use @here
-        3. Third: use @everyone (rare, weekly limit)
+        (@everyone is never used — a mass ping from a random account reads
+        as pure bot behavior and isn't worth the reach)
 
-        Returns: "user_ping", "here", "everyone", or "none"
+        Returns: "user_ping", "here", or "none"
         """
         ping_ctrl = get_ping_controller()
 
         # Check what pings are available
         can_user = ping_ctrl.can_ping_user(channel_id)
         can_here = ping_ctrl.can_ping_here(channel_id)
-        can_everyone = ping_ctrl.can_ping_everyone(channel_id)
 
         # Algorithmic escalation
-        # 60% chance: try user ping first
-        # 30% chance: try @here
-        # 10% chance: try @everyone (if available)
+        # ~70%: try user ping first, ~30%: try @here
 
-        if can_everyone and random.random() < 0.10:
-            action = "everyone"
-        elif can_here and random.random() < 0.30:
+        if can_here and random.random() < 0.30:
             action = "here"
         elif can_user:
             action = "user_ping"
         # Fallback: try whatever is available
         elif can_here:
             action = "here"
-        elif can_everyone:
-            action = "everyone"
         elif can_user:
             action = "user_ping"
         else:
@@ -482,7 +476,7 @@ class ReEngagementTracker:
         # different available one instead.
         last = self._last_action.get(channel_id)
         if action != "none" and action == last and random.random() < 0.70:
-            alts = [a for a, ok in (("user_ping", can_user), ("here", can_here), ("everyone", can_everyone)) if ok and a != action]
+            alts = [a for a, ok in (("user_ping", can_user), ("here", can_here)) if ok and a != action]
             if alts:
                 action = random.choice(alts)
         if action != "none":
@@ -529,6 +523,13 @@ def select_online_user(
     """
     if exclude_ids is None:
         exclude_ids = set()
+    # Never ping our own persona accounts — the other personas rotate through
+    # this same process and their user ids look like ordinary members here.
+    try:
+        from ..persona.runtime import own_user_ids
+        exclude_ids = set(exclude_ids) | set(own_user_ids())
+    except Exception:
+        pass
 
     # Don't re-ping someone pinged recently — falls back to them only if
     # literally everyone else has been pinged too

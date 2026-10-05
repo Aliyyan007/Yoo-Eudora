@@ -35,7 +35,8 @@ except ImportError as _voice_err:
 else:
     _VOICE_IMPORT_ERROR = None
 from .ai.mention_system import get_mention_manager
-from .ai.abuse_handler import get_abuse_handler
+from .ai.abuse_handler import get_abuse_handler, is_bot_accusation
+from .ai import output_guard
 from .ai.multi_message import determine_message_count, split_into_messages, detect_conversation_nature
 from .ai.channel_nature import analyze_channel_nature, get_cached_nature, get_nature_summary
 from .ai.reactions import react_to_message, get_tracker
@@ -101,6 +102,31 @@ def _is_generic_followup(text: str) -> bool:
     """True for short bare follow-up pings like 'wbu?', 'wbu lmao', 'u?'."""
     words = re.sub(r'[^a-z\s?]', '', text.lower()).split()
     return 0 < len(words) <= 4 and words[0].rstrip('?') in _GENERIC_FOLLOWUP_STEMS
+
+
+# Pure acknowledgements — replying to every "lol" is how a bot gives itself
+# away; these deserve a reaction at most, not a typed reply.
+_ACK_WORDS = {
+    "lol", "lmao", "lmfao", "xd", "haha", "hahaha", "hehe", "ok", "okay",
+    "k", "kk", "oh", "ah", "bruh", "bro", "chill", "ofc", "man", "mate",
+    "yeah", "ya", "yea", "yep", "nah", "nope", "true", "fr", "same",
+    "nice", "cool", "damn", "real", "based", "w", "l", "rip", "hmm", "hm",
+    "mhm", "sure", "alr", "aight", "ight", "oof", "wow",
+}
+
+
+def _is_low_content(text: str) -> bool:
+    """True for acknowledgements / emoji-only noise that doesn't merit a
+    typed reply ("lol", "ofc man", "😂", "...."). Questions always count as
+    content — a bare "?" still wants an answer."""
+    if not text:
+        return False
+    if "?" in text:
+        return False
+    if not any(c.isalnum() for c in text):
+        return True  # "....", "😂", "🥀"
+    words = re.findall(r"[a-z']+", text.lower())
+    return 1 <= len(words) <= 3 and all(w in _ACK_WORDS for w in words)
 
 
 def dynamic_reply_chance() -> float:
@@ -272,6 +298,10 @@ class AIPersonaClient(discord.Client):
 
         # Speed multiplier (adjustable via "reply faster" / "slow down" commands)
         self._speed_multiplier = 1.0
+
+        # Bot-suspicion windows: channel_id -> timestamp until which we keep
+        # a low profile (someone accused/suspected the account of being a bot)
+        self._bot_suspicion_until: dict[str, float] = {}
 
         # Per-channel send lock (prevent double-send race condition)
         self._sending_in_channel: Set[str] = set()
@@ -583,6 +613,14 @@ class AIPersonaClient(discord.Client):
                             # must not wedge the item forever (one-shot).
                             prt.remove_deferred(self.persona.id, it["message_id"])
                             done_ch.add(ch_id)
+                            # Too old to answer naturally — replying to a
+                            # >45min-old message reads as a bot catching up.
+                            age_s = time.time() - msg.created_at.timestamp()
+                            if age_s > 2700:
+                                logger.info(
+                                    f"[deferred] dropped stale message from "
+                                    f"{it.get('author_name', '?')} ({int(age_s // 60)}m old)")
+                                continue
                             await asyncio.sleep(random.uniform(3, 8))
                             await self._on_message_impl(msg)
                             logger.info(
@@ -1033,8 +1071,9 @@ class AIPersonaClient(discord.Client):
                                 continue
                             ping_prefix = f"<@{pinged_user.id}> "
 
-                        # Generate re-engagement message (in executor to not block)
-                        topic = mem.get_channel_topic(ch_id)
+                        # Generate re-engagement message (in executor to not block).
+                        # Fresh topic only — a stale one fixates on dead convos.
+                        topic = mem.get_channel_topic_fresh(ch_id)
                         loop = asyncio.get_running_loop()
                         msg = await loop.run_in_executor(
                             None, lambda: ai_reply.generate_proactive_message(
@@ -1118,6 +1157,14 @@ class AIPersonaClient(discord.Client):
 
         # Define ch_id early (needed by tracking systems below)
         ch_id = str(message.channel.id)
+
+        # ── Bot-suspicion tracking ────────────────────────────────────────
+        # A human suspecting the account is a bot opens a 30-min low-profile
+        # window in this channel: fewer ambient replies, and reply prompts
+        # get the "don't defend yourself" heads-up instead of a denial.
+        if not message.author.bot and is_bot_accusation(message.content):
+            self._bot_suspicion_until[ch_id] = time.time() + 1800
+            logger.info(f"[suspicion] bot accusation in #{message.channel} — 30min low profile")
 
         # ── Cross-persona pending capture ─────────────────────────────────
         # A message aimed at an OFFLINE persona (mention, reply to their
@@ -1304,6 +1351,17 @@ class AIPersonaClient(discord.Client):
         logger.info(f"[{message.channel}] {message.author.name}: '{message.content[:50]}' -> {respond_reason}")
 
         if not should_respond:
+            # Low-effort ack in a sticky convo — no typed reply, but an
+            # occasional emoji reaction keeps us present without spamming.
+            if respond_reason == "sticky-low-content" and random.random() < 0.35:
+                emoji = "💀" if self.persona.id == "rowan" else random.choice(["😂", "💀", "😭"])
+
+                async def _silent_react():
+                    try:
+                        await message.add_reaction(emoji)
+                    except Exception:
+                        pass
+                asyncio.create_task(_silent_react())
             # Daily-cap drop on a DIRECTED message (every "daily-cap" reason is
             # post-directed-gate — mention/reply/name/dm). Queue it so the user
             # still gets answered once the counter resets instead of silence.
@@ -1345,6 +1403,16 @@ class AIPersonaClient(discord.Client):
         finally:
             self._sending_in_channel.discard(ch_id)
 
+    def _reply_to_us(self, message: discord.Message, ch_id: str) -> bool:
+        """True if the message is a reply-reference to one of OUR messages."""
+        ref_id = getattr(getattr(message, "reference", None), "message_id", None)
+        if ref_id is None:
+            return False
+        for m in self.history_cache.get(ch_id, deque()):
+            if m.id == ref_id:
+                return m.author == self.user
+        return False
+
     async def _process_pending_messages(self, ch_id: str):
         """Process messages that were queued while the bot was typing/sending."""
         pending = self._pending_messages.get(ch_id, deque())
@@ -1356,6 +1424,11 @@ class AIPersonaClient(discord.Client):
             # skipped lines reach the reply via the same-author lookahead).
             if any(m.author.id == msg.author.id for m in pending):
                 logger.info(f"Coalesced pending message from {msg.author.name}: '{msg.content[:50]}' (newer one queued)")
+                continue
+            # Pure acknowledgements not aimed at us don't each earn a queued
+            # reply — replying to every "lol" is peak bot behavior.
+            if _is_low_content(msg.content) and not self._reply_to_us(msg, ch_id):
+                logger.info(f"Skipped low-content pending message from {msg.author.name}: '{msg.content[:50]}'")
                 continue
             # NOTE: We do NOT re-check _should_respond here. These messages
             # were already approved when they arrived. Re-checking would
@@ -1559,6 +1632,23 @@ class AIPersonaClient(discord.Client):
                 me = message.channel.guild.me
                 if not can_speak_in(message.channel, me):
                     return False, "sticky-no-perms"
+
+            # Bot-suspicion backoff — while the channel suspects a bot, half
+            # of the non-question ambient replies get swallowed. (Direct
+            # mentions / replies-to-us already returned earlier.)
+            if (self._bot_suspicion_until.get(ch_id, 0) > now
+                    and not is_question(message.content)
+                    and random.random() < 0.5):
+                return False, "suspicion-backoff"
+
+            # Low-effort acknowledgements ("lol", "fr", "ofc man") in a sticky
+            # convo don't each earn a typed reply — caller may drop a reaction
+            # instead. Replies to OUR messages and mentions still land.
+            if (_is_low_content(message.content)
+                    and not mentions_bot
+                    and not self._reply_to_us(message, ch_id)):
+                return False, "sticky-low-content"
+
             remaining = int(sticky_end - now)
             return True, f"sticky-convo ({remaining}s left)"
 
@@ -1759,6 +1849,14 @@ class AIPersonaClient(discord.Client):
             # Skip very short messages (non-greetings)
             if len(message.content.strip()) < 4:
                 return False, "too-short"
+
+            # Bot-suspicion backoff — while the channel suspects a bot, half
+            # of the non-question ambient replies get swallowed. (Direct
+            # mentions / replies-to-us already returned earlier.)
+            if (self._bot_suspicion_until.get(ch_id, 0) > now
+                    and not is_question(message.content)
+                    and random.random() < 0.5):
+                return False, "suspicion-backoff"
 
             # Name detection: if the message contains another user's display
             # name but NOT our name, lower the reply chance significantly.
@@ -2472,6 +2570,10 @@ class AIPersonaClient(discord.Client):
                     None, server_directory.build_server_facts, message.guild)
                 transcript = facts + "\n" + transcript
 
+            # Suspicion flag — while the channel suspects a bot, the prompt
+            # gets the "don't defend yourself" heads-up
+            suspicion = self._bot_suspicion_until.get(ch_id, 0) > time.time()
+
             ai_data = await loop.run_in_executor(
                 None,
                 lambda: ai_reply.generate_reply(
@@ -2481,6 +2583,7 @@ class AIPersonaClient(discord.Client):
                     channel_topic, ch_name, discord_topic, image_urls,
                     my_name=self.user.display_name,
                     mentioned_users=mentioned_other_names,
+                    suspicion=suspicion,
                 )
             )
 
@@ -2542,6 +2645,7 @@ class AIPersonaClient(discord.Client):
                                 channel_topic, ch_name, discord_topic, image_urls,
                                 my_name=self.user.display_name,
                                 mentioned_users=mentioned_other_names,
+                                suspicion=suspicion,
                             )
                         )
                         if retry_data and retry_data.get("reply"):
@@ -2593,6 +2697,7 @@ class AIPersonaClient(discord.Client):
                                 channel_topic, ch_name, discord_topic, image_urls,
                                 my_name=self.user.display_name,
                                 mentioned_users=mentioned_other_names,
+                                suspicion=suspicion,
                             )
                         )
                         _cand = ai_reply.humanize(str(_rr.get("reply") or "").strip())[:2000] if _rr else ""
@@ -2607,6 +2712,12 @@ class AIPersonaClient(discord.Client):
                             reply_text = _grounded or server_directory.NO_CHANNEL_FALLBACK
                     except Exception as e:
                         logger.debug(f"Anti-repeat retry failed: {e}")
+
+                # Degenerate-output guard — theorem soup / ellipsis storms /
+                # oversized rambles never reach the channel.
+                if output_guard.is_degenerate(reply_text):
+                    logger.warning(f"[guard] degenerate reply suppressed: {reply_text[:80]!r}")
+                    return
 
                 # React with emoji — use algorithmic reaction system
                 # First check if AI suggested a reaction, then use our algorithm
@@ -2773,8 +2884,12 @@ class AIPersonaClient(discord.Client):
                         else:
                             logger.debug(f"GIF search failed for '{gif_query}'")
 
-                # Burst reply (follow-up message)
-                if burst_reply and str(burst_reply).strip() not in ("null", "None", "") and self.can_send(ch_id):
+                # Burst reply (follow-up message) — only when the main reply
+                # wasn't itself a question (double-question reads as nagging),
+                # and only 40% of the time even then.
+                if (burst_reply and str(burst_reply).strip() not in ("null", "None", "")
+                        and "?" not in reply_text and random.random() < 0.4
+                        and self.can_send(ch_id)):
                     burst_text = ai_reply.humanize(str(burst_reply).strip())[:200]
                     burst_text = server_directory.ground_channel_mentions(burst_text, message.guild) or None
                     # Don't chain bare "wbu?"-style bursts — if a generic

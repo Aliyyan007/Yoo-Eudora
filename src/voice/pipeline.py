@@ -232,6 +232,9 @@ class VoicePipeline:
         # into the next utterance (<2s old) so a chopped breath isn't lost
         self._user_carry_pcm: dict[int, tuple] = {}
         self._user_watchdog_tasks: dict[int, asyncio.TimerHandle] = {}
+        # Watchdog generation token — bumped on every (re)arm; a fired handle
+        # whose gen is stale returns without finalizing
+        self._user_wd_gen: dict[int, int] = {}
 
         # Per-user DSP state — decoders and resamplers are STATEFUL (frame
         # prediction, filter history) and must never be shared across users
@@ -1108,17 +1111,23 @@ class VoicePipeline:
         # pauses don't cut their utterance in half
         if self._loop and self._loop.is_running():
             delay_ms = _ENDPOINT_SILENCE_MS_SLOW if self._is_feeble(user_id) else _ENDPOINT_SILENCE_MS
+            gen = self._user_wd_gen.get(user_id, 0) + 1
+            self._user_wd_gen[user_id] = gen
             self._user_watchdog_tasks[user_id] = self._loop.call_later(
-                delay_ms / 1000.0, self._watchdog_fire, user_id
+                delay_ms / 1000.0, self._watchdog_fire, user_id, gen
             )
 
-    def _watchdog_fire(self, user_id: int) -> None:
+    def _watchdog_fire(self, user_id: int, gen: int = None) -> None:
         """call_later callback — fires ~500-900ms after the last VOICE packet.
 
         The watchdog is only restarted on is_voice frames, so if it fires,
         that much wall-clock silence has passed — a true speech endpoint.
         """
         try:
+            # Stale handle — a newer arm owns the endpoint; a handle already
+            # queued by the loop can still fire after being superseded.
+            if gen is not None and gen != self._user_wd_gen.get(user_id):
+                return
             if not self._user_in_speech.get(user_id, False):
                 return  # already finalized
 
@@ -1137,9 +1146,11 @@ class VoicePipeline:
                         if time.time() - self._user_utt_start.get(user_id, 0) < _MAX_UTTERANCE_S:
                             self._user_endpoint_extended.add(user_id)
                             logger.info(f"[voice] Partial ends mid-clause ('…{partial[-30:]}') — extending endpoint")
+                            gen = self._user_wd_gen.get(user_id, 0) + 1
+                            self._user_wd_gen[user_id] = gen
                             self._user_watchdog_tasks[user_id] = self._loop.call_later(
                                 _ENDPOINT_SILENCE_MS_SLOW / 1000.0,
-                                self._watchdog_fire, user_id)
+                                self._watchdog_fire, user_id, gen)
                             return
                 except Exception:
                     pass  # fall through to normal endpoint
@@ -1293,6 +1304,18 @@ class VoicePipeline:
         2. If Whisper is available, re-score the full utterance (slower, higher accuracy)
         3. Use the Whisper result if available and different, otherwise use streaming result
         """
+        # Cancel any still-pending watchdog FIRST. The entry stored here is a
+        # call_later TimerHandle — when the watchdog itself triggered this
+        # finalize its handle already fired, so cancel() is a harmless no-op
+        # (it can never cancel this task); but a stale ARMED timer would fire
+        # into the next utterance and cut fresh speech mid-flow.
+        _wd = self._user_watchdog_tasks.pop(user_id, None)
+        if _wd is not None:
+            _wd.cancel()
+        # Bump the generation — any watchdog callback already queued by the
+        # loop is now stale and will no-op when it fires.
+        self._user_wd_gen[user_id] = self._user_wd_gen.get(user_id, 0) + 1
+
         # Mark as no longer in speech
         self._user_in_speech[user_id] = False
         self._user_speaking[user_id] = False
@@ -1307,13 +1330,7 @@ class VoicePipeline:
         if len(self._user_utterance_pcm.get(user_id, b"")) / 96000 >= 0.6:
             self._play_ack()
 
-        # Clear the watchdog task reference — but do NOT cancel it.
-        # The watchdog task IS the task that called _finalize_and_respond.
-        # Cancelling it would cancel ourselves, raising CancelledError
-        # at the next await point (e.g. asr.end_utterance), silently
-        # killing the entire finalize pipeline. This was THE root cause
-        # of the bot not listening or speaking.
-        self._user_watchdog_tasks.pop(user_id, None)
+        # (Watchdog handle already popped + cancelled at entry — see above.)
 
         # Reset the VAD — it may still be mid-utterance (forced endpoint or the
         # deferred-feeble path). A fresh state guarantees the next voice onset
@@ -2120,6 +2137,7 @@ class VoicePipeline:
         task = self._user_watchdog_tasks.pop(user_id, None)
         if task is not None:
             task.cancel()
+        self._user_wd_gen.pop(user_id, None)
 
     async def cleanup(self) -> None:
         """Clean up all resources."""
@@ -2160,6 +2178,7 @@ class VoicePipeline:
         for task in self._user_watchdog_tasks.values():
             task.cancel()
         self._user_watchdog_tasks.clear()
+        self._user_wd_gen.clear()
         if self._dsp_pool is not None:
             self._dsp_pool.shutdown(wait=False)
             self._dsp_pool = None

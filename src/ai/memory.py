@@ -374,9 +374,24 @@ def get_memorable_chats(user_id: str) -> List[dict]:
 
 # ── Channel topics ────────────────────────────────────────────────────────────
 
+# Parallel freshness map — channel_id -> last update timestamp. Lets callers
+# ignore topics summarised hours ago (a stale topic makes proactive messages
+# fixate on a dead conversation). Process-local: after a restart topics read
+# as stale until the next summary, which is the safe direction.
+_channel_topic_ts: Dict[str, float] = {}
+
+
 def get_channel_topic(channel_id: str) -> str:
     """Return the stored topic summary for a channel."""
     return _load_memory().get("channel_topics", {}).get(channel_id, "")
+
+
+def get_channel_topic_fresh(channel_id: str, max_age_s: int = 3600) -> str:
+    """Topic only if recorded within max_age_s — stale topics read as fixation."""
+    ts = _channel_topic_ts.get(channel_id)
+    if not ts or time.time() - ts > max_age_s:
+        return ""
+    return get_channel_topic(channel_id)
 
 
 def update_channel_topic(channel_id: str, topic: str):
@@ -387,6 +402,7 @@ def update_channel_topic(channel_id: str, topic: str):
     if "channel_topics" not in memory:
         memory["channel_topics"] = {}
     memory["channel_topics"][channel_id] = topic[:120]
+    _channel_topic_ts[channel_id] = time.time()
     _save_memory(memory)
     logger.debug(f"Channel topic updated [{channel_id}]: {topic[:60]}")
 

@@ -100,10 +100,6 @@ def humanize(text: str) -> str:
     if r() < 0.35 and len(text) > 1 and text[0].isupper():
         text = text[0].lower() + text[1:]
 
-    # 5. Occasionally append a filler (12% chance)
-    if r() < 0.12 and len(text) < 80:
-        text += random.choice([' lol', ' lmao', ' fr', ' ngl', ' tho', ' rn'])
-
     # 6. Anti-detection: Remove AI tells (em-dashes, semicolons, "moreover", etc.)
     # AI text overuses em-dashes and semicolons â€” humans rarely use them in chat
     text = text.replace('â€”', '-')   # em-dash -> hyphen
@@ -117,8 +113,8 @@ def humanize(text: str) -> str:
     words = [w for w in words if w.lower().strip('.,!?') not in ai_transitions]
     text = ' '.join(words)
 
-    # 7. Imperfection injection: occasional realistic typo (8% chance, not on short msgs)
-    if r() < 0.08 and len(text) > 15:
+    # 7. Imperfection injection: rare realistic typo (2% chance, only on longer msgs)
+    if r() < 0.02 and len(text) > 40:
         words = text.split()
         candidates = [i for i, w in enumerate(words) if len(w) >= 4 and w.isalpha()]
         if candidates:
@@ -134,10 +130,6 @@ def humanize(text: str) -> str:
     if r() < 0.03 and ' ' in text:
         pos = text.find(' ')
         text = text[:pos] + '  ' + text[pos + 1:]
-
-    # 9. Vary punctuation: sometimes add "..." for trailing thought (10% chance)
-    if r() < 0.10 and not text.endswith(('?', '!', '...', 'ðŸ˜‚', 'ðŸ’€', 'ðŸ˜­')):
-        text += '...'
 
     # 10. Occasionally lowercase everything (15% chance for short casual msgs)
     if r() < 0.15 and len(text) < 60:
@@ -336,6 +328,7 @@ def generate_reply(
     image_urls: list = None,
     my_name: str = "",
     mentioned_users: list = None,
+    suspicion: bool = False,
 ) -> Optional[dict]:
     """
     Generate a reply using the LLM. Returns parsed JSON dict or None.
@@ -345,7 +338,7 @@ def generate_reply(
         transcript, username, user_id, trigger_message, mood,
         recent_replies, rules_text, channel_style, my_profile_text,
         channel_lessons, channel_topic, channel_name, discord_topic,
-        my_name, mentioned_users,
+        my_name, mentioned_users, suspicion,
     )
 
     if image_urls:

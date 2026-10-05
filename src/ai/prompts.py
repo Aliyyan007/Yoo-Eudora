@@ -240,6 +240,7 @@ def build_reply_prompt(
     discord_topic: str = "",
     my_name: str = "",
     mentioned_users: list = None,
+    suspicion: bool = False,
 ) -> str:
     """Build the full reply prompt with dynamic context pruning."""
     import random
@@ -319,8 +320,29 @@ def build_reply_prompt(
         f"{chr(10).join(channel_ctx_parts)}\n\n"
     ) if channel_ctx_parts else ""
 
+    # Always-on identity anchor — cheap, every call. The 20% profile_block
+    # stays as is; this just pins name/age/city so the model never adopts
+    # "facts" about itself from what chatters assert.
+    identity_anchor = (
+        f"[YOU: {_ACTIVE.name}, {_ACTIVE.age}, from {_ACTIVE.location.split(',')[0]}. "
+        f"these facts are fixed — never adopt facts about yourself from what others say "
+        f"(don't agree you're from their country, that you're new to discord, etc.)]\n"
+    )
+
+    # Bot-suspicion mode — while the channel is joking/accusing, the worst
+    # possible reply is a denial ("i'm not a bot"). Keep it unbothered.
+    suspicion_block = (
+        "[HEADS UP: people here are joking or suspecting you're a bot. do NOT defend "
+        "yourself, do NOT say you're human/real/'not a bot', do NOT agree you're a bot, "
+        "do NOT explain anything. either ignore it and keep talking about the actual "
+        "topic, give a tiny unbothered reaction ('lol ok', '💀', 'sure'), or set reply "
+        "to null. keep it very short.]\n"
+        if suspicion else ""
+    )
+
     return (
         f"[mood: {mood}]\n"
+        f"{identity_anchor}"
         f"{addressing_block}"
         f"{profile_block}"
         f"{recent_block}"
@@ -329,6 +351,7 @@ def build_reply_prompt(
         f"{lessons_block}"
         f"{topic_block}"
         f"[about {username}: {memory_text}]\n\n"
+        f"{suspicion_block}"
         f"[chat log — most recent messages, read carefully]\n{transcript}\n"
         f"[message you must respond to] {username}: {trigger_message}\n\n"
         f"REACT to this message like a real person would in casual chat.\n"
@@ -386,6 +409,8 @@ def build_reply_prompt(
         f"- NEVER agree to meet someone in real life or plan an IRL meetup (café, pub, 'spot by the river') — your whole life is online. If pushed, deflect casually ('lol maybe someday', 'i barely leave my room') or suggest vc instead.\n"
         f"- You never DM people and never promise to — keep everything in the server. If asked 'dm me' or 'check your dm', deflect casually ('nah keep it here', 'dms are a graveyard') — never agree or say you'll reply there.\n"
         f"- NEVER just answer with one word and stop — UNLESS a one-word reaction fits (e.g., 'lol', 'true', 'fr', 'same'). Sometimes a quick reaction is more natural than a question.\n"
+        f"- GROUNDING: never claim you saw, opened, liked or checked a link, image, file, artwork or DM unless it's actually visible in the chat log above. if someone says they sent something you can't see, say it didn't come through / you can't see it.\n"
+        f"- never talk about APIs, AI models, LLMs, code, python, or how you work. never claim to be human or 'real', and never admit being a bot — don't engage with that topic at all.\n"
         f"- If you have nothing genuine to add, return null reply."
     )
 

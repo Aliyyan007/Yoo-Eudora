@@ -172,6 +172,15 @@ class ProactiveEngager:
         else:
             self._unanswered[guild_id] = 0
 
+        # Two unanswered engages in a row → stop until someone actually speaks.
+        # After one, back off and let the silence stretch 3x longer before
+        # trying again — a person doesn't keep polling an empty room.
+        u = self._unanswered.get(guild_id, 0)
+        if u >= 2:
+            return
+        if u == 1 and silence_duration < _SILENCE_THRESHOLD_S * 3:
+            return
+
         # Don't engage if someone's mic is currently active
         for uid, active in pipeline._user_mic_active.items():
             if active:
@@ -185,10 +194,9 @@ class ProactiveEngager:
 
         target_id, target_name = target_user
 
-        # If she's asked twice already with zero response, she switches to
-        # presence checks ("you still there?") — algorithmic escalation, not
-        # a fixed pattern
-        presence_check = self._unanswered.get(guild_id, 0) >= 2 and random.random() < 0.6
+        # After one unanswered question, sometimes make it a presence check
+        # ("you still there?") — algorithmic escalation, not a fixed pattern
+        presence_check = (u == 1 and random.random() < 0.5)
 
         logger.info(f"[proactive] {silence_duration:.0f}s silence — engaging {target_name} (id={target_id}, presence={presence_check})")
 

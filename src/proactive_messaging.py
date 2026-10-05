@@ -197,11 +197,24 @@ class ProactiveMessenger:
 
             # 2. Random auto-chat (channel has some activity but is slowing down)
             # Send a random message with auto_chat_chance probability
-            # Only if: silence > 5 min, and we haven't auto-chatted in 10+ min
+            # Only if: silence > 5 min, we haven't auto-chatted in 10+ min,
+            # AND real humans actually spoke here in the last 30 min —
+            # chatting into a bot-only/empty room is pure bot behavior.
             elif silence_duration > 300 and (now - self.last_auto_chat) > 600:
                 if random.random() < self.auto_chat_chance:
-                    await self._send_random_chat(channel_id)
-                    self.last_auto_chat = now
+                    try:
+                        from .persona import runtime as _prt
+                        own_ids = set(_prt.own_user_ids())
+                    except Exception:
+                        own_ids = set()
+                    humans_30m = sum(
+                        1 for m in self.client.history_cache.get(ch_id, ())
+                        if not getattr(m.author, "bot", False)
+                        and m.author.id not in own_ids
+                        and (now - m.created_at.timestamp()) < 1800)
+                    if humans_30m >= 2:
+                        await self._send_random_chat(channel_id)
+                        self.last_auto_chat = now
                     return  # One auto-chat per cycle
 
     async def _revive_dead_chat(self, channel_id: int):
@@ -262,7 +275,7 @@ class ProactiveMessenger:
                 ping_prefix = f"<@{pinged_user.id}> "
 
         # Try AI-generated message first, fall back to random
-        topic = mem.get_channel_topic(ch_id)
+        topic = mem.get_channel_topic_fresh(ch_id)
         loop = asyncio.get_running_loop()
         message = await loop.run_in_executor(
             None, lambda: ai_reply.generate_proactive_message(
@@ -350,6 +363,11 @@ class ProactiveMessenger:
                 logger.debug(f"[engage] #{channel.name} gated — skipping post-bump")
                 continue
 
+            # Skip channels with no recent human activity — posting into a
+            # dead room right after bumping is the most bot-like thing there is
+            if self.last_activity.get(ch_id, 0) < time.time() - 1800:
+                continue
+
             # Send 1 message after the bump (a multi-message burst reads as spam)
             num_messages = 1
             for i in range(num_messages):
@@ -358,7 +376,7 @@ class ProactiveMessenger:
                 # First message: AI-generated or random
                 if i == 0:
                     ch_id = str(channel_id)
-                    topic = mem.get_channel_topic(ch_id)
+                    topic = mem.get_channel_topic_fresh(ch_id)
                     loop = asyncio.get_running_loop()
                     msg = await loop.run_in_executor(
                         None, lambda: ai_reply.generate_proactive_message(topic)
@@ -419,7 +437,7 @@ class ProactiveMessenger:
                     continue
 
                 ch_id = str(best_ch.id)
-                topic = mem.get_channel_topic(ch_id)
+                topic = mem.get_channel_topic_fresh(ch_id)
                 loop = asyncio.get_running_loop()
                 msg = await loop.run_in_executor(
                     None, lambda: ai_reply.generate_proactive_message(topic)

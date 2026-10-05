@@ -85,6 +85,10 @@ def resolve_call_name(
         except Exception:
             prof = {}
     real = (prof or {}).get("real_name", "") or ""
+    if real and ("." in real or "_" in real or any(c.isdigit() for c in real)):
+        # Handle-shaped junk stored as a "real name" ("thomas.codez",
+        # "rishab06027") — fall back to the cleaned display name.
+        real = ""
     if real:
         # "Aliyyan Khan" → "Aliyyan"; must look like an actual name
         cand = re.sub(r"[^\w'\- ]", "", str(real)).strip().split()

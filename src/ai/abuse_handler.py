@@ -75,7 +75,6 @@ MODERATE_ABUSE_PATTERNS = [
 
 # Mild abuse / dismissive patterns
 MILD_ABUSE_PATTERNS = [
-    r'\bbruh\b',
     r'\bcringe\b',
     r'\bmid\b',
     r'\blame\b',
@@ -100,6 +99,17 @@ BOT_ACCUSATION_PATTERNS = [
     r'\bur\s+a\s+freak(?:ing)?\s+bot\b',
     r'\bact\s+like\s+a\s+bot\b',
     r'\bsound\s+like\s+a\s+bot\b',
+    # Looser accusations / suspicion — "wait you bot?", "why talk like bot
+    # tho", "stop the botness", "tell which api you use", "the real humans"
+    r'\b(?:you|u|she|he|ur)\s+(?:is\s+|are\s+|r\s+)?(?:a\s+)?bot\b',
+    r'\b(?:she\'?s|he\'?s|you\'?re|ur)\s+(?:a\s+)?bot\b',
+    r'\bbot\s*\?',
+    r'\bbotness\b',
+    r'\bstop\s+the\s+bot\b',
+    r'\b(?:talk|talks|talking|sound|sounds|feel|feels)\s+like\s+(?:a\s+)?bot\b',
+    r'\bare\s+(?:you|u)\s+(?:an?\s+)?(?:ai|bot)\b',
+    r'\b(?:which|what)\s+(?:api|model|llm)\b',
+    r'\breal\s+humans?\b',
 ]
 
 # Compiled patterns
@@ -107,6 +117,17 @@ _SEVERE_REGEXES = [re.compile(p, re.IGNORECASE) for p in SEVERE_ABUSE_PATTERNS]
 _MODERATE_REGEXES = [re.compile(p, re.IGNORECASE) for p in MODERATE_ABUSE_PATTERNS]
 _MILD_REGEXES = [re.compile(p, re.IGNORECASE) for p in MILD_ABUSE_PATTERNS]
 _BOT_ACCUSATION_REGEXES = [re.compile(p, re.IGNORECASE) for p in BOT_ACCUSATION_PATTERNS]
+
+
+def is_bot_accusation(text: str) -> bool:
+    """True if the message suspects/accuses the account of being a bot.
+
+    Used by the client to open a 30-min low-profile window — NOT to fire a
+    canned denial (denying you're a bot is the most bot-like reply there is).
+    """
+    if not text:
+        return False
+    return any(rx.search(text) for rx in _BOT_ACCUSATION_REGEXES)
 
 
 def detect_abuse(text: str) -> Tuple[str, int]:
@@ -148,30 +169,32 @@ def detect_abuse(text: str) -> Tuple[str, int]:
 # Response templates by abuse level
 # These are british dry humor responses — sarcastic and dismissive, not hateful
 
+# Persona-neutral lines — all three rotating personas share this pool, so
+# no Eudora-only british slang (bruv/innit/allow it/peng/bare) in here.
 SEVERE_RESPONSES = [
-    "bruv allow it, that's uncalled for",
+    "whoa, that's uncalled for",
     "alright calm down, no need for that",
     "wow ok then, someone's having a day",
     "yeah yeah whatever, take a breather",
-    "bruv you're gassing for no reason",
+    "you're gassing for no reason",
     "ok and? you done now?",
-    "that's mad rude innit, sort yourself out",
+    "that's mad rude, sort yourself out",
     "wow harsh, didn't realise you cared that much",
     "alright alright, message received, calm down",
-    "bruv i'm not the one who hurt you, go touch grass",
+    "i'm not the one who hurt you, go touch grass",
 ]
 
 MODERATE_RESPONSES = [
     "alright chill",
     "wow ok",
-    "bruv no need for that",
+    "no need for that",
     "whatever you say",
     "ok and?",
     "sure mate",
     "if you say so",
     "cool story",
     "alright then",
-    "bruv calm down",
+    "calm down",
 ]
 
 MILD_RESPONSES = [
@@ -180,20 +203,8 @@ MILD_RESPONSES = [
     "lol ok",
     "if u say so",
     "whatever",
-    "bruv",
     "alright",
     "cool",
-]
-
-BOT_ACCUSATION_RESPONSES = [
-    "bruv i'm not a bot, allow it",
-    "i'm not a bot, just vibing here",
-    "not a bot, just got better things to do than argue with u",
-    "bruv i'm literally just chatting, how's that a bot",
-    "i'm not a bot, u just can't handle the vibes",
-    "not a bot, i just type fast innit",
-    "bruv calling everyone a bot is mad weird",
-    "i'm not a bot, u just don't like what i'm saying",
 ]
 
 
@@ -237,6 +248,12 @@ class AbuseHandler:
         if abuse_level == "none":
             return None
 
+        # Bot accusations and mild dismissiveness get NO canned reply — the
+        # suspicion window + LLM "unbothered" handling covers accusations,
+        # and mild stuff ("cringe", "whatever") isn't worth a fight-back.
+        if abuse_level in ("bot_accusation", "mild"):
+            return None
+
         now = time.time()
 
         # Update abuse count (with decay)
@@ -275,18 +292,15 @@ class AbuseHandler:
         """
         import random
 
-        if abuse_level == "bot_accusation":
-            return random.choice(BOT_ACCUSATION_RESPONSES)
-
         if abuse_level == "severe":
             # Escalate: later responses are more pointed
             if count >= 3:
                 # More pointed response
                 return random.choice([
-                    "bruv you're actually obsessed with me, go touch grass",
+                    "you're actually obsessed with me, go touch grass",
                     "ok we get it, u don't like me, move on",
                     "you're still going? find something better to do",
-                    "bruv this is getting sad, i'm not gonna keep doing this",
+                    "this is getting sad, i'm not gonna keep doing this",
                 ])
             return random.choice(SEVERE_RESPONSES)
 
@@ -294,7 +308,7 @@ class AbuseHandler:
             if count >= 3:
                 return random.choice([
                     "ok we get it, u don't like me",
-                    "bruv find something better to do",
+                    "find something better to do",
                     "you're still going? lol",
                 ])
             return random.choice(MODERATE_RESPONSES)
