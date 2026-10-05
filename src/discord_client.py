@@ -37,6 +37,7 @@ else:
 from .ai.mention_system import get_mention_manager
 from .ai.abuse_handler import get_abuse_handler, is_bot_accusation
 from .ai import output_guard
+from .ai import relationship
 from .ai.multi_message import determine_message_count, split_into_messages, detect_conversation_nature
 from .ai.channel_nature import analyze_channel_nature, get_cached_nature, get_nature_summary
 from .ai.reactions import react_to_message, get_tracker
@@ -693,7 +694,11 @@ class AIPersonaClient(discord.Client):
                 rn = (mem.get_user_profile(str(user_id)) or {}).get("real_name", "")
             except Exception:
                 rn = ""
-            return mt, rn
+            try:
+                rel = relationship.describe_brief(str(user_id), owner=is_owner(user_id))
+            except Exception:
+                rel = ""
+            return mt, rn, rel
         memory_task = loop.run_in_executor(None, _mem_batch)
 
         # Get current mood for tone matching
@@ -712,6 +717,11 @@ class AIPersonaClient(discord.Client):
         from collections import deque as _dq
         vq = self._user_recent_voice.setdefault(user_id, _dq(maxlen=5))
         vq.append((time.time(), transcript[:200]))
+        # Talking in VC counts toward the relationship too
+        try:
+            relationship.record_message(str(user_id))
+        except Exception:
+            pass
 
         # Detect if this is a greeting (hey, hi, yo, what's up, etc.)
         transcript_lower = transcript.lower().strip()
@@ -733,10 +743,12 @@ class AIPersonaClient(discord.Client):
         # Wait for the memory lookup — capped so a slow D1 can never stall
         # a live voice turn. On timeout the reply is just less personalised.
         real_name = ""
+        rel_brief = ""
         try:
-            user_memory, real_name = await asyncio.wait_for(memory_task, timeout=0.9)
+            user_memory, real_name, rel_brief = await asyncio.wait_for(memory_task, timeout=0.9)
         except Exception:
             user_memory = ""
+            rel_brief = ""
 
         # What a friend would call them — learned real name wins, else a
         # cleaned display name. Feeding 'Mr. Alien' verbatim is how the bot
@@ -744,6 +756,10 @@ class AIPersonaClient(discord.Client):
         username = resolve_call_name(
             str(user_id), username,
             profile={"real_name": real_name} if real_name else None)
+
+        # Relationship tier — how familiar the voice persona should act
+        if rel_brief:
+            user_memory = (user_memory + f"\nyou and {username}: {rel_brief}").strip()
 
         # Record what the user just said under their call name — deduped
         # because the streaming path may call this again via the
@@ -1164,6 +1180,10 @@ class AIPersonaClient(discord.Client):
         # get the "don't defend yourself" heads-up instead of a denial.
         if not message.author.bot and is_bot_accusation(message.content):
             self._bot_suspicion_until[ch_id] = time.time() + 1800
+            try:
+                relationship.record_suspicion(str(message.author.id))
+            except Exception:
+                pass
             logger.info(f"[suspicion] bot accusation in #{message.channel} — 30min low profile")
 
         # ── Cross-persona pending capture ─────────────────────────────────
@@ -1225,6 +1245,10 @@ class AIPersonaClient(discord.Client):
 
             engagement_tracker = get_engagement_tracker()
             engagement_tracker.record_message(str(message.author.id), message.content)
+            try:
+                relationship.record_message(str(message.author.id))
+            except Exception:
+                pass
             # If message is high-value, extract potential facts immediately
             if should_store_message(message.content):
                 potential_facts = extract_potential_facts(message.content)
@@ -2453,6 +2477,18 @@ class AIPersonaClient(discord.Client):
             # Add user memory context to transcript
             if user_facts_detail:
                 transcript = f"[USER MEMORY: {user_facts_detail}]\n" + transcript
+
+            # Relationship context — how well the bot knows this user, so the
+            # persona calibrates familiarity (no teasing strangers, no
+            # re-greeting close friends)
+            try:
+                rel_line = relationship.describe(user_id, owner=is_owner(message.author.id))
+                if detect_loneliness(message.content) or sentiment == "sad":
+                    rel_line += " they may be looking for connection — be warm, not jokey."
+                if rel_line:
+                    transcript = f"[your history with {username}: {rel_line}]\n" + transcript
+            except Exception:
+                pass
 
             # Cross-modal context: if this user has also been talking to the
             # bot in a voice call recently, the text reply should know
