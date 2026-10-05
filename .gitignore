@@ -1,0 +1,40 @@
+# Secrets — NEVER commit
+config/.env
+.env
+
+# Runtime data / logs
+/data/
+/logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Large local artifacts
+references.zip
+*.zip
+
+# Dev/test scratch files — not part of the shipped product
+_test_*
+_patch_*
+_vendor_*
+_tmp_*
+
+# Local backups of pre-edit originals
+/.backup_pre_fixes/
+
+# Conversation log — real users' messages, keep local
+/console.md
+
+# Legacy reference implementation (superseded by src/action_engine/)
+Robust Action Performer System)/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

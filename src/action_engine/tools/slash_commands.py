@@ -1,0 +1,120 @@
+"""Slash command tools: use application commands like /bump via discord.py-self.
+
+discord.py-self v2.1.0 supports slash commands via:
+  cmds = await channel.application_commands()
+  cmd = next(c for c in cmds if isinstance(c, discord.SlashCommand) and c.name == "bump")
+  interaction = await cmd(channel)
+"""
+from __future__ import annotations
+
+import discord
+
+from src.action_engine.tools.context import ToolContext
+from src.action_engine.utils.fuzzy import fuzzy_search
+
+
+async def list_slash_commands(ctx: ToolContext, channel_query: str = "here") -> dict:
+    """List all available slash commands in a channel."""
+    from src.action_engine.tools.messaging import _resolve_text_channel
+    ch = await _resolve_text_channel(ctx, channel_query)
+    if ch is None:
+        return {"error": f"No channel matching '{channel_query}'."}
+    try:
+        cmds = await ch.application_commands()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"Failed to fetch slash commands: {e}"}
+    result = []
+    for cmd in cmds:
+        info = {
+            "name": cmd.name,
+            "type": type(cmd).__name__,
+            "description": getattr(cmd, "description", ""),
+            "application_id": str(getattr(cmd, "application_id", "")),
+        }
+        result.append(info)
+    return {"channel": ch.name, "commands": result}
+
+
+async def use_slash_command(
+    ctx: ToolContext,
+    command_name: str,
+    channel_query: str = "here",
+    application_id: str | None = None,
+    bot_name: str | None = None,
+    options: dict | None = None,
+) -> dict:
+    """Use a slash command (e.g. /bump) in a channel.
+
+    If `application_id` is provided, targets a specific bot's command
+    (useful when multiple bots register the same /bump command).
+    `bot_name` resolves a bot by fuzzy display name — a bot's user ID
+    IS its application ID.
+    """
+    # Strip leading '/' if the agent included it (e.g. "/bump" -> "bump").
+    command_name = command_name.lstrip("/").strip()
+
+    # "of Global Bot" — resolve a bot name to its application_id
+    # (a bot's user id equals its application id).
+    if not application_id and bot_name:
+        try:
+            from src.action_engine.tools.members import resolve_member
+            res = await resolve_member(ctx, bot_name)
+            if res.get("id"):
+                application_id = str(res["id"])
+        except Exception:
+            pass
+
+    from src.action_engine.tools.messaging import _resolve_text_channel
+    ch = await _resolve_text_channel(ctx, channel_query)
+    if ch is None:
+        return {"error": f"No channel matching '{channel_query}'."}
+    try:
+        cmds = await ch.application_commands()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"Failed to fetch slash commands: {e}"}
+
+    # Find the command by name (and optionally by application_id).
+    slash_cmds = [c for c in cmds if isinstance(c, discord.SlashCommand)]
+    cmd = None
+    targeted = bool(application_id)
+    if application_id:
+        # Target a specific bot by application_id.
+        cmd = next(
+            (c for c in slash_cmds
+             if c.name.lower() == command_name.lower()
+             and str(getattr(c, "application_id", "")) == str(application_id)),
+            None,
+        )
+        if cmd is None:
+            # A specific bot was asked for — do NOT fall back to a same-name
+            # command owned by a different bot (wrong bot = wrong action).
+            available = {str(getattr(c, "application_id", "")): c.name for c in slash_cmds}
+            return {"error": f"Bot '{bot_name or application_id}' has no "
+                             f"'/{command_name}' command here.",
+                    "available": available}
+    if cmd is None:
+        # Fall back to first match by name.
+        cmd = next((c for c in slash_cmds if c.name.lower() == command_name.lower()), None)
+    if cmd is None:
+        # Fuzzy match.
+        results = fuzzy_search(command_name, slash_cmds, key=lambda c: c.name, limit=1)
+        if results:
+            cmd = results[0].item
+    if cmd is None:
+        available = [c.name for c in slash_cmds]
+        return {"error": f"No slash command '{command_name}'. Available: {available}"}
+
+    try:
+        if options:
+            interaction = await cmd(ch, **options)
+        else:
+            interaction = await cmd(ch)
+        return {
+            "ok": True,
+            "command": cmd.name,
+            "channel": ch.name,
+            "application_id": str(getattr(cmd, "application_id", "")),
+            "interaction_id": getattr(interaction, "id", None),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"Slash command '{command_name}' failed: {e}"}

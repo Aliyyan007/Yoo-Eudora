@@ -1,0 +1,22 @@
+# Secrets — NEVER bake into image
+config/.env
+.env
+
+# Runtime data / logs
+data/
+logs/
+*.log
+
+# Large local artifacts
+references.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Git / editor
+.git/
+.idea/
+.vscode/
