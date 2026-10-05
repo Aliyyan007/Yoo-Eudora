@@ -1676,6 +1676,17 @@ class VoicePipeline:
         if await _drop_if_stale():
             return
 
+        # Internals-leak / degenerate guard — never speak a reply that names
+        # an AI provider or reads like model soup; fall back to a filler.
+        try:
+            from ..ai import output_guard as _og
+            if _og.leaks_internals(response) or _og.is_degenerate(response):
+                logger.warning(f"[voice] suppressed leaking/degenerate reply: {response[:60]!r}")
+                await self._speak(_r.choice(["wdym?", "huh?", "sorry what?", "what?"]))
+                return
+        except Exception:
+            pass  # guard never blocks speaking on its own failure
+
         logger.info(f"[voice] LLM response: {response[:100]}")
         await self._speak(response, tts=tts, tts_cfg=tts_cfg, tts_open=tts_open)
 

@@ -37,3 +37,33 @@ def is_degenerate(text: str, max_len: int = 400) -> bool:
         if letters < 0.4 * len(non_space):
             return True
     return False
+
+
+# Naming an AI provider/model or discussing your own internals is the
+# single most damning bot tell — "probably OpenAI GPT-4", "i use the groq
+# api", "my system prompt". The prompt rule tells the model not to; this
+# stops it when it does anyway. A provider name is a leak even inside a
+# question ("probably GPT-4?" still outs you) — only bare "what api" /
+# "which model" style confusion echoes pass.
+_PROVIDER_LEAK = re.compile(
+    r"\b(?:openai|gpt[-\s]?[0-9o]+|gpt\b|groq|deepseek|anthropic|claude|"
+    r"gemini|llama|mistral|qwen|copilot|llm\b|my\s+(?:system\s+)?prompt|"
+    r"system\s+prompt)\b",
+    re.IGNORECASE)
+_API_ADMISSION = re.compile(
+    r"\b(?:api\s*keys?|the\s+\w+\s+api|(?:use[sd]?|using)\s+an?\s+api)\b",
+    re.IGNORECASE)
+
+
+def leaks_internals(text: str) -> bool:
+    """True when a generated reply names an AI provider/model or admits to
+    using an API. Confused echoes of a probe ('what api?', 'wdym') pass —
+    the bare word in a question isn't an admission."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _PROVIDER_LEAK.search(t):
+        return True
+    if _API_ADMISSION.search(t) and not t.endswith("?"):
+        return True
+    return False

@@ -12,6 +12,7 @@ from loguru import logger
 import discord
 
 from .ai import reply as ai_reply
+from .ai import output_guard
 from .ai import d1_memory as mem  # D1-backed memory (falls back to JSON if D1 unavailable)
 from .channel_scanner import can_speak_in, is_skip_channel, find_most_active_channel
 from .ai.re_engagement import get_ping_controller, get_re_engagement_tracker, select_online_user
@@ -381,7 +382,11 @@ class ProactiveMessenger:
                     msg = await loop.run_in_executor(
                         None, lambda: ai_reply.generate_proactive_message(topic)
                     )
-                    if not msg or len(msg) < 3:
+                    # AI text can leak internals or go degenerate — fall back
+                    # to a pre-written line instead of sending it
+                    if not msg or len(msg) < 3 or \
+                            output_guard.is_degenerate(msg) or \
+                            output_guard.leaks_internals(msg):
                         msg = random.choice(POST_BUMP_MESSAGES)
                 else:
                     msg = random.choice(POST_BUMP_MESSAGES)

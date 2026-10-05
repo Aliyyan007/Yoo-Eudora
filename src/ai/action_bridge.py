@@ -177,6 +177,20 @@ _CHAT_LIKE = re.compile(
 _ASK_FORM = re.compile(
     r"\b(?:can|could|would|will) (?:you|u)\b|\b(?:you|u) to\b|\b(?:pls|plz|please)\b")
 
+# Bot-internals probes — "tell which api you use", "who made you", "what
+# model are you". These read as imperatives to the heuristic router ("tell",
+# "name", "list") but are really people poking at the account's nature —
+# routing them to the agent wastes a call and produces weird replies. The
+# normal reply engine + suspicion window owns these.
+_PROBE_LIKE = re.compile(
+    r"\b(?:tell|say|name|show|reveal|state|list|give|share|explain)\b[^.?!]*"
+    r"\b(?:api|model|llm|key|token|prompt|framework|library|stack|developer|"
+    r"dev|creator|maker|engine)\b"
+    r"|\b(?:which|what|whats|wat|wut|who|whos|whod)\b[^.?!]*"
+    r"\b(?:api|model|llm|key|developer|dev|creator|maker|made|built|coded|"
+    r"engine|framework|stack|language|written|programmed)\b",
+    re.IGNORECASE)
+
 
 def _looks_like_chat(text: str) -> bool:
     t = (text or "").strip().lower()
@@ -364,6 +378,18 @@ class ActionWorker:
         queue/run call so the agent gets the router's filtered tool set."""
         if not _ENABLED or not self._ensure_ready():
             return None
+        if _PROBE_LIKE.search(text or ""):
+            return None
+        # Bot accusations ("stop the bot mate", "who do u sound like a bot")
+        # are conversational pokes, not action requests — routing them to the
+        # agent wastes the call and produces off replies. The suspicion
+        # window + reply engine owns these.
+        try:
+            from .abuse_handler import is_bot_accusation
+            if is_bot_accusation(text or ""):
+                return None
+        except Exception:
+            pass
         try:
             route = await self._classify(text)
         except Exception as e:

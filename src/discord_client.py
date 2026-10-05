@@ -2755,6 +2755,13 @@ class AIPersonaClient(discord.Client):
                     logger.warning(f"[guard] degenerate reply suppressed: {reply_text[:80]!r}")
                     return
 
+                # Internals-leak guard — the prompt says never discuss APIs/
+                # models, but when it slips through ("probably OpenAI GPT-4")
+                # the send dies here instead of outing the account.
+                if output_guard.leaks_internals(reply_text):
+                    logger.warning(f"[guard] internals-leak reply suppressed: {reply_text[:80]!r}")
+                    return
+
                 # React with emoji — use algorithmic reaction system
                 # First check if AI suggested a reaction, then use our algorithm
                 # to decide whether to actually send it (not on every message)

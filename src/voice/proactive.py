@@ -312,9 +312,14 @@ class ProactiveEngager:
                 response = clean_for_speech(response)
 
                 if response and len(response) > 5:
-                    logger.info(f"[proactive] LLM question for {target_name}: {response[:80]}")
-                    await pipeline._speak(response)
-                    return
+                    from ..ai import output_guard
+                    if output_guard.leaks_internals(response) or \
+                            output_guard.is_degenerate(response):
+                        logger.debug(f"[proactive] suppressed leaking/degenerate question")
+                    else:
+                        logger.info(f"[proactive] LLM question for {target_name}: {response[:80]}")
+                        await pipeline._speak(response)
+                        return
         except Exception as e:
             logger.debug(f"[proactive] LLM question failed: {e}")
 

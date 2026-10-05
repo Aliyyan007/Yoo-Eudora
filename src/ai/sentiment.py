@@ -27,7 +27,9 @@ SENTIMENT_PATTERNS = {
     "excited": [
         (r'\b(omg|omfg|yesss|let\'?s gooo?|woo+h?+|woot|hype+d?|pog|poggers|insane|crazy|amazing|incredible|wild)\b', 3),
         (r'!{2,}', 2),
-        (r'[A-Z]{4,}', 2),  # ALL CAPS words
+        # NOTE: ALL-CAPS is checked case-sensitively on the ORIGINAL text in
+        # detect_sentiment — a case-insensitive match against lowercased text
+        # scores every ≥4-letter word as "excited"
         (r'(🔥|🚀|⚡|💥|🎉|🎊|🤯|😱|😍|🥳)', 3),
     ],
     "happy": [
@@ -87,6 +89,11 @@ def detect_sentiment(text: str) -> Tuple[str, int]:
                 total += weight * min(len(matches), 3)  # cap repeats
         if total > 0:
             scores[category] = total
+
+    # ALL-CAPS words ("WHAT", "NO WAY") — must match the ORIGINAL text, case
+    # sensitive; the loop above lowercases and would flag every long word.
+    if re.findall(r'\b[A-Z]{4,}\b', text):
+        scores["excited"] = scores.get("excited", 0) + 2
 
     if not scores:
         return "neutral", 0
@@ -162,6 +169,11 @@ LONELINESS_PATTERNS = [
     r'\b(bored\s+af|so\s+bored|bored\s+out\s+of\s+my\s+mind)\b',
     r'\b(lets?\s+talk|lets?\s+chat|who\s+wants?\s+to\s+chat)\b',
     r'\b(wake\s+up|revive|liven\s+up)\b',
+    # Vulnerability disguised as humor — "i just need some friends ofc i
+    # sound like a lonely ass man" is an emotional opening, not noise
+    r'\b(need|want|looking\s+for|trying\s+to\s+(?:find|make)|making|make)\s+(?:some\s+|new\s+|a\s+)?(?:friends?|homies|people\s+to\s+(?:talk|vibe|hang)|someone\s+to\s+talk)\b',
+    r'\b(lonely|alone|no\s+friends|friendless|sad)\s*(?:ass|af|rn|lately|tbh|fr)\b',
+    r'\b(i\s+have\s+no\s+friends|got\s+no\s+friends|no\s+one\s+to\s+talk|nobody\s+to\s+talk)\b',
 ]
 
 
