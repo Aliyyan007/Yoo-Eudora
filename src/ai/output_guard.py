@@ -48,10 +48,13 @@ def is_degenerate(text: str, max_len: int = 400) -> bool:
 _PROVIDER_LEAK = re.compile(
     r"\b(?:openai|gpt[-\s]?[0-9o]+|gpt\b|groq|deepseek|anthropic|claude|"
     r"gemini|llama|mistral|qwen|copilot|llm\b|my\s+(?:system\s+)?prompt|"
-    r"system\s+prompt)\b",
+    r"system\s+prompt|digitalocean|vercel|netlify|heroku|railway|gcp|azure|"
+    r"aws\b|vps\b|droplet|ec2\b|kubernetes|docker|container|"
+    r"my\s+deployment|my\s+hosting|hosting\s+platform)\b",
     re.IGNORECASE)
 _API_ADMISSION = re.compile(
-    r"\b(?:api\s*keys?|the\s+\w+\s+api|(?:use[sd]?|using)\s+an?\s+api)\b",
+    r"\b(?:api\s*keys?|the\s+\w+\s+api|(?:use[sd]?|using)\s+an?\s+api|"
+    r"on\s+render\b|deployed\s+on|hosted?\s+on\s+\w+)\b",
     re.IGNORECASE)
 
 

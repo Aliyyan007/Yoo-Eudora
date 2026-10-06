@@ -2490,6 +2490,19 @@ class AIPersonaClient(discord.Client):
             except Exception:
                 pass
 
+            # Activity anchor — if we already answered "wyd" recently, keep the
+            # same story. A second "wyd" should get a callback ("literally just
+            # said — the rig"), not a freshly invented activity.
+            try:
+                _wyd = getattr(self, "_wyd_answer", None)
+                if _wyd and time.time() - _wyd[1] < 2700:
+                    transcript = (f"[you already answered 'wyd' recently with: "
+                                  f"\"{_wyd[0]}\" — if they're re-asking, refer to "
+                                  f"it ('just said — {_wyd[0]}, u good?'), don't "
+                                  f"invent a new activity]\n") + transcript
+            except Exception:
+                pass
+
             # Cross-modal context: if this user has also been talking to the
             # bot in a voice call recently, the text reply should know
             voice_lines = self._user_recent_voice.get(message.author.id)
@@ -2885,6 +2898,18 @@ class AIPersonaClient(discord.Client):
                     self.reply_history[ch_id] = deque(maxlen=8)
                 self.reply_history[ch_id].append(reply_text)
                 logger.info(f"Sent reply ({len(bursts)} burst(s)): {reply_text[:80]}")
+
+                # Activity anchor: if they just asked "wyd"-style, remember
+                # what we said we're doing so a repeat question gets the
+                # same story instead of a newly invented activity.
+                try:
+                    if re.search(
+                        r"\b(wyd|what\s+(?:are|r)\s+(?:you|u)\s+(?:doing|up\s+to)|"
+                        r"whatcha\s+doing|what\s+u\s+doing|wassup|what'?s\s+up)\b",
+                        trigger_text or "", re.IGNORECASE):
+                        self._wyd_answer = (reply_text.strip()[:80], time.time())
+                except Exception:
+                    pass
 
                 # ── Sticker/GIF sending (low frequency, algorithmic) ────────
                 # Try to send a sticker after the reply (very low chance)

@@ -188,7 +188,8 @@ _PROBE_LIKE = re.compile(
     r"dev|creator|maker|engine)\b"
     r"|\b(?:which|what|whats|wat|wut|who|whos|whod)\b[^.?!]*"
     r"\b(?:api|model|llm|key|developer|dev|creator|maker|made|built|coded|"
-    r"engine|framework|stack|language|written|programmed)\b",
+    r"engine|framework|stack|language|written|programmed|hosting|"
+    r"host\b|platform|provider|deploy)\b",
     re.IGNORECASE)
 
 
