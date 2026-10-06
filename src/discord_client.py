@@ -132,7 +132,10 @@ def _is_low_content(text: str) -> bool:
 
 # Wind-down: how many messages the OTHER person has sent in the current
 # conversation burst before dry closers trigger the wrap-up path.
-_WRAP_STREAK_MIN = 20
+# Base 40 — the threshold stretches toward 80 while they're clearly still
+# invested (asking questions back, writing real lines, not going dry).
+_WRAP_STREAK_MIN = 40
+_WRAP_STREAK_MAX = 80
 # How long we stay quiet on their ambient lines after wrapping a convo.
 _WRAP_QUIET_S = 900
 
@@ -273,9 +276,11 @@ class AIPersonaClient(discord.Client):
         CONVERSATION_TRACKER_EXPIRY_S = 600  # 10 minutes (was 30 min — too long)
 
         # Wind-down state: per-channel per-user session streak (their msg
-        # count in the current burst, resets after 45min silence) and the
+        # count in the current burst, resets after 45min silence), a small
+        # window of their recent lines for the dynamic threshold, and the
         # quiet window set after we wrap up a long conversation.
         self._convo_streak: dict = {}   # ch_id -> {user_id -> (count, ts)}
+        self._convo_recent: dict = {}   # ch_id -> {user_id -> deque(12)}
         self._wrap_quiet: dict = {}     # ch_id -> {user_id -> until_ts}
 
         # Rules cache: guild_id -> rules_text
@@ -376,6 +381,34 @@ class AIPersonaClient(discord.Client):
             logger.debug(f"Channel daily cap ({DAILY_CAP_PER_CH}) reached for {ch_id}")
             return False
         return True
+
+    def _wrap_threshold(self, ch_id: str, user_id: str) -> int:
+        """Dynamic wind-down cutoff: base _WRAP_STREAK_MIN of their messages,
+        stretching toward _WRAP_STREAK_MAX while they're clearly still
+        invested — asking questions back, writing real sentences, keeping
+        the convo alive. A dry chat wraps near the base; an engaged one
+        earns the stretch."""
+        n = _WRAP_STREAK_MIN
+        try:
+            recent = list(self._convo_recent.get(ch_id, {}).get(user_id, ()))
+        except Exception:
+            recent = []
+        if not recent:
+            return n
+        q_ratio = sum(1 for t in recent if "?" in t) / len(recent)
+        avg_len = sum(len(t) for t in recent) / len(recent)
+        dry_ratio = sum(
+            1 for t in recent if _is_low_content(t) or _is_closing(t)
+        ) / len(recent)
+        if q_ratio >= 0.2:          # still curious — asking things back
+            n += 15
+        if avg_len >= 60:           # writing real lines, not one-worders
+            n += 15
+        elif avg_len >= 30:
+            n += 8
+        if dry_ratio < 0.3:         # mostly substance, not acks/closers
+            n += 10
+        return min(n, _WRAP_STREAK_MAX)
 
     def record_send(self, ch_id: str):
         """Increment daily counters after a message is sent."""
@@ -1303,6 +1336,11 @@ class AIPersonaClient(discord.Client):
                 _st[_uid] = (
                     _prev[0] + 1 if _prev and (time.time() - _prev[1]) < 2700 else 1,
                     time.time())
+                # Rolling window of their last lines — the wrap threshold
+                # stretches while they stay invested.
+                _rc = self._convo_recent.setdefault(ch_id, {})
+                _rc.setdefault(_uid, deque(maxlen=12)).append(
+                    (message.content or "")[:120])
             except Exception:
                 pass
             # If message is high-value, extract potential facts immediately
@@ -1749,7 +1787,7 @@ class AIPersonaClient(discord.Client):
             # the bot fires another follow-up question at an obvious close.
             if (_is_closing(txt_low)
                     and self._convo_streak.get(ch_id, {}).get(_uid, (0, 0))[0]
-                    >= _WRAP_STREAK_MIN):
+                    >= self._wrap_threshold(ch_id, _uid)):
                 return True, "wrap-up"
 
             # Low-effort acknowledgements ("lol", "fr", "ofc man") in a sticky
@@ -2596,7 +2634,8 @@ class AIPersonaClient(discord.Client):
             _is_wrap = False
             try:
                 _streak = self._convo_streak.get(ch_id, {}).get(user_id, (0, 0))[0]
-                if _is_closing(trigger_text or message.content) and _streak >= _WRAP_STREAK_MIN:
+                _thresh = self._wrap_threshold(ch_id, user_id)
+                if _is_closing(trigger_text or message.content) and _streak >= _thresh:
                     _is_wrap = True
                     transcript = (
                         f"[WRAP UP: this convo's been running a while "
