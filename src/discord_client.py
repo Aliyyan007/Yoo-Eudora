@@ -1628,11 +1628,24 @@ class AIPersonaClient(discord.Client):
         # with this user, so their ambient lines stay unanswered for ~15min.
         # Direct pings, replies to our messages, and real questions still
         # land — we're winding down, not ghosting.
+        # If they keep sending REAL messages (not more dry closers), they
+        # weren't actually done — 2+ substantive lines break the quiet early.
         _uid = str(message.author.id)
         _wq = self._wrap_quiet.get(ch_id, {}).get(_uid, 0)
-        if (_wq > now and not mentions_bot and message.reference is None
-                and not is_question(txt_low)):
-            return False, f"wrap-quiet ({int(_wq - now)}s left)"
+        if _wq > now:
+            if not mentions_bot and message.reference is None \
+                    and not is_question(txt_low):
+                if _is_closing(txt_low) or _is_low_content(txt_low):
+                    return False, f"wrap-quiet ({int(_wq - now)}s left)"
+                _wq_hits = self._wrap_quiet.setdefault(f"{ch_id}#hits", {})
+                _wq_hits[_uid] = _wq_hits.get(_uid, 0) + 1
+                if _wq_hits[_uid] < 2:
+                    return False, f"wrap-quiet ({int(_wq - now)}s left, re-engage {_wq_hits[_uid]}/2)"
+                # Sustained re-engagement — they're still chatting, so the
+                # wrap was premature: clear the window and talk normally.
+                self._wrap_quiet[ch_id].pop(_uid, None)
+                _wq_hits.pop(_uid, None)
+                logger.debug(f"[wrap] {message.author.name} kept talking — quiet window broken early")
 
         # ── 3. Conversation stickiness ─────────────────────────────────────
         # If we recently replied in this channel, respond to messages for
@@ -2808,6 +2821,17 @@ class AIPersonaClient(discord.Client):
                 reply_text = ai_reply.humanize(str(reply_text).strip())[:2000]
                 _grounded = server_directory.ground_channel_mentions(reply_text, message.guild)
                 reply_text = _grounded or server_directory.NO_CHANNEL_FALLBACK
+
+                # Wrap replies can't end with a question — 'okie, what's
+                # next?' after a dry closer defeats the whole wrap. If the
+                # model slipped one in anyway, drop every sentence ending in
+                # '?' and keep whatever's left; an all-question reply becomes
+                # a plain ack.
+                if _is_wrap and "?" in reply_text:
+                    _kept = re.sub(r"[^.!?]*\?+", "", reply_text).strip(" ,.!")
+                    reply_text = _kept if len(_kept) >= 3 else random.choice(
+                        ["yea fr", "ayy", "for sure", "sounds good",
+                         "nice one", "fair enough"])
 
                 # Dedup check
                 last = self.last_sent.get(ch_id, "")
