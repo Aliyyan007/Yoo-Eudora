@@ -130,6 +130,42 @@ def _is_low_content(text: str) -> bool:
     return 1 <= len(words) <= 3 and all(w in _ACK_WORDS for w in words)
 
 
+# Wind-down: how many messages the OTHER person has sent in the current
+# conversation burst before dry closers trigger the wrap-up path.
+_WRAP_STREAK_MIN = 20
+# How long we stay quiet on their ambient lines after wrapping a convo.
+_WRAP_QUIET_S = 900
+
+_CLOSING_PHRASES = (
+    "hmm okay fine", "hmm ok fine", "hmm ok", "okay fine", "ok fine",
+    "fine", "hmm", "ok", "okay", "alright", "aight", "ight", "ig",
+    "i see", "gotcha", "sure", "fair enough", "makes sense", "cool",
+    "nice", "interesting", "i'm glad", "im glad", "glad", "glad too",
+    "sounds good", "sounds nice", "thanks", "thank you", "ty", "tysm",
+    "anyways", "anyway", "for sure", "that's fair", "k", "kk", "yep",
+    "yeah ok", "yea ok", "yeah sure", "yea sure", "no worries", "true",
+    "really.", "mhm", "mm", "understood",
+)
+
+
+def _is_closing(text: str) -> bool:
+    """True for short dry/closing lines — 'hmm okay fine', 'i'm glad too.
+    really.', 'fair enough'. The other person is winding the convo down.
+    Questions and longer messages never count as closers."""
+    t = (text or "").strip().lower()
+    if not t or "?" in t or len(t) > 45:
+        return False
+    t = t.strip(".!…~ \t")
+    if t in _CLOSING_PHRASES:
+        return True
+    # phrase + small tail ("i'm glad too. really.", "ok fine lol")
+    words = t.split()
+    return len(words) <= 6 and any(
+        t == p or t.startswith(p + " ") or t.endswith(" " + p) or f" {p} " in t
+        for p in _CLOSING_PHRASES if " " in p or len(p) > 2
+    )
+
+
 def dynamic_reply_chance() -> float:
     """
     Return a reply probability tuned to the time of day.
@@ -235,6 +271,12 @@ class AIPersonaClient(discord.Client):
         # Used to ensure the bot replies to users it pinged (even after sticky expires).
         self.conversation_tracker: Dict[str, Dict[str, float]] = {}
         CONVERSATION_TRACKER_EXPIRY_S = 600  # 10 minutes (was 30 min — too long)
+
+        # Wind-down state: per-channel per-user session streak (their msg
+        # count in the current burst, resets after 45min silence) and the
+        # quiet window set after we wrap up a long conversation.
+        self._convo_streak: dict = {}   # ch_id -> {user_id -> (count, ts)}
+        self._wrap_quiet: dict = {}     # ch_id -> {user_id -> until_ts}
 
         # Rules cache: guild_id -> rules_text
         self.rules_cache: dict = {}
@@ -1249,6 +1291,20 @@ class AIPersonaClient(discord.Client):
                 relationship.record_message(str(message.author.id))
             except Exception:
                 pass
+
+            # Session streak — how long this conversation with them has been
+            # running (their message count in the current burst). Feeds the
+            # wind-down path: long convo + dry closer -> wrap up instead of
+            # firing another follow-up question.
+            try:
+                _st = self._convo_streak.setdefault(ch_id, {})
+                _uid = str(message.author.id)
+                _prev = _st.get(_uid)
+                _st[_uid] = (
+                    _prev[0] + 1 if _prev and (time.time() - _prev[1]) < 2700 else 1,
+                    time.time())
+            except Exception:
+                pass
             # If message is high-value, extract potential facts immediately
             if should_store_message(message.content):
                 potential_facts = extract_potential_facts(message.content)
@@ -1568,6 +1624,16 @@ class AIPersonaClient(discord.Client):
                 # The reply is to someone else, not us
                 return False, "addressed-to-other-user (reply)"
 
+        # ── 2b. Wrap-quiet window — we just closed out a long conversation
+        # with this user, so their ambient lines stay unanswered for ~15min.
+        # Direct pings, replies to our messages, and real questions still
+        # land — we're winding down, not ghosting.
+        _uid = str(message.author.id)
+        _wq = self._wrap_quiet.get(ch_id, {}).get(_uid, 0)
+        if (_wq > now and not mentions_bot and message.reference is None
+                and not is_question(txt_low)):
+            return False, f"wrap-quiet ({int(_wq - now)}s left)"
+
         # ── 3. Conversation stickiness ─────────────────────────────────────
         # If we recently replied in this channel, respond to messages for
         # 5 minutes — BUT only if the message isn't addressed to someone else
@@ -1664,6 +1730,14 @@ class AIPersonaClient(discord.Client):
                     and not is_question(message.content)
                     and random.random() < 0.5):
                 return False, "suspicion-backoff"
+
+            # Wind-down: long convo (>= _WRAP_STREAK_MIN of their messages)
+            # + a dry closer like 'hmm okay fine' -> wrap up. Without this
+            # the bot fires another follow-up question at an obvious close.
+            if (_is_closing(txt_low)
+                    and self._convo_streak.get(ch_id, {}).get(_uid, (0, 0))[0]
+                    >= _WRAP_STREAK_MIN):
+                return True, "wrap-up"
 
             # Low-effort acknowledgements ("lol", "fr", "ofc man") in a sticky
             # convo don't each earn a typed reply — caller may drop a reaction
@@ -2503,6 +2577,23 @@ class AIPersonaClient(discord.Client):
             except Exception:
                 pass
 
+            # Wind-down: long conversation + a dry closer ('hmm okay fine')
+            # → the reply is a closer, not another question. Then their
+            # ambient lines go quiet for a while (set after send below).
+            _is_wrap = False
+            try:
+                _streak = self._convo_streak.get(ch_id, {}).get(user_id, (0, 0))[0]
+                if _is_closing(trigger_text or message.content) and _streak >= _WRAP_STREAK_MIN:
+                    _is_wrap = True
+                    transcript = (
+                        f"[WRAP UP: this convo's been running a while "
+                        f"({_streak} of their messages) and they just went dry "
+                        f"— close out with a short casual ack ('yea fr', "
+                        f"'anyways good chat', 'ayy'), NO question, nothing "
+                        f"that re-engages]\n") + transcript
+            except Exception:
+                pass
+
             # Cross-modal context: if this user has also been talking to the
             # bot in a voice call recently, the text reply should know
             voice_lines = self._user_recent_voice.get(message.author.id)
@@ -2910,6 +3001,19 @@ class AIPersonaClient(discord.Client):
                         self._wyd_answer = (reply_text.strip()[:80], time.time())
                 except Exception:
                     pass
+
+                # Wind-down: we just sent the closer on a long convo — their
+                # ambient lines go quiet for ~15min so we don't immediately
+                # re-open the chat we just wrapped.
+                if _is_wrap:
+                    try:
+                        self._wrap_quiet.setdefault(ch_id, {})[user_id] = \
+                            time.time() + _WRAP_QUIET_S
+                        # The streak resets — we've closed this conversation
+                        self._convo_streak.get(ch_id, {}).pop(user_id, None)
+                        logger.debug(f"[wrap] closed long convo with {username} — quiet for {_WRAP_QUIET_S}s")
+                    except Exception:
+                        pass
 
                 # ── Sticker/GIF sending (low frequency, algorithmic) ────────
                 # Try to send a sticker after the reply (very low chance)

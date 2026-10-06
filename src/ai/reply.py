@@ -352,14 +352,20 @@ def generate_reply(
             want_json=True,
         )
     else:
+        # Comprehension bump: long/layered messages ("the newbie is standing
+        # there wondering where to go") misread as literal questions on
+        # reasoning_effort=low — medium effort costs a few extra tokens and
+        # catches the abstract reading. Short triggers stay on low.
+        _deep = len(trigger_message or "") >= 120
         # Try smart model first, fall back to fast model if it fails
         raw = llm.call_smart(
             task="reply",
             system=prompts.REPLY_SYSTEM,
             user=prompt,
             temperature=0.92,
-            max_tokens=1100,
+            max_tokens=1100 if not _deep else 1600,
             want_json=True,
+            reasoning_effort="medium" if _deep else "low",
         )
         if not raw or not raw.strip():
             logger.debug("Smart model returned empty, falling back to fast model")
