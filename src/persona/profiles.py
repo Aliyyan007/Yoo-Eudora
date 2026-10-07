@@ -38,6 +38,7 @@ class PersonaProfile:
     voice_fillers: str = ""    # spoken filler words that fit THIS voice
     proactive_examples: str = ""  # persona-flavored proactive message examples
     statuses: List[str] = field(default_factory=list)  # custom-status pool
+    relationship_status: str = "single"  # ground truth for 'u single?'-type Qs
 
 
 # ═══════════════════════════════════════════════════════════════════════════

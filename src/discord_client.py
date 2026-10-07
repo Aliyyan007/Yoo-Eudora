@@ -2622,9 +2622,11 @@ class AIPersonaClient(discord.Client):
                 _wyd = getattr(self, "_wyd_answer", None)
                 if _wyd and time.time() - _wyd[1] < 2700:
                     transcript = (f"[you already answered 'wyd' recently with: "
-                                  f"\"{_wyd[0]}\" — if they're re-asking, refer to "
-                                  f"it ('just said — {_wyd[0]}, u good?'), don't "
-                                  f"invent a new activity]\n") + transcript
+                                  f"\"{_wyd[0]}\" — SAME activity if they're "
+                                  f"re-asking, but phrase it differently "
+                                  f"('still on the wallpapers', 'same as before "
+                                  f"lol') — never repeat the earlier line "
+                                  f"word-for-word]\n") + transcript
             except Exception:
                 pass
 
@@ -2876,6 +2878,7 @@ class AIPersonaClient(discord.Client):
                 _thresh = 0.62 if len(reply_text.split()) <= 6 else 0.78
                 if _recent_own and any(
                         ai_reply._similarity_ratio(reply_text, prev) >= _thresh
+                        or ai_reply._shares_phrase(reply_text, prev)
                         for prev in _recent_own):
                     logger.debug(f"Near-repeat reply '{reply_text[:40]}' — regenerating")
                     try:

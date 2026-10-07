@@ -192,6 +192,17 @@ _PROBE_LIKE = re.compile(
     r"host\b|platform|provider|deploy)\b",
     re.IGNORECASE)
 
+# Meta-questions about the bot's own replies — "why did u say that?",
+# "whyd you send that", "what did u mean", "wdym". They're always chat —
+# asking ABOUT a message, never asking to DO anything. Owner texts skip
+# the looks-like-chat gate, so these need their own early-out.
+_META_QUESTION = re.compile(
+    r"\bwhy\s+(?:did|d)\s+(?:u|you|ya)\s+(?:say|send|type|post|write|"
+    r"text|mention|ask|do)\b"
+    r"|\bwhat\s+(?:did|d|do)\s+(?:u|you|ya)\s+(?:mean|say|send)\b"
+    r"|\bwdym\b|\bwhy\s+(?:did|d)\s+(?:u|you)\s+reply\b",
+    re.IGNORECASE)
+
 
 def _looks_like_chat(text: str) -> bool:
     t = (text or "").strip().lower()
@@ -380,6 +391,10 @@ class ActionWorker:
         if not _ENABLED or not self._ensure_ready():
             return None
         if _PROBE_LIKE.search(text or ""):
+            return None
+        # Meta-questions about the bot's own reply ("why did u say that?")
+        # are always conversational — never an action request.
+        if _META_QUESTION.search(text or ""):
             return None
         # Bot accusations ("stop the bot mate", "who do u sound like a bot")
         # are conversational pokes, not action requests — routing them to the

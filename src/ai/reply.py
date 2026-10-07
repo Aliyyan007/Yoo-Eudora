@@ -43,6 +43,21 @@ def _similarity_ratio(a: str, b: str) -> float:
     return len(wa & wb) / len(wa | wb)
 
 
+def _shares_phrase(a: str, b: str, min_run: int = 4) -> bool:
+    """True when any contiguous run of >= min_run words from `a` appears
+    verbatim inside `b` (stopwords stripped). Catches the same clause being
+    recycled inside differently-shaped replies — 'just tweaking my
+    wallpaper collection rn' sent three times with three different tails
+    sails past whole-string similarity but lands here."""
+    wa, wb = _extract_words(a), _extract_words(b)
+    if len(wa) < min_run or len(wb) < min_run:
+        return False
+    b_runs = {" ".join(wb[i:i + min_run])
+              for i in range(len(wb) - min_run + 1)}
+    return any(" ".join(wa[i:i + min_run]) in b_runs
+               for i in range(len(wa) - min_run + 1))
+
+
 # â”€â”€ Humanization post-processor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _ABBREVS = [
