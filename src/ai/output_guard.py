@@ -7,12 +7,21 @@ suppresses the send when it fires.
 """
 import re
 
+# Discord mention tokens render as real names/channels for the reader —
+# to a text heuristic they're digit-noise that trips the letter-ratio
+# check. Normalize each to a letter token before scoring.
+_MENTION_TOKEN = re.compile(
+    r"<@!?\d+>|<@&\d+>|<#\d+>|<a?:\w{2,}:\d+>|@everyone|@here")
+
 
 def is_degenerate(text: str, max_len: int = 400) -> bool:
     """True for output that should never be sent — empty/oversized text,
     markdown-garbled model soup ("## Theorem (a). We're **…..**"), ellipsis
     storms, punctuation runs no human types, or mostly non-letter noise."""
-    t = (text or "").strip()
+    t0 = (text or "").strip()
+    if len(_MENTION_TOKEN.findall(t0)) > 4:
+        return True  # mention spam — no human drops 5+ links in one line
+    t = _MENTION_TOKEN.sub(" mention ", t0)
     if not t:
         return True
     if len(t) > max_len:

@@ -2861,17 +2861,6 @@ class AIPersonaClient(discord.Client):
                 _grounded = server_directory.ground_channel_mentions(reply_text, message.guild)
                 reply_text = _grounded or server_directory.NO_CHANNEL_FALLBACK
 
-                # Wrap replies can't end with a question — 'okie, what's
-                # next?' after a dry closer defeats the whole wrap. If the
-                # model slipped one in anyway, drop every sentence ending in
-                # '?' and keep whatever's left; an all-question reply becomes
-                # a plain ack.
-                if _is_wrap and "?" in reply_text:
-                    _kept = re.sub(r"[^.!?]*\?+", "", reply_text).strip(" ,.!")
-                    reply_text = _kept if len(_kept) >= 3 else random.choice(
-                        ["yea fr", "ayy", "for sure", "sounds good",
-                         "nice one", "fair enough"])
-
                 # Dedup check
                 last = self.last_sent.get(ch_id, "")
                 if ai_reply.is_duplicate(reply_text, last):
@@ -2915,6 +2904,16 @@ class AIPersonaClient(discord.Client):
                             reply_text = _grounded or server_directory.NO_CHANNEL_FALLBACK
                     except Exception as e:
                         logger.debug(f"Anti-repeat retry failed: {e}")
+
+                # Wrap replies can't end with a question — 'okie, what's
+                # next?' after a dry closer defeats the whole wrap. Runs
+                # AFTER the near-repeat retry above so regenerated text is
+                # stripped too. An all-question reply becomes a plain ack.
+                if _is_wrap and "?" in reply_text:
+                    _kept = re.sub(r"[^.!?]*\?+", "", reply_text).strip(" ,.!")
+                    reply_text = _kept if len(_kept) >= 3 else random.choice(
+                        ["yea fr", "ayy", "for sure", "sounds good",
+                         "nice one", "fair enough"])
 
                 # Degenerate-output guard — theorem soup / ellipsis storms /
                 # oversized rambles never reach the channel.
