@@ -140,7 +140,19 @@ def detect_command(text: str) -> Tuple[Optional[str], Optional[Dict]]:
             elif cmd_type == "set_name":
                 params["name"] = groups[1] if len(groups) > 1 else ""
             elif cmd_type == "set_hobby":
-                params["hobby"] = groups[1] if len(groups) > 1 else ""
+                hobby = (groups[1] if len(groups) > 1 else "") or ""
+                hobby = hobby.strip().strip(".!?\"'")
+                # Reject pronoun/vague captures — 'i like it' and 'what's
+                # it about' aren't hobby claims; storing 'it' poisons the
+                # user's profile with noise.
+                if len(hobby) < 3 or hobby.lower() in {
+                        "it", "this", "that", "them", "those", "these",
+                        "stuff", "things", "thing", "something",
+                        "anything", "everything", "nothing", "a lot",
+                        "alot", "so much", "too", "tbh", "fr", "yeah",
+                        "yes", "lol", "a lot", "lots"}:
+                    return None, None
+                params["hobby"] = hobby
             elif cmd_type == "set_personality":
                 params["personality"] = groups[1] if len(groups) > 1 else ""
             elif cmd_type == "set_location":
