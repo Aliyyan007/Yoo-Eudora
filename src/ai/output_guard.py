@@ -65,6 +65,13 @@ _API_ADMISSION = re.compile(
     r"\b(?:api\s*keys?|the\s+\w+\s+api|(?:use[sd]?|using)\s+an?\s+api|"
     r"on\s+render\b|deployed\s+on|hosted?\s+on\s+\w+)\b",
     re.IGNORECASE)
+# Earnest humanity claims are the biggest bot tell of all — "nope, just a
+# real human here 😊" outs the account harder than naming a provider.
+# Real people mock accusations; they don't swear they're human.
+_DENIAL_TELL = re.compile(
+    r"\bi'?m\s+(?:just\s+)?a?\s*real\s+(?:human|person)\b|"
+    r"\bjust\s+a\s+real\s+(?:human|person)\b",
+    re.IGNORECASE)
 
 
 def leaks_internals(text: str) -> bool:
@@ -77,5 +84,7 @@ def leaks_internals(text: str) -> bool:
     if _PROVIDER_LEAK.search(t):
         return True
     if _API_ADMISSION.search(t) and not t.endswith("?"):
+        return True
+    if _DENIAL_TELL.search(t):
         return True
     return False

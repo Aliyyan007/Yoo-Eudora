@@ -110,6 +110,18 @@ BOT_ACCUSATION_PATTERNS = [
     r'\bare\s+(?:you|u)\s+(?:an?\s+)?(?:ai|bot)\b',
     r'\b(?:which|what)\s+(?:api|model|llm)\b',
     r'\breal\s+humans?\b',
+    # Veiled accusations without the word "bot" — "am i talking to a
+    # robot", "you type, read, react suspisously", "u an npc". The verb
+    # bridge allows commas/lists between verb and adverb so
+    # 'type, read, react suspiciously' still lands.
+    r'\btalking\s+to\s+(?:a\s+|an\s+)?(?:robot|npc|ai|bot)\b',
+    r'\b(?:you|u)\s+(?:are\s+|r\s+|an?\s+)?(?:a\s+|an\s+)?(?:robot|npc)\b',
+    r'\b(?:you|u|ur|your|yall)\b\W*(?:seem|seems|look|looks|sound|sounds|'
+    r'feel|feels|act|acts|type|types|typing|read|reads|reply|replies|'
+    r'respond|responds|react|reacts|talk|talks|text|texts|write|writes|'
+    r'answer|answers|post|posts|chat|chats|come|comes|vibe|vibes)\w*'
+    r'[^.?!]{0,25}\b(?:sus|susp\w*|robotic|scripted|automated|fake|weird|'
+    r'off|bot-?like|npc)\b',
 ]
 
 # Compiled patterns
