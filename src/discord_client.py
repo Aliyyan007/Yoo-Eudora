@@ -315,6 +315,15 @@ class AIPersonaClient(discord.Client):
         except Exception as e:
             logger.debug(f"headers context cache write failed: {e}")
 
+    async def login(self, token):
+        # Stage markers: "[connect] REST login…" -> fingerprint+REST auth.
+        # Silence after this = scrape/API hang; "login OK" then silence =
+        # gateway-stage hang (watchdog catches either at 120s).
+        logger.info(f"[connect] {self.persona.id if self.persona else '?'} REST login…")
+        r = await super().login(token)
+        logger.info("[connect] REST login OK — opening gateway")
+        return r
+
     async def headers_context(self):
         """Bounded fingerprint: cached context first, else scrape with a
         hard timeout, else static fallback — never hang the whole login

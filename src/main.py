@@ -170,6 +170,45 @@ async def main():
 
         return client, client.start(token)
 
+    # Boot-time reachability probe: answers "is this host's IP being
+    # blocked?" instead of a silent login hang. TCP-443 to discord.com /
+    # gateway.discord.gg + GETs of /api/v9/gateway and /login — failures
+    # here mean Discord (or Cloudflare in front of it) is dropping this
+    # egress IP and DISCORD_PROXY is the fix. Non-fatal, ~30s worst case.
+    async def _preflight_probe():
+        import socket
+        import aiohttp as _aio
+        loop = asyncio.get_running_loop()
+
+        def _tcp(host):
+            try:
+                s = socket.create_connection((host, 443), timeout=8)
+                s.close()
+                return "OK"
+            except Exception as e:
+                return f"FAIL ({type(e).__name__}: {e})"
+
+        for host in ("discord.com", "gateway.discord.gg"):
+            r = await loop.run_in_executor(None, _tcp, host)
+            logger.info(f"[preflight] tcp443 {host}: {r}")
+        try:
+            to = _aio.ClientTimeout(total=12)
+            async with _aio.ClientSession(timeout=to) as sess:
+                for url in ("https://discord.com/api/v9/gateway",
+                            "https://discord.com/login"):
+                    try:
+                        async with sess.get(url) as resp:
+                            logger.info(f"[preflight] GET {url}: HTTP {resp.status}")
+                    except Exception as e:
+                        logger.info(f"[preflight] GET {url}: FAIL ({type(e).__name__}: {e})")
+        except Exception as e:
+            logger.debug(f"[preflight] http probe skipped: {e}")
+
+    try:
+        await _preflight_probe()
+    except Exception as e:
+        logger.debug(f"[preflight] probe error (non-fatal): {e}")
+
     supervisor = PersonaSupervisor(build_client)
     logger.info(
         f"Connecting to Discord — {len(supervisor._accounts)} persona "
