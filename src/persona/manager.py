@@ -40,6 +40,10 @@ _ALL_FAIL_SLEEP_S = 120         # every account failed — breathe, retry
 # A connect task that dies this fast was an auth/transport failure, not a
 # normal session end — counts toward the all-accounts-failing backoff.
 _FAST_CRASH_S = 120
+# Bounded READY wait: client.start() can sit inside a dropped/stalled
+# gateway handshake for the whole rotation window with ZERO log output —
+# the "service running, bots never online" failure. Fail it fast instead.
+_CONNECT_WATCHDOG_S = int(os.getenv("CONNECT_WATCHDOG_S", "120"))
 
 
 def _fail_hint(exc: BaseException) -> str:
@@ -102,6 +106,31 @@ class PersonaSupervisor:
         self._client = client
         self._run_task = asyncio.create_task(run_coro, name=f"persona:{profile.id}")
         return self._run_task
+
+    async def _wait_ready(self, timeout: float) -> None:
+        """Watch the connect: return once the client's READY event fires.
+        Raise the run-task's real error if it dies first, or TimeoutError
+        if neither happens — a hung gateway handshake is a failure, not a
+        reason to hold the window."""
+        client, task = self._client, self._run_task
+        if client is None or task is None:
+            raise RuntimeError("connect produced no client")
+        # Poll is_ready() rather than await client.wait_until_ready():
+        # the _ready event only exists after login() has begun, so the
+        # awaited version races the connect task and can raise
+        # RuntimeError("not properly initialised") as a false failure.
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            if client.is_ready():
+                return
+            if task.done():
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+                raise RuntimeError("client closed before READY")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(f"no READY after {timeout:.0f}s")
+            await asyncio.sleep(0.5)
 
     async def _stop_account(self) -> None:
         client, task = self._client, self._run_task
@@ -167,11 +196,16 @@ class PersonaSupervisor:
                 f"[persona] rotating → {profile.full_name} "
                 f"(window ~{window/60:.0f}min, seq {seq})")
 
-            # ── Connect with bounded retries ────────────────────────────
+            # ── Connect with bounded retries + READY watchdog ──────────
             task = None
             for attempt in range(1, _CONNECT_RETRY_LIMIT + 1):
                 try:
-                    task = await self._start_account(profile)
+                    await self._start_account(profile)
+                    # client.start() can hang silently inside the gateway
+                    # handshake on a flagged/dropped IP — wait for READY
+                    # or the task's death, whichever comes first.
+                    await self._wait_ready(_CONNECT_WATCHDOG_S)
+                    task = self._run_task
                     break
                 except Exception as e:
                     logger.warning(
