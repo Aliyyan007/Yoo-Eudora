@@ -37,6 +37,25 @@ ROTATE_JITTER_MIN = int(os.getenv("PERSONA_ROTATE_JITTER_MIN", "30"))
 _RESUME_MIN_REMAINING_S = 300   # <5min left in the window → just rotate
 _CONNECT_RETRY_LIMIT = 3
 _ALL_FAIL_SLEEP_S = 120         # every account failed — breathe, retry
+# A connect task that dies this fast was an auth/transport failure, not a
+# normal session end — counts toward the all-accounts-failing backoff.
+_FAST_CRASH_S = 120
+
+
+def _fail_hint(exc: BaseException) -> str:
+    """Attach an actionable hint to a connect/crash error so a Discord-side
+    outage is diagnosable from the log alone."""
+    kind = type(exc).__name__
+    text = str(exc)
+    if "LoginFailure" in kind or "Improper token" in text or "401" in text:
+        return " — token rejected (invalid/revoked); re-check the persona token env var"
+    if "captcha" in text.lower() or "cloudflare" in text.lower() or "403" in text:
+        return (" — Discord is challenging this host's IP (datacenter IPs get"
+                " flagged for user tokens); set DISCORD_PROXY to a clean proxy")
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timed out" in text.lower():
+        return (" — connect timed out; if this repeats on every account the egress"
+                " IP is likely being dropped — try DISCORD_PROXY")
+    return ""
 
 
 def _window_seconds() -> float:
@@ -157,7 +176,7 @@ class PersonaSupervisor:
                 except Exception as e:
                     logger.warning(
                         f"[persona] {profile.id} connect attempt {attempt} "
-                        f"failed: {e}")
+                        f"failed: {type(e).__name__}: {e}{_fail_hint(e)}")
                     await self._stop_account()
                     if attempt < _CONNECT_RETRY_LIMIT:
                         await asyncio.sleep(min(30 * attempt, 120))
@@ -169,6 +188,7 @@ class PersonaSupervisor:
             consecutive_fails = 0
 
             # ── Hold the window; bail early if the connection dies ──────
+            started_at = time.time()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=window)
                 # Task finished on its own (client closed itself) → rotate
@@ -181,7 +201,26 @@ class PersonaSupervisor:
                 if not task.cancelled():
                     raise
             except Exception as e:
-                logger.warning(f"[persona] {profile.id} crashed: {e!r} — rotating")
+                fast = (time.time() - started_at) < _FAST_CRASH_S
+                logger.warning(
+                    f"[persona] {profile.id} crashed after "
+                    f"{time.time() - started_at:.0f}s: {e!r} — rotating"
+                    f"{_fail_hint(e)}")
+                # A fast crash = connect/auth failure (login rejections land
+                # here, not in the retry loop above). Count it so every
+                # account dying → all-fail backoff + loud hint, instead of
+                # hot-rotating forever with the process looking alive.
+                if fast:
+                    consecutive_fails += 1
+                    if consecutive_fails >= len(self._accounts):
+                        logger.error(
+                            "[persona] EVERY account failed to connect. If the"
+                            " tokens are valid, Discord is likely blocking this"
+                            " host's IP — set DISCORD_PROXY (and"
+                            " DISCORD_PROXY_AUTH=user:pass if needed) to route"
+                            " traffic through a clean IP.")
+                else:
+                    consecutive_fails = 0
 
             await self._stop_account()
             seq += 1

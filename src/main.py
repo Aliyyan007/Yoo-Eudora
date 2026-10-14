@@ -122,7 +122,20 @@ async def main():
         if not token:
             raise RuntimeError(f"{profile.token_env} not set for {profile.id}")
 
-        client = AIPersonaClient(persona=profile)
+        # Optional egress proxy — Discord flags datacenter IPs (Render/VPS)
+        # for user-account logins, so DISCORD_PROXY routes all Discord
+        # traffic (REST + gateway) through a clean IP when set.
+        proxy = (os.getenv("DISCORD_PROXY") or "").strip() or None
+        proxy_auth = None
+        if proxy:
+            raw_auth = (os.getenv("DISCORD_PROXY_AUTH") or "").strip()
+            if ":" in raw_auth:
+                import aiohttp
+                _pu, _pp = raw_auth.split(":", 1)
+                proxy_auth = aiohttp.BasicAuth(_pu, _pp)
+            logger.info(f"[persona] routing {profile.id} via proxy {proxy.split('@')[-1]}")
+
+        client = AIPersonaClient(persona=profile, proxy=proxy, proxy_auth=proxy_auth)
 
         proactive = ProactiveMessenger(
             client=client,

@@ -556,9 +556,11 @@ class AIPersonaClient(discord.Client):
             self.my_profile_text = f"My display name: {self.user.display_name}\n"
             self.my_profile_text += f"My name: {self.persona.full_name} (goes by {self.persona.name.capitalize()})\n"
 
-        # Scan all guilds: discover channels, fetch rules, learn styles
+        # Scan all guilds: discover channels, fetch rules, learn styles.
+        # Track via _spawn — an untracked create_task survives rotation and
+        # keeps hitting the OLD client's closed session ("Session is closed").
         for guild in self.guilds:
-            asyncio.create_task(scan_guild(guild, self.rules_cache))
+            self._spawn(scan_guild(guild, self.rules_cache))
 
         # Start proactive messaging
         if self.proactive_messenger:
@@ -1212,7 +1214,7 @@ class AIPersonaClient(discord.Client):
     async def on_guild_join(self, guild: discord.Guild):
         """Called when joining a new server — scan it."""
         logger.info(f"Joined guild '{guild.name}' — scanning...")
-        asyncio.create_task(scan_guild(guild, self.rules_cache))
+        self._spawn(scan_guild(guild, self.rules_cache))
 
     async def on_member_join(self, member):
         """Greet new members in the most active channel."""
