@@ -217,11 +217,122 @@ DISTRESS_SIGNALS = [
 ]
 
 
+# ── Login fingerprint (headers context) ─────────────────────────────────
+# Before its first API call the client scrapes Discord's webapp (build
+# number, UA, TLS target) via headers_context(). Those fetches have no
+# hard timeout — a challenged/dropped datacenter IP hangs the whole login
+# silently (the "running but never online" bug). Bound the scrape, cache
+# the result, and fall back to a static fingerprint if it's unreachable.
+_HEADERS_SCRAPE_TIMEOUT_S = float(os.getenv("HEADERS_SCRAPE_TIMEOUT_S", "25"))
+_HEADERS_CACHE_PATH = os.path.join("data", "headers_context.json")
+_HEADERS_CACHE_MAX_AGE_S = 14 * 86400
+# Values captured live from HeadersContext.default() — the same dict the
+# lib produces when the scrape succeeds. Bump if Discord rejects them.
+_STATIC_BUILD_NUMBER = 637268
+_STATIC_BROWSER_MAJOR = 150
+
+
+def _fix_build_number(ctx):
+    """The lib's internal fallback build number is a sentinel (9999) that
+    screams 'bot'. If the scrape degraded to it, restore a real value and
+    re-encode the super properties."""
+    try:
+        bn = (ctx.super_properties or {}).get('client_build_number')
+        if bn in (None, 9999):
+            ctx.super_properties['client_build_number'] = _STATIC_BUILD_NUMBER
+            import base64
+            ctx.encoded_super_properties = base64.b64encode(
+                json.dumps(ctx.super_properties, separators=(',', ':')).encode()
+            ).decode()
+    except Exception:
+        pass
+    return ctx
+
+
+def _static_headers_context():
+    """Static HeadersContext identical in shape to default()'s own output."""
+    import uuid
+    HC = discord.HeadersContext
+    bv, bn = _STATIC_BROWSER_MAJOR, _STATIC_BUILD_NUMBER
+    props = {
+        'os': 'Windows', 'browser': 'Chrome', 'device': '', 'system_locale': 'en-US',
+        'browser_user_agent': HC.format_chromium_user_agent(bv),
+        'browser_version': f'{bv}.0.0.0', 'os_version': '10',
+        'referrer': '', 'referring_domain': '', 'referrer_current': '',
+        'referring_domain_current': '', 'release_channel': 'stable',
+        'client_build_number': bn, 'client_event_source': None,
+        'has_client_mods': False, 'client_launch_id': str(uuid.uuid4()),
+        'client_app_state': 'unfocused',
+        'client_heartbeat_session_id': str(uuid.uuid4()),
+        'launch_signature': HC.generate_launch_signature(),
+    }
+    return HC(
+        platform='Windows', browser_type='chrome', browser_major_version=bv,
+        super_properties=props,
+        extra_gateway_properties={
+            'is_fast_connect': False, 'gateway_connect_reasons': 'AppSkeleton'},
+    )
+
+
 class AIPersonaClient(discord.Client):
     """
     The main AI persona Discord client.
     Simulates a real human user with moods, memory, and human-like behavior.
     """
+
+    # ── Fingerprint scrape: bounded, cached, fallback ───────────────────
+    def _load_cached_headers(self):
+        """Return a HeadersContext from the disk cache if it's fresh."""
+        try:
+            with open(_HEADERS_CACHE_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if time.time() - float(d.get("saved_at", 0)) > _HEADERS_CACHE_MAX_AGE_S:
+                return None
+            return _fix_build_number(discord.HeadersContext(
+                platform=d.get("platform", "Windows"),
+                browser_type=d.get("browser_type", "chrome"),
+                browser_major_version=int(d["browser_major_version"]),
+                super_properties=d["super_properties"],
+                encoded_super_properties=d.get("encoded_super_properties"),
+                extra_gateway_properties=d.get("extra_gateway_properties") or {},
+            ))
+        except Exception:
+            return None
+
+    def _save_cached_headers(self, ctx) -> None:
+        try:
+            os.makedirs(os.path.dirname(_HEADERS_CACHE_PATH), exist_ok=True)
+            with open(_HEADERS_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump({
+                    "saved_at": time.time(),
+                    "platform": ctx.platform,
+                    "browser_type": ctx.browser_type,
+                    "browser_major_version": ctx.browser_major_version,
+                    "super_properties": ctx.super_properties,
+                    "encoded_super_properties": ctx.encoded_super_properties,
+                    "extra_gateway_properties": ctx.extra_gateway_properties,
+                }, f)
+        except Exception as e:
+            logger.debug(f"headers context cache write failed: {e}")
+
+    async def headers_context(self):
+        """Bounded fingerprint: cached context first, else scrape with a
+        hard timeout, else static fallback — never hang the whole login
+        on a webapp fetch a datacenter IP can't reach."""
+        cached = self._load_cached_headers()
+        if cached is not None:
+            return cached
+        try:
+            ctx = await asyncio.wait_for(
+                super().headers_context(), timeout=_HEADERS_SCRAPE_TIMEOUT_S)
+            ctx = _fix_build_number(ctx)
+            self._save_cached_headers(ctx)
+            return ctx
+        except Exception as e:
+            logger.warning(
+                f"Fingerprint scrape failed ({type(e).__name__}: {e}) — "
+                "using static headers context")
+            return _static_headers_context()
 
     def __init__(self, persona=None, **kwargs):
         # Stealth: don't chunk guilds at startup (minimizes API traffic)
