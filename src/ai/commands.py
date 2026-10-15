@@ -12,16 +12,27 @@ from typing import Tuple, Optional, List, Dict
 from loguru import logger
 
 
-# Invalid targets — common words that are NOT usernames
+# Invalid targets — common words that are NOT usernames. Used both as a
+# whole-target match AND a first-token match ("bot like wtf" from "wow
+# another ping bot like wtf" — 'ping' mid-sentence isn't a command, and
+# 'bot' is never a name).
 INVALID_TARGETS = {
     "you", "me", "him", "her", "them", "us", "everyone", "here", "all",
     "someone", "anybody", "nobody", "this", "that", "there", "where",
     "what", "who", "why", "how", "when", "yes", "no", "maybe", "ok",
     "okay", "sure", "yeah", "nah", "nope", "please", "thanks", "thank",
     "the", "a", "an", "my", "your", "his", "her", "their", "our",
-    "bot", "myself", "yourself", "himself", "herself", "itself",
+    "bot", "bots", "myself", "yourself", "himself", "herself", "itself",
     "today", "tomorrow", "yesterday", "now", "later", "soon",
-    "guys", "people", "folks", "everyone", "everybody",
+    "guys", "people", "folks", "everybody",
+    # sentence filler — a "name" starting with these is captured chatter
+    "like", "wtf", "lol", "lmao", "bro", "dude", "man", "guy", "girl",
+    "ping", "pong", "pinging", "mention", "user", "users", "member",
+    "members", "server", "channel", "mod", "mods", "admin", "person",
+    "new", "old", "last", "first", "next", "recent", "newest", "latest",
+    "joined", "join", "left", "some", "any", "one", "thing", "something",
+    "stuff", "it", "its", "idk", "idc", "rn", "tho", "tbh", "fr",
+    "really", "actually", "just", "also", "still", "back", "again",
 }
 
 
@@ -195,8 +206,14 @@ def detect_command(text: str) -> Tuple[Optional[str], Optional[Dict]]:
                 if cmd_type == "start_chat" and target.lower() == "you" and ("talk to you" in text_lower or "chat with you" in text_lower):
                     return None, {}
 
-                # Filter out common words that aren't usernames
-                if target.lower() in INVALID_TARGETS:
+                # Filter out common words that aren't usernames — whole
+                # target OR first token ("ping bot like wtf" captures
+                # 'bot like wtf' from a sentence that merely CONTAINS the
+                # word 'ping'). A multi-word target whose first word is a
+                # common word is captured chatter, not a name.
+                toks = target.lower().split()
+                if not toks or toks[0] in INVALID_TARGETS \
+                        or all(t in INVALID_TARGETS for t in toks):
                     return None, {}  # Not a command — treat as normal message
 
                 params["target"] = target

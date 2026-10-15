@@ -250,6 +250,11 @@ class ActionWorker:
                     return json.dumps({"error": "not allowed for this user"})
                 result = await _real_dispatch(ctx, name, args)
                 ok = '"error"' not in (result or "")[:120]
+                if not ok:
+                    # Tool errors were invisible — the agent saw them but the
+                    # console only showed 'performed=False'. Log the reason.
+                    logger.info(f"[actions] tool '{name}' failed: "
+                                f"{(result or '')[:160]}")
                 try:
                     ctx.performed.append((name, ok))
                 except AttributeError:

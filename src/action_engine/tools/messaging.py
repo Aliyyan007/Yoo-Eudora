@@ -9,6 +9,8 @@ Key design: the `channel_query` accepts:
 """
 from __future__ import annotations
 
+import re
+
 import discord
 
 from src.action_engine.tools.context import ToolContext
@@ -17,6 +19,20 @@ from src.action_engine.tools.members import resolve_member
 from src.action_engine.tools.roles import resolve_role_sync
 from src.action_engine.utils.fuzzy import fuzzy_search
 from src.action_engine.utils.logger import logger
+
+
+_BAD_MENTION = re.compile(r"<@[!&?]*([^0-9>\s][^>]*)>|<#([^0-9>\s][^>]*)>")
+
+
+def _sanitize_content(text: str) -> str:
+    """The agent sometimes writes malformed mention syntax into `content`
+    ('<@&?Rishab>', '<@Global Bot>') — Discord renders those as literal
+    text garbage. Render the inner name as plain text instead. Real
+    <@id>/<@!id>/<@&id>/<#id> mentions pass through untouched."""
+    if not text or ("<@" not in text and "<#" not in text):
+        return text
+    return _BAD_MENTION.sub(
+        lambda m: (m.group(1) or m.group(2) or "").strip(), text)
 
 
 async def _resolve_text_channel(ctx: ToolContext, query: str):
@@ -93,6 +109,7 @@ async def send_message(
         res = await resolve_channel(ctx, c)
         if "mention" in res:
             parts.append(res["mention"])
+    content = _sanitize_content(content)
     if content:
         parts.append(content)
     final = " ".join(parts) if parts else content

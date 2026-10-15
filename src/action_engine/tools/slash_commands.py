@@ -56,11 +56,22 @@ async def use_slash_command(
     # "of Global Bot" — resolve a bot name to its application_id
     # (a bot's user id equals its application id). resolve_member now
     # searches the SERVER-side member index, so bots that were never
-    # cached locally still resolve.
+    # cached locally still resolve. People append 'bot' colloquially
+    # ("Global bot" → account named 'Global') — retry stripped variants.
     if not application_id and bot_name:
         try:
             from src.action_engine.tools.members import resolve_member
-            res = await resolve_member(ctx, bot_name)
+            import re as _re
+            variants = [bot_name]
+            stripped = _re.sub(r"\s+(?:the\s+)?bot\b\.?$", "",
+                               bot_name.strip(), flags=_re.I).strip()
+            if stripped and stripped.lower() != bot_name.strip().lower():
+                variants.append(stripped)
+            res = {}
+            for v in variants:
+                res = await resolve_member(ctx, v)
+                if res.get("id"):
+                    break
             if res.get("id"):
                 application_id = str(res["id"])
             else:

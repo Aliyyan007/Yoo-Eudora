@@ -330,8 +330,21 @@ async def get_recent_joins(ctx: ToolContext, limit: int = 10) -> list[dict]:
         for m in recents:
             if getattr(m, "joined_at", None):
                 pool[m.id] = m
+        logger.info(f"[members] recent-joins: server returned "
+                    f"{len(recents or [])} member(s)")
     except Exception as e:  # noqa: BLE001
-        logger.debug(f"query_recent_members failed: {e}")
+        logger.info(f"[members] query_recent_members failed "
+                    f"({type(e).__name__}: {e}) — cache fallback")
+    # The bot's own live-observed joins (gateway member_join events seen
+    # since boot) — the freshest join signal there is.
+    try:
+        seen = getattr(ctx.bot, "_recent_joins", None) or {}
+        for uid in seen:
+            m = pool.get(uid) or guild.get_member(uid)
+            if m is not None and getattr(m, "joined_at", None):
+                pool[m.id] = m
+    except Exception:
+        pass
     joined = sorted(pool.values(), key=lambda m: m.joined_at, reverse=True)
     return [_member_summary(m) for m in joined[:limit]]
 

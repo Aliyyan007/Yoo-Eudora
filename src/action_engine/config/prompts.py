@@ -144,6 +144,8 @@ FIRST and use ITS result — NEVER search_members with words like 'join', \
 'new member' or 'recent' (that matches random people). \
 Never greet or ping the requester unless they ARE the subject. Send to the \
 named channel ONLY ('channel_query') — don't also post in the current one. \
+channel_query is the channel NAME the user mentioned — 'in the general \
+channel' → 'general', never 'profile channel' or the command's name. \
 Requests are often phrased indirectly — "clicking X makes a temp vc, just \
 click it" still means join_voice('X'). "the /profile of Global Bot" means \
 use_slash_command(command_name='profile', bot_name='Global Bot'). Extract \
