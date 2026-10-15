@@ -1,13 +1,19 @@
-"""Member tools: details, fuzzy search, joins/leaves, online presence, pings."""
+"""Member tools: details, fuzzy search, joins/leaves, online presence, pings.
+
+IMPORTANT: `guild.members` is only the gateway-cached subset (the client
+never chunks guilds), so lookups must fall back to server-side member
+search (`query_members` / `query_recent_members`) when the cache misses —
+otherwise real members resolve to fuzzy garbage like 'raus'.
+"""
 from __future__ import annotations
 
 import re
 from typing import Any
 
 import discord
+from rapidfuzz import fuzz
 
 from src.action_engine.tools.context import ToolContext
-from src.action_engine.utils.fuzzy import fuzzy_search
 from src.action_engine.utils.logger import logger
 
 _STATUS_MAP = {
@@ -113,61 +119,169 @@ def _try_direct_member(ctx: ToolContext, query: str):
     return None
 
 
-async def search_members(ctx: ToolContext, query: str, limit: int = 5) -> list[dict]:
-    """Fuzzy-search members by display name OR username. Also accepts IDs."""
+def _name_fields(m) -> list[str]:
+    """Every name a member answers to: username, global display name,
+    effective display name, guild nickname."""
+    return [
+        getattr(m, "name", "") or "",               # username
+        getattr(m, "global_name", "") or "",        # account display name
+        getattr(m, "display_name", "") or "",       # effective (nick/global/name)
+        getattr(m, "nick", "") or "",               # guild nickname
+    ]
+
+
+def _exact_member(candidates, query: str):
+    """Case-insensitive EXACT match across all name fields — username first,
+    then global name, display name, nick. Always wins over fuzzy so a real
+    exact-name target can never be stolen by a fuzzy near-miss."""
+    q = (query or "").strip().casefold()
+    if not q:
+        return None
+    for idx in range(4):
+        for m in candidates:
+            f = _name_fields(m)[idx]
+            if f and f.casefold() == q:
+                return m
+    return None
+
+
+async def _server_member_search(guild, query: str, limit: int = 10) -> list:
+    """Gateway member search — hits Discord's member index, not just the
+    (sparse) local cache. Safe no-op on failure."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        return await guild.query_members(
+            q, limit=max(5, min(100, limit)), cache=True)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"server member search failed for '{q}': {e}")
+        return []
+
+
+def _name_score(query: str, target: str) -> float:
+    """token_set + partial — but partial ONLY in the legitimate direction
+    (query ⊆ target, e.g. 'ris' → 'rishab'). The reverse (a short member
+    name inside a long query — 'raus' ⊂ 'sweetbutdangeROUS28') is how the
+    wrong person used to get pinged."""
+    if not target:
+        return 0.0
+    score = float(fuzz.token_set_ratio(query, target))
+    if len(query.strip()) <= len(target.strip()):
+        score = max(score, float(fuzz.partial_ratio(query, target)))
+    return score
+
+
+def _best_member_score(query: str, m) -> tuple[float, str]:
+    best, field = 0.0, ""
+    for f in _name_fields(m):
+        s = _name_score(query, f)
+        if s > best:
+            best, field = s, f
+    return best, field
+
+
+def _member_pool(ctx, guild, fetched: list) -> dict:
+    """Union of cached + server-fetched members, keyed by id."""
+    pool = {m.id: m for m in guild.members}
+    for m in fetched:
+        pool[m.id] = m
+    return pool
+
+
+async def _find_member(ctx: ToolContext, query: str):
+    """Full confidence-ranked resolution:
+    1. ID/mention
+    2. exact name match (cache)
+    3. server-side search → exact match
+    4. directional fuzzy — only if confident AND clearly ahead of #2
+    Returns (member_or_None, ranked_list)."""
     guild = ctx.require_guild()
-    # Direct ID resolution.
+    m = _try_direct_member(ctx, query)
+    if m:
+        return m, [(100.0, m)]
+
+    pool = _member_pool(ctx, guild, [])
+    hit = _exact_member(pool.values(), query)
+    if hit is not None:
+        return hit, [(100.0, hit)]
+
+    # Cache missed — ask the server (gateway OP 8 member search).
+    fetched = await _server_member_search(guild, query)
+    if fetched:
+        pool = _member_pool(ctx, guild, fetched)
+        hit = _exact_member(fetched, query)
+        if hit is not None:
+            return hit, [(100.0, hit)]
+
+    # idx tiebreak — Member objects aren't orderable; equal scores would
+    # crash sorted() on the second element.
+    scored = []
+    for i, m in enumerate(pool.values()):
+        s, _field = _best_member_score(query, m)
+        scored.append((s, i, m))
+    scored.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+    ranked = [(s, m) for s, _, m in scored if s >= 40.0]
+    return None, ranked
+
+
+async def search_members(ctx: ToolContext, query: str, limit: int = 5) -> list[dict]:
+    """Search members by display name / username / nick. Accepts IDs.
+    Merges the sparse local cache with a server-side member search so
+    names that were never cached still resolve."""
+    guild = ctx.require_guild()
     m = _try_direct_member(ctx, query)
     if m:
         return [_member_summary(m)]
-    members = guild.members
 
-    # search by display_name first
-    by_disp = fuzzy_search(query, members, key=lambda m: m.display_name, limit=limit)
-    by_user = fuzzy_search(query, members, key=lambda m: str(m), limit=limit)
+    fetched = await _server_member_search(guild, query, limit=max(limit, 5))
+    pool = _member_pool(ctx, guild, fetched)
 
-    # merge & dedupe by id, keep best score
-    seen: dict[int, dict] = {}
-    for r in by_disp + by_user:
-        mid = r.item.id
-        if mid not in seen or r.score > seen[mid]["score"]:
-            seen[mid] = {**_member_summary(r.item), "score": r.score}
-    ranked = sorted(seen.values(), key=lambda d: d["score"], reverse=True)
-    return ranked[:limit]
+    scored = []
+    for i, mm in enumerate(pool.values()):
+        s, field = _best_member_score(query, mm)
+        if s >= 40.0:
+            scored.append((s, i, field, mm))   # idx tiebreak: Members unorderable
+    scored.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+    return [{**_member_summary(mm), "score": s, "matched_on": field}
+            for s, _, field, mm in scored[:limit]]
 
 
 async def get_member_details(ctx: ToolContext, query: str) -> dict | list[dict]:
-    """Get full details for a member by fuzzy name or ID. Includes bio if available."""
-    guild = ctx.require_guild()
-    # Direct ID resolution.
-    m = _try_direct_member(ctx, query)
-    if m:
-        detail = _member_detail(m)
-        detail["bio"] = await _maybe_fetch_profile(m)
+    """Get full details for a member by name or ID. Includes bio if available."""
+    hit, ranked = await _find_member(ctx, query)
+    if hit is not None:
+        detail = _member_detail(hit)
+        detail["bio"] = await _maybe_fetch_profile(hit)
         return detail
-    results = fuzzy_search(query, guild.members, key=lambda m: m.display_name, limit=3)
-    if not results:
+    if not ranked:
         return {"error": f"No member matching '{query}'."}
-    if len(results) == 1 or results[0].score >= 85:
-        m = results[0].item
+    if len(ranked) == 1 or ranked[0][0] >= 85:
+        m = ranked[0][1]
         detail = _member_detail(m)
         detail["bio"] = await _maybe_fetch_profile(m)
         return detail
-    return [{**_member_summary(r.item), "score": r.score} for r in results]
+    return [{**_member_summary(m), "score": s} for s, m in ranked[:3]]
 
 
 async def resolve_member(ctx: ToolContext, query: str) -> dict:
-    """Resolve a fuzzy name or ID to a single member (best match)."""
-    # Direct ID resolution first.
-    m = _try_direct_member(ctx, query)
-    if m:
+    """Resolve a name or ID to a single member. FAILS SAFE: a weak or
+    ambiguous fuzzy guess returns an error rather than pinging the wrong
+    person (the 'raus' bug)."""
+    hit, ranked = await _find_member(ctx, query)
+    if hit is not None:
+        return {"id": hit.id, "name": hit.display_name, "mention": hit.mention}
+    # Only accept a fuzzy winner when it's clearly ahead of the runner-up —
+    # a 2-point gap on 50-70 scores is a coin flip, not a match.
+    if ranked and ranked[0][0] >= 70.0 and (
+            len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= 5.0):
+        m = ranked[0][1]
         return {"id": m.id, "name": m.display_name, "mention": m.mention}
-    guild = ctx.require_guild()
-    results = fuzzy_search(query, guild.members, key=lambda m: m.display_name, limit=1)
-    if not results:
-        return {"error": f"No member matching '{query}'."}
-    m = results[0].item
-    return {"id": m.id, "name": m.display_name, "mention": m.mention}
+    if ranked:
+        opts = ", ".join(f"{m.display_name} (@{m.name})" for _, m in ranked[:3])
+        return {"error": f"Ambiguous '{query}' — possible: {opts}. "
+                         "Ask which one (or use their exact username)."}
+    return {"error": f"No member matching '{query}'."}
 
 
 async def get_member_mention(ctx: ToolContext, query: str) -> dict:
@@ -202,10 +316,23 @@ async def get_online_members(ctx: ToolContext) -> list[dict]:
 
 
 async def get_recent_joins(ctx: ToolContext, limit: int = 10) -> list[dict]:
-    """Members who joined most recently (sorted by joined_at desc)."""
+    """Members who joined most recently (sorted by joined_at desc).
+
+    The local member cache is sparse, so this first asks the server for
+    the genuinely-recent joins (query_recent_members) and merges with the
+    cache — otherwise "who just joined" silently answered from a stale
+    handful of cached members."""
     guild = ctx.require_guild()
-    joined = [m for m in guild.members if m.joined_at]
-    joined.sort(key=lambda m: m.joined_at, reverse=True)
+    pool = {m.id: m for m in guild.members if getattr(m, "joined_at", None)}
+    try:
+        recents = await guild.query_recent_members(
+            limit=max(5, min(50, limit)), cache=True)
+        for m in recents:
+            if getattr(m, "joined_at", None):
+                pool[m.id] = m
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"query_recent_members failed: {e}")
+    joined = sorted(pool.values(), key=lambda m: m.joined_at, reverse=True)
     return [_member_summary(m) for m in joined[:limit]]
 
 

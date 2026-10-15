@@ -367,6 +367,17 @@ class MentionManager:
         # Find the member
         members = find_members_by_name(guild, target_name, limit=5)
 
+        # The member cache is sparse (guilds aren't chunked), so a cache
+        # miss doesn't mean "no such user" — ask the server's member index
+        # before giving up. Skipping this is why real members like
+        # 'sweetbutdangerous28'/'rishab' used to "not exist".
+        if not members:
+            try:
+                fetched = await guild.query_members(target_name, limit=5)
+                members = [m for m in fetched if not m.bot][:5]
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"server member lookup failed for '{target_name}': {e}")
+
         if len(members) == 0:
             return {
                 "found": False,

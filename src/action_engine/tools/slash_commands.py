@@ -54,15 +54,25 @@ async def use_slash_command(
     command_name = command_name.lstrip("/").strip()
 
     # "of Global Bot" — resolve a bot name to its application_id
-    # (a bot's user id equals its application id).
+    # (a bot's user id equals its application id). resolve_member now
+    # searches the SERVER-side member index, so bots that were never
+    # cached locally still resolve.
     if not application_id and bot_name:
         try:
             from src.action_engine.tools.members import resolve_member
             res = await resolve_member(ctx, bot_name)
             if res.get("id"):
                 application_id = str(res["id"])
+            else:
+                # Named a specific bot but can't pin it down — running
+                # ANOTHER bot's same-named command would be the wrong
+                # action. Surface the resolver's reason verbatim.
+                return {"error": res.get("error") or
+                        f"Can't find a bot named '{bot_name}' in this "
+                        f"server — no way to target their /{command_name}."}
         except Exception:
-            pass
+            # Resolution blew up — don't silently run another bot's command.
+            return {"error": f"Could not resolve bot '{bot_name}'."}
 
     from src.action_engine.tools.messaging import _resolve_text_channel
     ch = await _resolve_text_channel(ctx, channel_query)

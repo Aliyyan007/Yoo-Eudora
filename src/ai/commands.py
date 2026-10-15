@@ -164,6 +164,15 @@ def detect_command(text: str) -> Tuple[Optional[str], Optional[Dict]]:
                     return None, None
                 params["location"] = location
             elif cmd_type in ("mention_user", "mention_user_id", "start_chat"):
+                # Channel clause present ("ping X in the general channel",
+                # "ping @X in #media") — the native mention path can only
+                # post in THIS channel. Defer to the action worker, which
+                # resolves the named channel and member and sends there.
+                if re.search(
+                        r"\b(?:in|into|to)\s+(?:the\s+)?#[\w\-]+"
+                        r"|\b(?:in|into|to)\s+(?:the\s+)?[\w\-]+\s+(?:channel|chat|vc|thread)\b",
+                        text_lower):
+                    return None, None
                 # Extract the target name/ID from the regex groups
                 # The regex captures: group(1) = verb (mention/ping/chat with),
                 # group(2) = target name or ID

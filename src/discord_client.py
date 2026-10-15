@@ -753,19 +753,28 @@ class AIPersonaClient(discord.Client):
 
     async def _process_pending_interactions(self):
         """Catch up on messages that were aimed at THIS persona while it was
-        offline (mentions/replies/name-drops recorded by whichever persona was
-        active at the time). Fresh ones get a natural reply-quote; older ones
-        just get marked handled so they never resurface."""
+        offline. Two sources:
+        1. pending — mentions/replies/name-drops RECORDED live by whichever
+           persona was active when they arrived (data/pending/<pid>.json).
+        2. offline-window scan — messages nobody could record because the
+           whole process was down; found via the channel read-state
+           (unread-mention badges) + our designated channels.
+        Replays go straight to _handle_reply — they were already approved
+        when recorded (or matched a mention/reply-to-us filter), and the
+        _should_respond gate would drop them as 'addressed-to-other-user'
+        since the mention/reference points at a DIFFERENT persona id."""
         from .persona import runtime as prt
         try:
             await asyncio.sleep(8)   # let the connection settle
             fresh = prt.fresh_pending(self.persona.id)
             stale = prt.stale_pending(self.persona.id)
             if not fresh and not stale:
+                await self._offline_window_scan(set())
                 return
             # Old ones are silently retired — replying hours later is weird.
             prt.mark_pending_handled(self.persona.id,
                                      [it["message_id"] for it in stale])
+            handled_ids = {it["message_id"] for it in fresh + stale}
             # Per-channel cap — never dump a backlog
             by_channel = {}
             for it in fresh:
@@ -777,15 +786,131 @@ class AIPersonaClient(discord.Client):
                         if channel is None:
                             continue
                         msg = await channel.fetch_message(it["message_id"])
-                        await self._on_message_impl(msg)
+                        if msg is None or self.is_closed():
+                            continue
+                        self.processed_msgs.append(msg.id)   # never re-enter
+                        await self._handle_reply(msg, str(it["channel_id"]))
                         prt.mark_pending_handled(self.persona.id,
                                                  [it["message_id"]])
                         await asyncio.sleep(random.uniform(4, 10))
                     except Exception as e:
                         logger.debug(f"[persona] pending {it['message_id']} skipped: {e}")
             logger.info(f"[persona] pending catch-up done ({len(fresh)} fresh, {len(stale)} stale)")
+            await self._offline_window_scan(handled_ids)
         except Exception as e:
             logger.debug(f"[persona] pending processing failed: {e}")
+
+    async def _offline_window_scan(self, handled_ids: set):
+        """Catch up on pings/replies that arrived while the WHOLE process was
+        offline — nobody was alive to record them into pending.
+
+        Signals scanned (bounded, cheap):
+          - channels with an unread-mention badge (Discord's read_state) —
+            pings sent while offline still raise it;
+          - our designated engagement channels — replies to our messages
+            don't raise a mention badge;
+          - channels that held pending items.
+
+        A message only counts if it mentions us or replies to one of our
+        messages AND we haven't said anything newer in that channel (we
+        weren't there to see it). Cap: newest-per-author, ~45min window."""
+        from .persona import runtime as prt
+        try:
+            my_id = self.user.id
+            sibling_ids = set(prt.own_user_ids()) - {my_id}
+            now_ts = time.time()
+            floor_ts = now_ts - 2700   # ~45min — older pings read as stale
+
+            # ── Collect candidate channels ────────────────────────────────
+            channels: dict[int, object] = {}
+            for guild in self.guilds:
+                for tc in guild.text_channels:
+                    try:
+                        if getattr(tc, "mention_count", 0) > 0:
+                            channels[tc.id] = tc
+                    except Exception:
+                        continue
+            for cid in getattr(self, "_engage_channel_ids", ()):
+                tc = self.get_channel(int(cid))
+                if tc is not None:
+                    channels[int(cid)] = tc
+            answered = 0
+            for ch in channels.values():
+                if answered >= 3 or self.is_closed():
+                    break
+                try:
+                    # Window: since last ack (or 45min floor, whichever is later)
+                    from datetime import datetime as _dt, timezone as _tz
+                    after_dt = None
+                    try:
+                        last_ack = getattr(ch.read_state, "last_acked_id", None)
+                        if last_ack:
+                            after_dt = discord.utils.snowflake_time(last_ack)
+                    except Exception:
+                        pass
+                    floor_dt = _dt.fromtimestamp(floor_ts, tz=_tz.utc)
+                    if after_dt is None or after_dt < floor_dt:
+                        after_dt = floor_dt
+
+                    msgs = [m async for m in ch.history(limit=40, after=after_dt)]
+                    if not msgs:
+                        continue
+                    my_ids = {m.id for m in msgs if m.author.id == my_id}
+                    my_latest = max(
+                        (m.created_at for m in msgs if m.author.id == my_id),
+                        default=None)
+
+                    seen_auth = set()
+                    for m in msgs:   # history yields newest → oldest
+                        if answered >= 3 or self.is_closed():
+                            break
+                        if m.author.bot or m.author.id == my_id:
+                            continue
+                        if m.author.id in sibling_ids or m.id in handled_ids:
+                            continue
+                        if m.id in self.processed_msgs:
+                            continue
+                        if my_latest and m.created_at <= my_latest:
+                            continue   # I already spoke after it — was seen
+                        if m.author.id in seen_auth:
+                            continue
+                        # Direct mention?
+                        hit = any(getattr(u, "id", 0) == my_id
+                                  for u in m.mentions)
+                        # …or a reply to one of my messages?
+                        if not hit and m.reference and m.reference.message_id:
+                            ref = m.reference
+                            rm = getattr(ref, "resolved", None) \
+                                or getattr(ref, "cached_message", None)
+                            if rm is not None:
+                                hit = getattr(rm.author, "id", 0) == my_id
+                            elif ref.message_id in my_ids:
+                                hit = True
+                            else:
+                                try:
+                                    rm = await ch.fetch_message(ref.message_id)
+                                    hit = getattr(rm.author, "id", 0) == my_id
+                                except Exception:
+                                    hit = False
+                        if not hit:
+                            continue
+                        seen_auth.add(m.author.id)
+                        self.processed_msgs.append(m.id)
+                        logger.info(
+                            f"[catchup] answering {m.author.name}'s "
+                            f"offline-window message in #{ch.name}: "
+                            f"'{(m.content or '')[:50]}'")
+                        await self._handle_reply(m, str(ch.id))
+                        answered += 1
+                        await asyncio.sleep(random.uniform(4, 9))
+                except Exception as e:
+                    logger.debug(f"[catchup] scan failed in "
+                                 f"#{getattr(ch, 'name', '?')}: {e}")
+            if answered:
+                logger.info(f"[catchup] answered {answered} offline-window "
+                            f"message(s)")
+        except Exception as e:
+            logger.debug(f"[catchup] offline scan failed: {e}")
 
     async def _deferred_replies_loop(self):
         """Answer directed messages that were dropped on the daily cap once
@@ -1765,6 +1890,21 @@ class AIPersonaClient(discord.Client):
         mentions_others = [u for u in message.mentions if u != self.user and not u.bot]
 
         if mentions_others and not mentions_bot:
+            # Exception: an imperative opener makes the mentioned user the
+            # OBJECT of a command to us — "ping @x in #general", "greet
+            # @newbie". Those are our tasks — count them as addressed so the
+            # reply path (and the action worker inside it) sees them.
+            # "@sarah ping me" stays gated — mention first = addressed to her.
+            if re.search(
+                    r"^\s*(?:pls|plz|please|hey|yo|ok|okay|can\s+you|"
+                    r"could\s+you|can\s+u|could\s+u|would\s+you|would\s+u|"
+                    r"will\s+you|will\s+u|just|go|now)?\s*"
+                    r"(?:ping|pings|greet|welcome|dm|dms|message|send|tag|"
+                    r"invite|remind|post|use|run|tell|say|ask|check)\b",
+                    txt_low):
+                if not self.can_send(ch_id):
+                    return False, "imperative-daily-cap"
+                return True, "imperative-with-target"
             # Message is addressed to another user, not us
             return False, "addressed-to-other-user (mention)"
 
@@ -2493,6 +2633,11 @@ class AIPersonaClient(discord.Client):
 
     async def _handle_reply(self, message: discord.Message, ch_id: str):
         """Generate and send a reply to a message."""
+        # A reply task that outlived its client (persona rotation closed the
+        # session mid-flight) can't send anyway — bail quietly instead of
+        # logging a scary "Session is closed" ERROR.
+        if self.is_closed():
+            return
         is_dm = isinstance(message.channel, (discord.DMChannel, discord.GroupChannel))
 
         # Update mood based on message content

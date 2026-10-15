@@ -139,6 +139,9 @@ re-send the same message/ping. \
 The speaker [name] is the REQUESTER, not the subject: "greet the new \
 member", "ping him", "welcome the recent joiner" refer to SOMEONE ELSE — \
 resolve them via get_recent_joins/search_members or the context lines first. \
+"new member"/"just joined"/"recent joiner"/"who joined" → get_recent_joins \
+FIRST and use ITS result — NEVER search_members with words like 'join', \
+'new member' or 'recent' (that matches random people). \
 Never greet or ping the requester unless they ARE the subject. Send to the \
 named channel ONLY ('channel_query') — don't also post in the current one. \
 Requests are often phrased indirectly — "clicking X makes a temp vc, just \
