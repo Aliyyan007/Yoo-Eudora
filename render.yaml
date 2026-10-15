@@ -41,6 +41,17 @@ services:
         sync: false
       - key: FISH_AUDIO_FALLBACK_VOICE_ID
         sync: false
+      # ── Egress proxy (Discord blocks datacenter IPs) ──
+      # WARP sidecar: registers a Cloudflare WireGuard device in the
+      # container and exports DISCORD_PROXY=http://127.0.0.1:40000 so all
+      # Discord traffic exits on a Cloudflare IP. Set DISCORD_PROXY
+      # manually to use a different proxy instead (WARP is then skipped).
+      - key: USE_WARP_PROXY
+        value: "1"
+      - key: DISCORD_PROXY
+        sync: false
+      - key: DISCORD_PROXY_AUTH
+        sync: false
       # ── Channel / server config ──
       - key: BUMP_CHANNEL_ID
         sync: false
