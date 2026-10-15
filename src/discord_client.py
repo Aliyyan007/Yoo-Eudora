@@ -443,6 +443,10 @@ class AIPersonaClient(discord.Client):
         # reply-probability boost so they integrate into normal engagement
         self._recent_joins: dict = {}
 
+        # Per-channel throttle for the deep self-cleanup sweep (6h-age /
+        # >15-per-channel hygiene) — ~30min between history scans per channel
+        self._deep_sweep_last: dict = {}
+
         # Designated engagement channels (TEXT_CHANNEL_IDS) — these are the
         # bot's home turf; utility-channel gates never silence them
         self._engage_channel_ids: set = set()
@@ -1322,6 +1326,25 @@ class AIPersonaClient(discord.Client):
             except Exception as e:
                 logger.debug(f"Voice state update error: {e}")
 
+    async def _deep_sweep_channel(self, channel) -> None:
+        """Slow-cadence hygiene: delete OUR messages older than 6h or beyond
+        15/channel (self_cleanup.sweep_channel). Throttled ~30min per channel
+        — one history fetch each, so it stays cheap for the event loop."""
+        ch_id = str(channel.id)
+        now = time.time()
+        if now - self._deep_sweep_last.get(ch_id, 0) < 1800:
+            return
+        self._deep_sweep_last[ch_id] = now
+        try:
+            from .action_engine.core import self_cleanup
+            deleted = await self_cleanup.sweep_channel(self, channel)
+            if deleted:
+                logger.info(f"[cleanup] deep-swept {deleted} old msg(s) in "
+                            f"#{getattr(channel, 'name', ch_id)}")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[cleanup] deep sweep failed in "
+                         f"#{getattr(channel, 'name', ch_id)}: {e}")
+
     async def _memory_gc_loop(self):
         """Daily stale-memory sweep — forgets users/channels nobody has
         touched in MEMORY_MAX_AGE_DAYS (default 60). Bounds the context DB
@@ -1365,22 +1388,37 @@ class AIPersonaClient(discord.Client):
                 for guild in self.guilds:
                     for channel in guild.text_channels:
                         ch_id = str(channel.id)
-                        if not re_tracker.needs_re_engagement(ch_id):
-                            continue
-
-                        # Check permissions
-                        from .channel_scanner import can_speak_in, is_skip_channel
-                        if is_skip_channel(channel.name):
-                            continue
-                        if not can_speak_in(channel, guild.me):
-                            continue
-
-                        # Clean stale unanswered engagement msgs BEFORE the gate —
-                        # gating first while the wall is over cap returns early and
-                        # the stale messages would never get cleaned
+                        needs = re_tracker.needs_re_engagement(ch_id)
                         eng_log = get_engagement_log()
-                        await eng_log.sweep_before_send(channel, self.user,
-                                                        history_msgs=self.history_cache.get(ch_id))
+
+                        # ── Wall hygiene — runs even when NO send is due ────
+                        # Sweep any channel that plausibly holds our posts:
+                        # tracked unanswered engagement, a designated
+                        # engagement channel, or anywhere we spoke in the
+                        # last ~6h. Otherwise walls freeze the moment a
+                        # human talks (got_reply kills needs_re_engagement)
+                        # or a restart wipes the re-engage tracker.
+                        if (needs
+                                or eng_log.unanswered_count(ch_id) > 0
+                                or channel.id in self._engage_channel_ids
+                                or self.last_replied.get(ch_id, 0)
+                                   > time.time() - 6 * 3600):
+                            # Check permissions (sweep needs history read)
+                            from .channel_scanner import can_speak_in, is_skip_channel
+                            if is_skip_channel(channel.name) \
+                                    or not can_speak_in(channel, guild.me):
+                                continue
+                            # Clean stale unanswered engagement msgs BEFORE
+                            # the gate — gating first while the wall is over
+                            # cap returns early and the stale messages would
+                            # never get cleaned
+                            await eng_log.sweep_before_send(
+                                channel, self.user,
+                                history_msgs=self.history_cache.get(ch_id))
+                            await self._deep_sweep_channel(channel)
+
+                        if not needs:
+                            continue
                         # Unified gate: paused / shared send cooldown / wall full
                         if not eng_log.can_send_engagement(ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
                                                            history_msgs=self.history_cache.get(ch_id),
