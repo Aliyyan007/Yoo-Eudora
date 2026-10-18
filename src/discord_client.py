@@ -169,6 +169,55 @@ def _is_closing(text: str) -> bool:
     )
 
 
+def _read_delay_seconds(text: str) -> float:
+    """How long a human needs to physically READ the incoming message.
+    Casual skim pace ≈ 12–16 chars/sec — a 300-char paragraph takes
+    ~20-25s to absorb before the reply even starts forming. Short lines
+    stay snappy (the old 0.4–3s window)."""
+    n = len(text or "")
+    if n < 20:
+        return random.uniform(0.4, 1.5)
+    if n < 80:
+        return random.uniform(1.0, 3.0)
+    return min(n / random.uniform(12.0, 16.0), 22.0)
+
+
+def _think_delay_seconds(text: str) -> float:
+    """Comprehension beat — how hard the message is to ANSWER, not just read.
+    Questions, advice asks, math, multi-clause paragraphs and heavy topics
+    all buy thinking time; banter and greetings buy none."""
+    t = (text or "").lower()
+    if not t:
+        return 0.0
+    score = 0.0
+    # Questions — each one needs an actual answer formed
+    q_marks = t.count("?")
+    if q_marks:
+        score += min(1.5 + 0.75 * (q_marks - 1), 4.0)
+    # Opinion / advice / explanation asks — real thinking
+    if re.search(
+            r"\b(what do (?:you|u) think|wdyt|should i|what should i|"
+            r"how do (?:i|you|u)|which one|which is better|help me|advice|"
+            r"opinion|thoughts|why do|why does|explain|difference between)\b", t):
+        score += 2.5
+    # Numbers / math — compute time
+    if re.search(r"\d\s*[+\-*/x=]\s*\d|\b(?:how much|how many|calculate|"
+                 r"percent|average|total)\b", t):
+        score += 2.0
+    # Multi-clause paragraph — parse effort before composing a reply
+    if len(t) > 120 or t.count(",") >= 2 or " because " in t or " but " in t:
+        score += 1.0
+    if len(t) > 220:
+        score += 1.5
+    # Emotionally heavy — a beat of care before answering
+    if re.search(r"\b(sad|depressed|died|death|broke up|breakup|miss (?:her|him|them)|"
+                 r"anxious|scared|cry(?:ing)?|lost|hurt|grieving)\b", t):
+        score += 1.5
+    if score <= 0:
+        return 0.0
+    return min(random.uniform(0.8, 1.2) * score, 9.0)
+
+
 def dynamic_reply_chance() -> float:
     """
     Return a reply probability tuned to the time of day.
@@ -2696,15 +2745,17 @@ class AIPersonaClient(discord.Client):
         if self.user in message.mentions or is_dm or message.reference is not None:
             notif_delay = random.uniform(2.5, 6.0) * combined_modifier  # Opening app on ping
 
-        if msg_len < 20:
-            read_delay = random.uniform(0.4, 1.5) * combined_modifier
-        elif msg_len < 80:
-            read_delay = random.uniform(1.0, 3.0) * combined_modifier
-        else:
-            read_delay = min(random.uniform(2.0, 4.0) + msg_len * 0.005, 10.0) * combined_modifier
+        # Reading time scales with the message's actual length — a human
+        # has to physically read a paragraph before replying (~12-16
+        # chars/sec skim pace). Plus a thinking beat sized by how hard it
+        # is to answer: questions/advice/math/heavy topics get a real
+        # comprehension pause, banter and greetings don't.
+        read_s = _read_delay_seconds(message.content)
+        think_s = _think_delay_seconds(message.content)
+        read_delay = (read_s + think_s) * combined_modifier
 
-        total_delay = max(notif_delay + read_delay + late_delay, 0.5)  # minimum 0.5s
-        logger.debug(f"Simulating {total_delay:.1f}s read delay [sentiment: {sentiment}, speed: {speed_mult}x, late: {late_delay:.1f}s]...")
+        total_delay = min(max(notif_delay + read_delay + late_delay, 0.5), 38.0)
+        logger.debug(f"Simulating {total_delay:.1f}s read delay [read: {read_s:.1f}s, think: {think_s:.1f}s, sentiment: {sentiment}, speed: {speed_mult}x, late: {late_delay:.1f}s]...")
         await asyncio.sleep(total_delay)
 
         try:
