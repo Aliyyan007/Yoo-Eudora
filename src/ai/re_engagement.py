@@ -82,6 +82,12 @@ class PingController:
         # :38 and an @everyone at :48 slip through back-to-back.
         self._min_mass_gap_s = _ei("PING_MIN_MASS_GAP_MIN", 20) * 60
 
+        # D1 merge state — deferred to first use so importing this module
+        # never spawns the memory bg-loop or blocks on the network (the
+        # singleton below is constructed at import time).
+        self._remote_merged = False
+        self._merge_thread = None
+
         # Persisted ping timelines — cooldowns survive restarts
         self._state_path = Path("data/ping_state.json")
         self._load_state()
@@ -114,15 +120,30 @@ class PingController:
             logger.debug(f"Ping state restored from {self._state_path}")
         except Exception as e:
             logger.debug(f"Ping state load failed (starting fresh): {e}")
-        # Merge D1 state — survives redeploys where data/ is wiped (Render
-        # ephemeral FS is exactly how @everyone escaped its weekly cap)
-        try:
-            from . import d1_memory as _mem
-            remote = _mem.load_server_state("ping_state")
-            if isinstance(remote, dict):
-                self._merge_remote(remote)
-        except Exception:
-            pass
+
+    def _ensure_remote(self):
+        """Kick off the D1 state merge on first use — deferred from __init__
+        so constructing the singleton at import never does network I/O.
+        Runs on a daemon thread: a slow/dead D1 can't stall the caller's
+        event loop while local (file) state stays fully usable meanwhile."""
+        if self._remote_merged:
+            return
+        self._remote_merged = True
+        import threading
+
+        def _do_merge():
+            # Merge D1 state — survives redeploys where data/ is wiped
+            # (Render ephemeral FS is how @everyone escaped its weekly cap)
+            try:
+                from . import d1_memory as _mem
+                remote = _mem.load_server_state("ping_state")
+                if isinstance(remote, dict):
+                    self._merge_remote(remote)
+            except Exception:
+                pass
+
+        self._merge_thread = threading.Thread(target=_do_merge, daemon=True)
+        self._merge_thread.start()
 
     def _merge_remote(self, data: dict):
         """Union remote (D1) ping state into local — take the STRICTER view
@@ -148,6 +169,7 @@ class PingController:
 
     def _save_state(self):
         """Atomically persist all ping timelines to disk."""
+        self._ensure_remote()
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             data = {
@@ -162,7 +184,24 @@ class PingController:
             tmp = self._state_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data))
             tmp.replace(self._state_path)
-            # Mirror to D1 — best-effort, survives redeploys (ephemeral FS)
+            # Mirror to D1 — best-effort, survives redeploys (ephemeral FS).
+            # Wait for the deferred merge first so a pre-merge snapshot can't
+            # clobber richer remote cooldowns.
+            try:
+                t = self._merge_thread
+                if t is not None and t.is_alive():
+                    t.join(timeout=30)
+                    data = {
+                        "here": {c: list(q) for c, q in self._here_pings.items()},
+                        "everyone": {c: list(q) for c, q in self._everyone_pings.items()},
+                        "role": {c: list(q) for c, q in self._role_pings.items()},
+                        "user": {c: list(q) for c, q in self._user_pings.items()},
+                        "recently": {c: [[u, t2] for u, t2 in q]
+                                     for c, q in self._recently_pinged.items()},
+                        "unanswered": dict(self._unanswered_pings),
+                    }
+            except Exception:
+                pass
             try:
                 from . import d1_memory as _mem
                 _mem.save_server_state("ping_state", data)
@@ -202,6 +241,7 @@ class PingController:
 
     def note_human_activity(self, channel_id: str):
         """A human spoke in the channel — pings are working; reset streak."""
+        self._ensure_remote()
         if self._unanswered_pings.pop(channel_id, None) is not None:
             self._save_state()
 
@@ -232,6 +272,7 @@ class PingController:
 
     def can_ping_here(self, channel_id: str) -> bool:
         """Check if @here can be used in this channel."""
+        self._ensure_remote()
         if self._mass_ping_blocked(channel_id):
             return False
         if self._any_ping_recently(channel_id):
@@ -252,6 +293,7 @@ class PingController:
 
     def can_ping_everyone(self, channel_id: str) -> bool:
         """Check if @everyone can be used in this channel."""
+        self._ensure_remote()
         if self._mass_ping_blocked(channel_id):
             return False
         if self._any_ping_recently(channel_id):
@@ -272,6 +314,7 @@ class PingController:
 
     def can_ping_role(self, channel_id: str) -> bool:
         """Check if a role ping can be used in this channel."""
+        self._ensure_remote()
         if self._mass_ping_blocked(channel_id):
             return False
         if self._any_ping_recently(channel_id):
@@ -294,6 +337,7 @@ class PingController:
         """Check if a direct user ping can be used in this channel.
         User pings are lighter (one notification, one person) — they get a
         milder streak block (4 unanswered) and a smaller cooldown scale."""
+        self._ensure_remote()
         if self._unanswered(channel_id) >= 4:
             return False
         now = time.time()
@@ -319,6 +363,7 @@ class PingController:
 
     def record_here_ping(self, channel_id: str):
         """Record an @here ping."""
+        self._ensure_remote()
         if channel_id not in self._here_pings:
             self._here_pings[channel_id] = deque(maxlen=50)
         self._here_pings[channel_id].append(time.time())
@@ -328,6 +373,7 @@ class PingController:
 
     def record_everyone_ping(self, channel_id: str):
         """Record an @everyone ping."""
+        self._ensure_remote()
         if channel_id not in self._everyone_pings:
             self._everyone_pings[channel_id] = deque(maxlen=50)
         self._everyone_pings[channel_id].append(time.time())
@@ -337,6 +383,7 @@ class PingController:
 
     def record_role_ping(self, channel_id: str):
         """Record a role ping."""
+        self._ensure_remote()
         if channel_id not in self._role_pings:
             self._role_pings[channel_id] = deque(maxlen=50)
         self._role_pings[channel_id].append(time.time())
@@ -346,6 +393,7 @@ class PingController:
 
     def record_user_ping(self, channel_id: str, user_id: int = None):
         """Record a direct user ping."""
+        self._ensure_remote()
         if channel_id not in self._user_pings:
             self._user_pings[channel_id] = deque(maxlen=50)
         self._user_pings[channel_id].append(time.time())
@@ -359,12 +407,14 @@ class PingController:
     def recently_pinged(self, channel_id: str) -> set:
         """User ids pinged within the repeat-cooldown window — exclude them
         from the next selection so the same person isn't pinged twice in a row."""
+        self._ensure_remote()
         now = time.time()
         return {uid for uid, ts in self._recently_pinged.get(channel_id, ())
                 if now - ts < self._ping_repeat_s}
 
     def reset_daily(self):
         """Reset daily counters (call at midnight)."""
+        self._ensure_remote()
         # Don't clear everything — weekly counters need to persist
         now = time.time()
         for tracker in [self._here_pings, self._role_pings, self._user_pings]:

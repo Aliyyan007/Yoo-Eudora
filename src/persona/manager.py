@@ -170,7 +170,10 @@ class PersonaSupervisor:
         saved_id = state.get("active")
         if saved_id and saved_id in {p.id for p in self._accounts}:
             elapsed = time.time() - float(state.get("activated_at", 0))
-            remaining = _window_seconds() - elapsed
+            # Subtract from the ORIGINAL rolled window — re-rolling here
+            # makes the resumed window randomly wrong (can even exceed it).
+            saved_window = float(state.get("window_s") or 0)
+            remaining = (saved_window or _window_seconds()) - elapsed
             if remaining < _RESUME_MIN_REMAINING_S:
                 remaining = 0.0     # window basically over — advance
                 seq += 1
@@ -191,7 +194,8 @@ class PersonaSupervisor:
             profile = self._next(seq)
             window = remaining if remaining > 0 else _window_seconds()
             remaining = 0.0
-            runtime.save_rotation_state(profile.id, time.time(), seq)
+            runtime.save_rotation_state(profile.id, time.time(), seq,
+                                        window_s=window)
             logger.info(
                 f"[persona] rotating → {profile.full_name} "
                 f"(window ~{window/60:.0f}min, seq {seq})")

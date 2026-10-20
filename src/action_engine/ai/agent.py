@@ -56,9 +56,10 @@ class Agent:
         self.pool = get_pool()
         self.max_rounds = settings.max_tool_rounds
         # Tools are built per-mode (chat mode uses a reduced set to stay
-        # under free-tier TPM limits). We cache the full set here and
-        # build the chat subset on demand.
-        self._tools_full = build_tools("command")
+        # under free-tier TPM limits). The full set is built LAZILY — the
+        # bridge only ever runs chat/voice modes, so building ~110 schema
+        # dicts per request for unused command/event modes is pure churn.
+        self._tools_full: list[dict] | None = None
         self._tools_chat = build_tools("chat")
         # Chat mode: max 5 tool rounds (vs 8 for command mode) to save tokens
         # but allow multi-action requests like "send 5 gifs and 5 stickers".
@@ -161,6 +162,8 @@ class Agent:
             max_rounds = self._chat_max_rounds
             extra = {"reasoning_effort": "low"}
         else:
+            if self._tools_full is None:
+                self._tools_full = build_tools("command")
             tools = self._tools_full
             model = settings.groq_model_text
             max_rounds = self.max_rounds
@@ -264,10 +267,16 @@ class Agent:
             for tc in msg.tool_calls:
                 name = tc.function.name
                 try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError as e:
+                    raw_args = tc.function.arguments
+                    if isinstance(raw_args, dict):
+                        args = raw_args
+                    else:
+                        args = json.loads(raw_args or "{}")
+                except (json.JSONDecodeError, TypeError) as e:
                     args = {}
                     logger.warning(f"Bad tool args for {name}: {e}")
+                if not isinstance(args, dict):
+                    args = {}
                 # Dedupe identical calls within one run — the model sometimes
                 # re-fires the same send (double-pings/double-greetings).
                 dedup_key = (name, json.dumps(args, sort_keys=True, default=str))

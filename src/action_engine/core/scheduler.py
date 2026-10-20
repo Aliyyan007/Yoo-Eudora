@@ -42,6 +42,9 @@ class Scheduler:
         self.tasks: dict[str, dict] = {}
         self._job: asyncio.Task | None = None
         self._stopping = False
+        # In-flight _run() tasks — tracked so stop()/rotation can cancel
+        # them instead of letting sends fire on a dead client.
+        self._run_tasks: set[asyncio.Task] = set()
 
     # ---------------- persistence ---------------- #
     def _load(self) -> None:
@@ -81,6 +84,15 @@ class Scheduler:
                 await self._job
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+            self._job = None
+        # Kill in-flight task runs — they hold a reference to the bot
+        # client and would keep sending on a dead connection otherwise.
+        pending = [t for t in self._run_tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._run_tasks.clear()
 
     # ---------------- api ---------------- #
     def add(self, task: dict) -> str:
@@ -116,7 +128,9 @@ class Scheduler:
             if not due:
                 continue
             for t in due:
-                asyncio.create_task(self._run(t))
+                rt = asyncio.create_task(self._run(t))
+                self._run_tasks.add(rt)
+                rt.add_done_callback(self._run_tasks.discard)
                 if t.get("interval_s"):
                     t["run_at"] = now + t["interval_s"]
                 else:

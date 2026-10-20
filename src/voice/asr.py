@@ -78,7 +78,7 @@ class StreamingASR:
                 if StreamingASR._recognizer_cache[self._repo] is None:
                     raise RuntimeError(f"ASR model '{self._repo}' failed to load previously — not retrying")
             logger.info(f"Loading sherpa-onnx streaming ASR ({self._repo})...")
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _load():
                 from pathlib import Path
@@ -136,13 +136,11 @@ class StreamingASR:
 
     async def feed_audio(self, pcm_48k_mono: bytes) -> None:
         """Feed 48kHz mono PCM audio. Resamples to 16k internally."""
-        if self._resampler:
-            pcm16 = self._resampler.feed(pcm_48k_mono)
-        else:
-            # Manual resample 48k → 16k (simple decimation by 3)
-            import struct
-            samples = struct.unpack(f'<{len(pcm_48k_mono)//2}h', pcm_48k_mono)
-            pcm16 = b''.join(struct.pack('<h', samples[i]) for i in range(0, len(samples), 3))
+        # _resampler is only None if the local ._resampler import itself
+        # failed — feeding raw 48k as 16k would be garbage anyway, so skip.
+        if self._resampler is None:
+            return
+        pcm16 = self._resampler.feed(pcm_48k_mono)
 
         if not pcm16:
             return
@@ -160,7 +158,7 @@ class StreamingASR:
         stream, recognizer = self._stream, self._recognizer
         if stream is None:
             return
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while True:
             async with self._infer_lock():
                 def _run(buf=samples):
@@ -196,7 +194,7 @@ class StreamingASR:
 
         pending = self._pending
         async with self._infer_lock():
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _finalize():
                 if len(pending):

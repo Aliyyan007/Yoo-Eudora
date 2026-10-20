@@ -105,10 +105,15 @@ async def discover_channels(guild: discord.Guild) -> List[discord.TextChannel]:
     """
     me = guild.me
     speakable = []
+    loop = asyncio.get_running_loop()
     for channel in guild.text_channels:
         if can_speak_in(channel, me):
             speakable.append(channel)
-            mem.mark_channel_seen(str(channel.id), channel.name, str(guild.id))
+            # mem.* is a sync call that can block up to ~30s on a dead D1 —
+            # never run it on the event loop
+            await loop.run_in_executor(
+                None, mem.mark_channel_seen,
+                str(channel.id), channel.name, str(guild.id))
     logger.info(f"Discovered {len(speakable)} speakable channels in '{guild.name}'")
     return speakable
 
@@ -159,9 +164,14 @@ async def learn_channel_style(channel: discord.TextChannel, max_messages: int = 
             return ""
 
         transcript = "\n".join(transcript_lines[-30:])
-        style = ai_reply.extract_channel_style(transcript)
+        loop = asyncio.get_running_loop()
+        # extract_channel_style / mem.* are sync (LLM call + D1 round-trip) —
+        # keep them off the event loop
+        style = await loop.run_in_executor(
+            None, ai_reply.extract_channel_style, transcript)
         if style:
-            mem.update_channel_style(str(channel.id), style)
+            await loop.run_in_executor(
+                None, mem.update_channel_style, str(channel.id), style)
             logger.info(f"Learned style for #{channel.name}: {style[:60]}...")
         return style
     except Exception as e:
@@ -187,9 +197,12 @@ async def learn_channel_topic(channel: discord.TextChannel, max_messages: int = 
             return ""
 
         transcript = "\n".join(transcript_lines[-30:])
-        topic = ai_reply.extract_channel_topic(transcript)
+        loop = asyncio.get_running_loop()
+        topic = await loop.run_in_executor(
+            None, ai_reply.extract_channel_topic, transcript)
         if topic:
-            mem.update_channel_topic(str(channel.id), topic)
+            await loop.run_in_executor(
+                None, mem.update_channel_topic, str(channel.id), topic)
             logger.info(f"Learned topic for #{channel.name}: {topic}")
         return topic
     except Exception as e:

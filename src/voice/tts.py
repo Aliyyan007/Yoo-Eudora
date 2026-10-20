@@ -44,22 +44,32 @@ class FishAudioTTS:
 
     async def open(self) -> None:
         """Open a TTS stream session."""
+        # Validate BEFORE connecting — a missing voice_id used to raise
+        # after the ws was already open, leaking the socket.
+        voice_id = self._cfg.voice_id
+        if not voice_id:
+            raise ValueError("No voice_id configured for Fish Audio TTS")
+
         url = f"{self._cfg.base_url.rstrip('/')}/v1/tts/live"
         headers = {
             "Authorization": f"Bearer {self._cfg.api_key}",
             "model": self._cfg.model,
         }
         try:
-            self._ws = await asyncio.wait_for(
-                websockets.connect(url, additional_headers=headers),
-                timeout=self._cfg.connect_timeout,
-            )
+            try:
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(url, additional_headers=headers),
+                    timeout=self._cfg.connect_timeout,
+                )
+            except TypeError:
+                # websockets < 14 used extra_headers= — retry with the old
+                # kwarg so a stale install doesn't silently kill TTS.
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(url, extra_headers=headers),
+                    timeout=self._cfg.connect_timeout,
+                )
         except (asyncio.TimeoutError, OSError, websockets.WebSocketException) as e:
             raise ConnectionError(f"Fish Audio connect failed: {e}") from e
-
-        voice_id = self._cfg.voice_id
-        if not voice_id:
-            raise ValueError("No voice_id configured for Fish Audio TTS")
 
         request_body = {
             "text": "",
@@ -181,4 +191,16 @@ class FishAudioTTS:
         await self._packet_queue.put(None)
 
     def is_open(self) -> bool:
-        return self._ws is not None and not self._ws.closed
+        ws = self._ws
+        if ws is None:
+            return False
+        # websockets>=14 (new asyncio impl) exposes a .state enum; the legacy
+        # protocol had .closed — check whichever attribute exists so this
+        # doesn't raise AttributeError on newer installs.
+        state = getattr(ws, "state", None)
+        if state is not None:
+            return state.name == "OPEN"
+        closed = getattr(ws, "closed", None)
+        if closed is not None:
+            return not closed
+        return True

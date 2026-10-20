@@ -18,6 +18,13 @@ from src.action_engine.utils.fuzzy import fuzzy_search
 from src.action_engine.utils.logger import logger
 
 
+# vc_manager.join_vc returns a human string — failure markers inside it
+# ("can't join that vc, don't have perms bruv", "couldn't join the vc,
+# something went wrong") are the only failure signal it gives.
+_VC_FAIL_RE = re.compile(
+    r"can'?t|couldn'?t|won'?t|went wrong|failed|perms", re.I)
+
+
 async def _resolve_voice_channel(ctx: ToolContext, query: str):
     """Resolve a voice/stage channel from a query (fuzzy or ID)."""
     guild = ctx.require_guild()
@@ -124,8 +131,20 @@ async def join_voice(ctx: ToolContext, channel_query: str, self_mute: bool = Fal
         if vm is not None:
             ok = await vm.join_vc(ctx.bot, ch, asyncio.get_running_loop())
         else:
-            ok = bool(await ctx.bot.vc_manager.join_vc(
-                ctx.bot, ch.guild, ch, ch.guild.me, ch))
+            # Legacy vc_manager path returns a STRING — always truthy, so
+            # bool() lied about failures. Check the text for failure
+            # markers instead.
+            res = await ctx.bot.vc_manager.join_vc(
+                ctx.bot, ch.guild, ch, ch.guild.me, ch)
+            ok = isinstance(res, str) and not _VC_FAIL_RE.search(res)
+            if ok:
+                # ...and it connects self_muted. An explicit "join the vc"
+                # action means joining able to talk — unmute to match.
+                try:
+                    await ch.guild.change_voice_state(
+                        channel=ch, self_mute=False, self_deaf=False)
+                except Exception:  # noqa: BLE001
+                    pass
         if not ok:
             return {"error": "Voice connect failed (host voice manager)."}
     except discord.ClientException as e:
@@ -144,10 +163,25 @@ async def leave_voice(ctx: ToolContext, **_extra) -> dict:
 
 async def say_in_vc(ctx: ToolContext, text: str) -> dict:
     """Speak a line out loud in the current voice channel via TTS —
-    delegated to the host bot's voice pipeline."""
-    guild_id = ctx.guild.id if ctx.guild else 0
-    if not guild_id and ctx.bot.voice_clients:
-        guild_id = ctx.bot.voice_clients[0].guild.id
+    delegated to the host bot's voice pipeline. Owner-only (bridge gate)."""
+    # Scope the voice connection to the request's guild — voice_clients[0]
+    # can be a DIFFERENT guild's call on multi-guild accounts.
+    vcs = list(getattr(ctx.bot, "voice_clients", []) or [])
+    vc = None
+    if ctx.guild is not None:
+        vc = next(
+            (v for v in vcs
+             if getattr(v, "guild", None) is not None
+             and v.guild.id == ctx.guild.id),
+            None,
+        )
+    elif len(vcs) == 1:
+        vc = vcs[0]
+    guild_id = (ctx.guild.id if ctx.guild else 0) or (
+        vc.guild.id
+        if vc is not None and getattr(vc, "guild", None) is not None
+        else 0
+    )
     vm = getattr(ctx.bot, "voice_manager", None)
     pipeline = getattr(vm, "_pipelines", {}).get(guild_id) if vm else None
     if pipeline is None:

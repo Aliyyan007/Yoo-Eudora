@@ -24,8 +24,13 @@ def _load() -> dict:
 
 
 def _save(p: dict) -> None:
+    """Atomic write — tmp file + replace, same as core/scheduler.py.
+    A direct write can leave a truncated prefs.json if the process dies
+    mid-write."""
     STORE.parent.mkdir(parents=True, exist_ok=True)
-    STORE.write_text(json.dumps(p, indent=1))
+    tmp = STORE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(p, indent=1))
+    tmp.replace(STORE)
 
 
 def get_pref(key: str, default=None):

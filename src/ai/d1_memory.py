@@ -98,6 +98,7 @@ def _run_async(coro):
 
 _cache: Dict[str, tuple] = {}  # key -> (value, timestamp)
 _CACHE_TTL = 300  # 5 minutes
+_CACHE_MAX = 512  # bound the dict — unread entries otherwise grow forever
 
 
 def _cache_get(key: str):
@@ -110,6 +111,11 @@ def _cache_get(key: str):
 
 
 def _cache_set(key: str, value):
+    if len(_cache) >= _CACHE_MAX:
+        # LRU-ish trim: evict the oldest quarter when full
+        ordered = sorted(_cache.items(), key=lambda kv: kv[1][1])
+        for k, _ in ordered[: _CACHE_MAX // 4]:
+            _cache.pop(k, None)
     _cache[key] = (value, time.time())
 
 
@@ -118,6 +124,14 @@ def _cache_invalidate(key: Optional[str] = None):
         _cache.pop(key, None)
     else:
         _cache.clear()
+
+
+def _cache_invalidate_prefix(prefix: str):
+    """Drop every cached key starting with `prefix` — callers that only know
+    the user/channel part of a composite key (e.g. user_memory_text:{uid}:)
+    can't exact-match the full key."""
+    for k in [k for k in _cache if k.startswith(prefix)]:
+        _cache.pop(k, None)
 
 
 # ── Fact contradiction detection (copied verbatim from memory.py) ─────────────
@@ -293,12 +307,16 @@ async def update_user_memory_async(user_id: str, username: str, new_facts: list)
                 existing_facts.append(fact)
                 existing_set.add(fact)
 
-        # Enforce cap at 20: if we have more than 20, drop oldest.
+        # Enforce cap at 20 total: drop oldest DB rows AND skip inserting
+        # new facts that would land past the cap (a >20-fact batch used to
+        # insert everything because only pre-existing rows were evicted).
         if len(existing_facts) > 20:
             overflow = existing_facts[: len(existing_facts) - 20]
+            overflow_set = set(overflow)
             for of in overflow:
                 if of in existing_ids:
                     to_delete_ids.append(existing_ids[of])
+            to_add = [f for f in to_add if f not in overflow_set]
             existing_facts = existing_facts[-20:]
 
         # Apply deletions.
@@ -321,7 +339,7 @@ async def update_user_memory_async(user_id: str, username: str, new_facts: list)
             except Exception as e:
                 logger.debug(f"Fact insert skipped ({fact}): {e}")
 
-        _cache_invalidate(f"user_memory_text:{user_id}:")
+        _cache_invalidate_prefix(f"user_memory_text:{user_id}:")
         logger.debug(f"Memory updated for {username}: {new_facts}")
     except Exception as e:
         logger.warning(f"D1 update_user_memory failed: {e}")
@@ -416,7 +434,7 @@ async def update_user_profile_async(user_id: str, username: str, field: str, val
                 [value, time.time(), user_id],
             )
 
-        _cache_invalidate(f"user_memory_text:{user_id}:")
+        _cache_invalidate_prefix(f"user_memory_text:{user_id}:")
         _cache_invalidate(f"user_profile:{user_id}")
         _cache_invalidate(f"user_facts:{user_id}")
         logger.info(f"User profile updated: {username}.{field} = {value[:60]}")
@@ -717,7 +735,7 @@ async def add_memorable_chat_async(user_id: str, username: str, chat_summary: st
         )
         _cache_invalidate(f"user_profile:{user_id}")
         _cache_invalidate(f"user_facts:{user_id}")
-        _cache_invalidate(f"user_memory_text:{user_id}:")
+        _cache_invalidate_prefix(f"user_memory_text:{user_id}:")
     except Exception as e:
         logger.warning(f"D1 add_memorable_chat failed: {e}")
         return _json_fallback.add_memorable_chat(user_id, username, chat_summary, channel_id)
@@ -1154,9 +1172,9 @@ async def sweep_stale_memory_async(max_age_days: int = 60) -> dict:
                        ("instructions", "timestamp"),
                        ("discovered_channels", "last_seen")):
         try:
-            res = await client.execute_write(
+            # execute_write returns rows affected (D1 meta.changes)
+            stats[table] = await client.execute_write(
                 f"DELETE FROM {table} WHERE {col} < ?", [cutoff])
-            stats[table] = getattr(res, "rows_affected", None) or 0
         except Exception as e:
             logger.debug(f"D1 sweep {table} failed: {e}")
     return stats

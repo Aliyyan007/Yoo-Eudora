@@ -59,7 +59,7 @@ class WhisperTwoPass:
                 self._model = cached
                 return
             logger.info(f"[whisper] Loading faster-whisper ({self._model_size}, {self._device}/{self._compute_type})...")
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _load():
                 from faster_whisper import WhisperModel
@@ -96,7 +96,7 @@ class WhisperTwoPass:
             return None
 
         async with WhisperTwoPass._infer_lock:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             t0 = time.time()
 
             def _transcribe():

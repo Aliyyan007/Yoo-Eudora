@@ -48,24 +48,35 @@ class EngagementEngine:
         self.ACTIVITY_MAX = 50          # max messages in window
 
         self._started = False
+        self._running = False
         self._decay_task = None
 
     def start(self):
         """Start the background decay loop."""
         if not self._started:
             import asyncio
-            self._started = True
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(self._decay_loop())
             except RuntimeError:
                 # No event loop yet — will be started later
-                self._started = False
+                return
+            self._started = True
+            self._running = True
+            self._decay_task = loop.create_task(self._decay_loop())
+
+    def stop(self):
+        """Cancel the decay loop — rotation calls this during teardown so a
+        dead persona's task doesn't keep running forever."""
+        self._running = False
+        self._started = False
+        task, self._decay_task = self._decay_task, None
+        if task is not None:
+            task.cancel()
 
     async def _decay_loop(self):
         """Background task that decays willingness over time."""
         import asyncio
-        while True:
+        while self._running:
             await asyncio.sleep(self.DECAY_INTERVAL)
             with self._lock:
                 now = time.time()

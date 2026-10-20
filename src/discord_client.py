@@ -10,7 +10,7 @@ import random
 import asyncio
 import time
 from collections import deque
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 from loguru import logger
 import discord
 
@@ -323,6 +323,12 @@ def _static_headers_context():
     )
 
 
+async def _noop():
+    """Placeholder for _spawn calls made after teardown — returns a
+    finished task shape without doing work on a dead client."""
+    return None
+
+
 class AIPersonaClient(discord.Client):
     """
     The main AI persona Discord client.
@@ -425,9 +431,6 @@ class AIPersonaClient(discord.Client):
         # Backoff: when told to go away / not talked to, stop replying for 10 min
         self.backoff_until: dict = {}      # channel_id -> timestamp when backoff ends
 
-        # Reaction dedup
-        self.recent_reactions: dict = {}   # channel_id -> deque of last 3 emoji
-
         # Channel activity tracking (for proactive messaging)
         self.last_activity: dict = {}      # channel_id -> timestamp
 
@@ -436,13 +439,11 @@ class AIPersonaClient(discord.Client):
         # Set when we reply, lasts 2 minutes. Keeps conversations flowing naturally
         # without creating a feedback loop where the bot answers everything.
         self.sticky_until: dict = {}      # channel_id -> timestamp
-        STICKY_DURATION_S = 120           # 2 minutes (was 5 min — too aggressive)
 
         # Multi-user conversation tracker: channel_id -> {user_id -> last_bot_interaction_ts}
         # Tracks when the bot last interacted with each specific user per channel.
         # Used to ensure the bot replies to users it pinged (even after sticky expires).
         self.conversation_tracker: Dict[str, Dict[str, float]] = {}
-        CONVERSATION_TRACKER_EXPIRY_S = 600  # 10 minutes (was 30 min — too long)
 
         # Wind-down state: per-channel per-user session streak (their msg
         # count in the current burst, resets after 45min silence), a small
@@ -527,6 +528,15 @@ class AIPersonaClient(discord.Client):
         # Long-lived tasks spawned for this activation — cancelled on
         # teardown so rotation never leaves loops running on a dead client
         self._spawned_tasks: list = []
+        # Named background loops (scan/status/re-engage/voice/...). on_ready
+        # can fire again on gateway resume — keyed tracking makes respawn
+        # idempotent AND self-healing when a loop dies unexpectedly.
+        self._loop_tasks: Dict[str, asyncio.Task] = {}
+        # Imperative-command cooldown ("ping @x" spam protection):
+        # (channel_id, user_id) -> last accepted timestamp
+        self._imperative_last: Dict[str, float] = {}
+        # Per-message flag cache — bounded so it can't grow per message id
+        self._msg_flags: Dict[int, dict] = {}
 
     # ── Daily cap management ───────────────────────────────────────────────
 
@@ -538,6 +548,13 @@ class AIPersonaClient(discord.Client):
             self.daily_count_ch.clear()
             self.daily_count_global = 0
             self.daily_reset_day = today
+            # Feature daily counters die at their cap without this — their
+            # reset_daily methods existed but were never wired anywhere.
+            try:
+                from .ai.reactions import reset_daily_counters
+                reset_daily_counters()
+            except Exception:
+                pass
             logger.info("Daily message counters reset")
 
     def can_send(self, ch_id: str) -> bool:
@@ -615,6 +632,11 @@ class AIPersonaClient(discord.Client):
         loops never leak onto a closed client. A done-callback logs any
         task that dies unexpectedly — silent task death is invisible
         otherwise (e.g. a bump scheduler that stopped looping for good)."""
+        if getattr(self, "_torn_down", False):
+            # Teardown already ran — a trailing event (late gateway echo,
+            # queued reply) must not spawn fresh work on a dead client.
+            t = asyncio.create_task(_noop())
+            return t
         t = asyncio.create_task(coro)
         self._spawned_tasks.append(t)
         def _on_done(task):
@@ -629,9 +651,55 @@ class AIPersonaClient(discord.Client):
         t.add_done_callback(_on_done)
         return t
 
+    def _ensure_loop(self, name: str, coro) -> asyncio.Task:
+        """Spawn a named loop only if it isn't already running — on_ready
+        can fire again on gateway resume, so unguarded _spawn()s would
+        duplicate every background loop. Also self-healing: a loop that
+        died (done + exception logged by _spawn) gets respawned."""
+        t = self._loop_tasks.get(name)
+        if t is not None and not t.done():
+            return t
+        self._loop_tasks[name] = self._spawn(coro)
+        return self._loop_tasks[name]
+
+    async def _offloop(self, fn, *args):
+        """Run a blocking call (sync D1/memory/LLM wrappers) on the default
+        executor — calling them directly on the loop stalls heartbeats for
+        seconds at a time (each does real HTTP on a background loop)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: fn(*args))
+
     async def teardown(self):
         """Cancel this persona's long-lived tasks before client.close().
         Called by the rotation supervisor before the next account connects."""
+        self._torn_down = True
+        # Per-client engines with their own loops — stop before task cancel
+        try:
+            self.engagement.stop()
+        except Exception:
+            pass
+        # Action worker jobs queued under THIS client must not fire on it
+        # after close — the worker survives rotation (rebinds to the next
+        # client), its queued work must not.
+        try:
+            from .ai.action_bridge import get_action_worker
+            worker = get_action_worker(self)
+            if worker is not None:
+                res = worker.cancel_for_client(self)
+                if asyncio.iscoroutine(res):
+                    await res
+        except Exception:
+            pass
+        # Flush relationship stats — the 120s write-behind window otherwise
+        # loses the tail of every activation's social data.
+        try:
+            flush = getattr(relationship, "flush_all", None)
+            if flush:
+                res = flush()
+                if asyncio.iscoroutine(res):
+                    await res
+        except Exception:
+            pass
         for t in self._spawned_tasks:
             t.cancel()
         for t in self._spawned_tasks:
@@ -681,13 +749,18 @@ class AIPersonaClient(discord.Client):
             _bio = self.persona.bio or ""
             _display_name = self.persona.full_name or self.persona.name
 
-            # Update display name (global name) and bio
-            if _bio or _display_name:
+            # Update display name (global name) and bio. Only include fields
+            # that have values — the lib's "unset" sentinel is MISSING; an
+            # Ellipsis is truthy and lands in the payload, breaking the whole
+            # edit (both fields lost).
+            _edit_kwargs = {}
+            if _display_name:
+                _edit_kwargs["global_name"] = _display_name
+            if _bio:
+                _edit_kwargs["bio"] = _bio
+            if _edit_kwargs:
                 try:
-                    await self.user.edit(
-                        global_name=_display_name if _display_name else ...,
-                        bio=_bio if _bio else ...,
-                    )
+                    await self.user.edit(**_edit_kwargs)
                     logger.info(f"Profile updated: name={_display_name}, bio={len(_bio)} chars")
                 except Exception as e:
                     logger.warning(f"Could not edit profile (may need password): {e}")
@@ -731,25 +804,30 @@ class AIPersonaClient(discord.Client):
         for guild in self.guilds:
             self._spawn(scan_guild(guild, self.rules_cache))
 
-        # Start proactive messaging
+        # Start proactive messaging (idempotent across READY refires)
         if self.proactive_messenger:
-            self._spawn(self.proactive_messenger.start_monitoring())
-            self._spawn(self.proactive_messenger.proactive_loop())
+            self._ensure_loop("proactive-monitor",
+                              self.proactive_messenger.start_monitoring())
+            self._ensure_loop("proactive-loop",
+                              self.proactive_messenger.proactive_loop())
 
         # Start periodic status/bio updates
-        self._spawn(self._status_update_loop())
+        self._ensure_loop("status-updates", self._status_update_loop())
 
         # Start re-engagement loop (check if no one replied to bot's messages)
-        self._spawn(self._re_engagement_loop())
+        self._ensure_loop("re-engagement", self._re_engagement_loop())
 
         # Daily stale-memory sweep — bounds the context DB across time
-        self._spawn(self._memory_gc_loop())
+        self._ensure_loop("memory-gc", self._memory_gc_loop())
 
         # Bump scheduler — spawned HERE, not at build time: its start()
         # awaits wait_until_ready(), which raises RuntimeError on an
         # un-initialised client (killed it ~0.2s after every activation).
-        # The guard prevents double-spawn if on_ready fires again (resume).
-        if self.bump_scheduler and not self.bump_scheduler._running:
+        # The guard prevents double-spawn if on_ready fires again (resume),
+        # and _user_stopped (set by the stop_bumping command) survives it —
+        # a gateway resume must not resurrect a user-stopped scheduler.
+        if (self.bump_scheduler and not self.bump_scheduler._running
+                and not getattr(self.bump_scheduler, "_user_stopped", False)):
             self._spawn(self.bump_scheduler.start())
 
         # ── Initialize voice manager (real-time voice conversation) ────────
@@ -762,20 +840,25 @@ class AIPersonaClient(discord.Client):
                 or os.getenv("FISH_AUDIO_VOICE_ID", "")
             )
             if fish_api_key and fish_voice_id and VoiceManager is not None:
-                tts_config = TTSConfig(
-                    api_key=fish_api_key,
-                    voice_id=fish_voice_id,
-                    model=os.getenv("FISH_AUDIO_MODEL", "s2.1-pro-free"),
-                )
-                self.voice_manager = VoiceManager(
-                    tts_config=tts_config,
-                    on_transcript=self._handle_voice_transcript,
-                    bot_id=self.user.id,
-                    on_transcript_stream=self._stream_voice_transcript,
-                    persona_gender=self.persona.gender,
-                )
-                self._spawn(self.voice_manager.monitor_vcs(self))
-                logger.info("Voice manager initialized (Fish Audio TTS + VAD + ASR)")
+                # READY refires on gateway resume — recreating the manager
+                # would orphan the old one with live pipelines + spawn a
+                # duplicate monitor loop. Init once per client lifetime.
+                if self.voice_manager is None:
+                    tts_config = TTSConfig(
+                        api_key=fish_api_key,
+                        voice_id=fish_voice_id,
+                        model=os.getenv("FISH_AUDIO_MODEL", "s2.1-pro-free"),
+                    )
+                    self.voice_manager = VoiceManager(
+                        tts_config=tts_config,
+                        on_transcript=self._handle_voice_transcript,
+                        bot_id=self.user.id,
+                        on_transcript_stream=self._stream_voice_transcript,
+                        persona_gender=self.persona.gender,
+                    )
+                    logger.info("Voice manager initialized (Fish Audio TTS + VAD + ASR)")
+                self._ensure_loop("voice-monitor",
+                                  self.voice_manager.monitor_vcs(self))
             else:
                 if VoiceManager is None:
                     logger.warning(f"Voice dependencies unavailable — voice disabled ({_VOICE_IMPORT_ERROR})")
@@ -789,6 +872,10 @@ class AIPersonaClient(discord.Client):
             from .persona import runtime as _prt
             _prt.register_self(self.user.id, self.user.display_name)
             get_engagement_log().register_own_ids(_prt.own_user_ids())
+            # The legacy VC manager is a process-level singleton — its
+            # told_shy/current_vc state from the previous account must not
+            # leak into this activation.
+            self.vc_manager.reset_for_new_client()
             if not self._pending_processed:
                 self._pending_processed = True
                 self._spawn(self._process_pending_interactions())
@@ -994,6 +1081,15 @@ class AIPersonaClient(discord.Client):
                                     f"{it.get('author_name', '?')} ({int(age_s // 60)}m old)")
                                 continue
                             await asyncio.sleep(random.uniform(3, 8))
+                            # The original id was appended to processed_msgs
+                            # when the message first arrived (before it was
+                            # deferred) — replaying through _on_message_impl
+                            # would hit the dedup check and drop silently.
+                            # Evict it so the replay is actually processed.
+                            try:
+                                self.processed_msgs.remove(msg.id)
+                            except ValueError:
+                                pass
                             await self._on_message_impl(msg)
                             logger.info(
                                 f"[deferred] answered {it['author_name']}'s "
@@ -1310,45 +1406,6 @@ class AIPersonaClient(discord.Client):
             logger.error(f"Voice transcript handler error: {e}")
             return ""
 
-    async def _speak_voice_greeting(self, guild_id: int) -> None:
-        """Speak a greeting when the bot joins a voice channel."""
-        try:
-            if not self.voice_manager:
-                return
-            pipeline = self.voice_manager._pipelines.get(guild_id)
-            if not pipeline:
-                return
-
-            # Find who's in the call
-            other_names = []
-            for vc in self.voice_clients:
-                if vc.guild.id == guild_id and vc.channel:
-                    other_names = [m.display_name for m in vc.channel.members if not m.bot]
-                    break
-
-            if not other_names:
-                # Generic greeting
-                greeting = "hey, just hopped in. what's everyone up to?"
-            elif len(other_names) == 1:
-                name = other_names[0]
-                greetings = [
-                    f"hey {name}, how are you doing?",
-                    f"oh hey {name}, what's going on?",
-                    f"hi {name}! how's your day been?",
-                    f"yo {name}, what are you up to?",
-                    f"hey {name}, how are you?",
-                ]
-                import random
-                greeting = random.choice(greetings)
-            else:
-                names_str = ", ".join(other_names[:3])
-                greeting = f"hey everyone, {names_str}. what are we talking about?"
-
-            logger.info(f"[voice] Speaking greeting: {greeting}")
-            await pipeline._speak(greeting)
-        except Exception as e:
-            logger.error(f"[voice] Greeting error: {e}")
-
     async def on_voice_state_update(self, member, before, after):
         """Handle voice state changes — users joining/leaving/muting in VCs."""
         # Skip for bots
@@ -1460,8 +1517,8 @@ class AIPersonaClient(discord.Client):
 
                         # Generate re-engagement message (in executor to not block).
                         # Fresh topic only — a stale one fixates on dead convos.
-                        topic = mem.get_channel_topic_fresh(ch_id)
                         loop = asyncio.get_running_loop()
+                        topic = await self._offloop(mem.get_channel_topic_fresh, ch_id)
                         msg = await loop.run_in_executor(
                             None, lambda: ai_reply.generate_proactive_message(
                                 topic, for_user=getattr(pinged_user, "display_name", None))
@@ -1473,13 +1530,15 @@ class AIPersonaClient(discord.Client):
                             ])
                         msg = ping_prefix + msg
 
-                        # Apply ping bookkeeping for the chosen action
+                        # Apply ping bookkeeping for the chosen action —
+                        # record_* hits the D1-backed state store (sync)
                         if action == "everyone":
-                            ping_ctrl.record_everyone_ping(ch_id)
+                            await self._offloop(ping_ctrl.record_everyone_ping, ch_id)
                         elif action == "here":
-                            ping_ctrl.record_here_ping(ch_id)
+                            await self._offloop(ping_ctrl.record_here_ping, ch_id)
                         elif pinged_user:
-                            ping_ctrl.record_user_ping(ch_id, user_id=pinged_user.id)
+                            await self._offloop(
+                                ping_ctrl.record_user_ping, ch_id, pinged_user.id)
                             # Track conversation with this user
                             if ch_id not in self.conversation_tracker:
                                 self.conversation_tracker[ch_id] = {}
@@ -1522,6 +1581,8 @@ class AIPersonaClient(discord.Client):
 
     async def on_message(self, message: discord.Message):
         """Main message handler — decides whether and how to respond."""
+        if getattr(self, "_torn_down", False):
+            return   # post-teardown dispatch — client is dead
         try:
             await self._on_message_impl(message)
         except Exception as e:
@@ -1640,22 +1701,30 @@ class AIPersonaClient(discord.Client):
             except Exception:
                 pass
             # If message is high-value, extract potential facts immediately
+            # and store them off-loop (sync D1/memory writes block the loop).
             if should_store_message(message.content):
                 potential_facts = extract_potential_facts(message.content)
                 if potential_facts:
                     logger.debug(f"High-value msg from {message.author.name}: {potential_facts}")
+                    self._spawn(self._offloop(
+                        mem.update_user_memory,
+                        str(message.author.id), message.author.name,
+                        potential_facts))
 
             # ── Track unanswered questions ────────────────────────────────
             # If this message contains a question, track it so the bot can
             # answer it later (e.g., if the bot missed it and then gets mentioned)
             if is_question(message.content):
                 self.unanswered_tracker.record_question(
-                    ch_id, message.content, message.author.display_name, message.id
+                    ch_id, message.content, message.author.display_name,
+                    message.id, author_id=message.author.id
                 )
 
             # ── Re-engagement tracking ────────────────────────────────────
-            # Record that a human replied (so we don't re-engage unnecessarily)
-            get_re_engagement_tracker().record_human_reply(ch_id)
+            # Record that a human replied (so we don't re-engage
+            # unnecessarily) — D1-backed save must not stall the loop
+            self._spawn(self._offloop(
+                get_re_engagement_tracker().record_human_reply, ch_id))
             # A human spoke — engagement worked / pause lifted
             get_engagement_log().mark_interaction(ch_id)
 
@@ -1686,15 +1755,15 @@ class AIPersonaClient(discord.Client):
                 is_new_participant = (user_msgs_in_cache <= 1 and active_users_count < 8)
                 # Returning user = check if they spoke in the last hour by looking at a wider window
                 is_returning_user = is_new_participant  # Simplified: treat all new participants as potentially returning
-                if not hasattr(self, '_msg_flags'):
-                    self._msg_flags = {}
+                # Bounded — one entry per message id, evict oldest past 500
+                if len(self._msg_flags) > 500:
+                    for _k in list(self._msg_flags.keys())[:250]:
+                        self._msg_flags.pop(_k, None)
                 self._msg_flags[message.id] = {
                     'is_new_participant': is_new_participant,
                     'is_returning_user': is_returning_user,
                 }
             except Exception:
-                if not hasattr(self, '_msg_flags'):
-                    self._msg_flags = {}
                 self._msg_flags[message.id] = {
                     'is_new_participant': False,
                     'is_returning_user': False,
@@ -1775,11 +1844,18 @@ class AIPersonaClient(discord.Client):
                         await message.add_reaction(emoji)
                     except Exception:
                         pass
-                asyncio.create_task(_silent_react())
-            # Daily-cap drop on a DIRECTED message (every "daily-cap" reason is
-            # post-directed-gate — mention/reply/name/dm). Queue it so the user
-            # still gets answered once the counter resets instead of silence.
-            if "daily-cap" in respond_reason and message.guild is not None:
+                self._spawn(_silent_react())
+            # Daily-cap drop on a DIRECTED message gets queued so the user
+            # still gets answered once the counter resets. Directed caps all
+            # carry a prefix (mention-daily-cap, reply-daily-cap, ...) — the
+            # bare "daily-cap" reason comes from the random-participation
+            # gate, i.e. an ambient message that never earned a reply; those
+            # must NOT be deferred (or every ambient drop queues a reply).
+            _is_dm = isinstance(message.channel,
+                                (discord.DMChannel, discord.GroupChannel))
+            _directed_cap = "daily-cap" in respond_reason and (
+                respond_reason != "daily-cap" or _is_dm)
+            if _directed_cap and message.guild is not None:
                 try:
                     from .persona import runtime as _prt
                     _prt.add_deferred(
@@ -1812,10 +1888,16 @@ class AIPersonaClient(discord.Client):
 
         try:
             await self._handle_reply(message, ch_id)
-            # Process any messages that arrived while we were typing
-            await self._process_pending_messages(ch_id)
         finally:
             self._sending_in_channel.discard(ch_id)
+            # Drain in finally too — if _handle_reply raised, the queue
+            # would otherwise stay non-empty forever: every later message
+            # hits the pending-check and queues → channel wedged silent.
+            try:
+                await self._process_pending_messages(ch_id)
+            except Exception as e:
+                logger.warning(f"Pending drain failed in {ch_id}: {e}")
+                self._pending_messages.pop(ch_id, None)
 
     def _reply_to_us(self, message: discord.Message, ch_id: str) -> bool:
         """True if the message is a reply-reference to one of OUR messages."""
@@ -1853,7 +1935,9 @@ class AIPersonaClient(discord.Client):
                 await self._handle_reply(msg, ch_id)
             except Exception as e:
                 logger.warning(f"Error processing pending message: {e}")
-                break
+                continue  # one bad message must not wedge the rest of the queue
+        if not pending:
+            self._pending_messages.pop(ch_id, None)
 
     def _should_respond(self, message: discord.Message) -> tuple:
         """Determine if and why we should respond to a message.
@@ -1953,6 +2037,13 @@ class AIPersonaClient(discord.Client):
                     txt_low):
                 if not self.can_send(ch_id):
                     return False, "imperative-daily-cap"
+                # Rate-limit imperatives — "ping @x" spam otherwise earns a
+                # reply + a queued action every single time.
+                _imp_key = f"{ch_id}:{message.author.id}"
+                _last_imp = self._imperative_last.get(_imp_key, 0)
+                if time.time() - _last_imp < 15:
+                    return False, "imperative-cooldown"
+                self._imperative_last[_imp_key] = time.time()
                 return True, "imperative-with-target"
             # Message is addressed to another user, not us
             return False, "addressed-to-other-user (mention)"
@@ -2270,8 +2361,21 @@ class AIPersonaClient(discord.Client):
             # But NOT if the greeting is followed by another user's name
             # (e.g. "hey @daniel" or "hi john" — that's for someone else)
             if is_greeting(message.content):
-                if mentions_others:
-                    return False, "greeting-for-other-user"
+                # "hey bob" / "hi daniel" — a greeting followed by another
+                # member's name is addressed to THEM, not us (the
+                # @-mention variant already got caught upstream).
+                _gtail = re.sub(
+                    r"^\W*(?:hi+|hello+|hey+a?|hiya|yo+|sup|hii+)\b[\s,!.]*",
+                    "", txt_low).strip()
+                if _gtail:
+                    _names = {
+                        (m.display_name or m.name or "").lower()
+                        for m in message.channel.guild.members
+                        if not m.bot and m != self.user
+                    }
+                    _first = _gtail.split()[0] if _gtail.split() else ""
+                    if _first in _names or _gtail in _names:
+                        return False, "greeting-for-other-user"
                 return True, "greeting-detected"
 
             # Check channel nature — skip random participation in utility channels
@@ -2462,7 +2566,7 @@ class AIPersonaClient(discord.Client):
             # Join the VC the user is in
             logger.info(f"VC: Joining '{user_vc.name}' (user {username} is in it)")
             if self.voice_manager:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 success = await self.voice_manager.join_vc(self, user_vc, loop)
                 if success:
                     await message.channel.send(f"hopping in {user_vc.name} 🎧 can hear u now")
@@ -2506,12 +2610,29 @@ class AIPersonaClient(discord.Client):
             ]))
             return
 
-        if len(active_vcs) == 1:
-            # Only one active VC — join it directly
-            vc_channel, members = active_vcs[0]
-            logger.info(f"VC: Joining '{vc_channel.name}' (only active VC, {len(members)} members)")
+        # "join the gaming vc" — resolve a named VC before falling back to
+        # the which-one question. Without this the user names a channel and
+        # still gets asked "which vc?" — the dead-end the audit flagged.
+        chosen = None
+        if len(active_vcs) > 1:
+            _txt = (message.clean_content or "").lower()
+            for vc_ch, _m in active_vcs:
+                if vc_ch.name.lower() in _txt:
+                    chosen = (vc_ch, _m)
+                    break
+            if chosen is None:
+                _words = [w for w in re.findall(r"\w+", _txt) if len(w) >= 4]
+                for vc_ch, _m in active_vcs:
+                    if any(w in vc_ch.name.lower() for w in _words):
+                        chosen = (vc_ch, _m)
+                        break
+
+        if len(active_vcs) == 1 or chosen is not None:
+            # Only one active VC (or a named one resolved) — join it directly
+            vc_channel, members = chosen or active_vcs[0]
+            logger.info(f"VC: Joining '{vc_channel.name}' (resolved, {len(members)} members)")
             if self.voice_manager:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 success = await self.voice_manager.join_vc(self, vc_channel, loop)
                 if success:
                     await message.channel.send(f"hopping in {vc_channel.name} 🎧 can hear u now")
@@ -2560,37 +2681,69 @@ class AIPersonaClient(discord.Client):
             await message.channel.send(result["message"])
             logger.info(f"Mention: user '{target_name}' not found (requested by {requester_name})")
 
-    async def _handle_command(self, cmd_type: str, params: dict, message: discord.Message, ch_id: str):
+    # Commands that DO something (send pings, call APIs, change behavior) —
+    # owner-only. A random chatter must not fire /bump, ping members, join
+    # the bot to VC, or tune its speed. Memory commands (set_name, remember…)
+    # only affect the speaker's own profile, so they stay open to everyone.
+    _ACTION_CMDS = {
+        "bump_server", "bump_with", "stop_bumping", "join_vc", "leave_vc",
+        "mention_user", "mention_user_id", "start_chat", "stop_pinging",
+        "ping_after_hours", "speed_up", "slow_down",
+    }
+
+    async def _handle_command(self, cmd_type: str, params: dict, message: discord.Message, ch_id: str) -> bool:
         """Handle a detected command from the user.
 
         This runs BEFORE the AI reply generation, so:
         - Action commands (bump, stop pinging) are executed immediately
         - Memory commands (set name, remember) store data for future use
         - The AI still generates a conversational reply acknowledging the action
+
+        Returns True when something was actually executed/stored — callers
+        use it to decide whether the "[COMMAND DETECTED — already handled]"
+        transcript note is honest.
         """
         user_id = str(message.author.id)
         username = message.author.name
 
+        # Non-owner firing an action command → don't execute, don't claim
+        # it was handled. The non-owner pushback context fires downstream.
+        if cmd_type in self._ACTION_CMDS and not is_owner(message.author.id):
+            logger.info(f"Non-owner {username} command '{cmd_type}' ignored")
+            return False
+
+        # Owner instructions persist for prompt context — what owners asked
+        # shapes later replies ("don't ping chat" stays remembered).
+        if cmd_type in self._ACTION_CMDS or cmd_type == "remember":
+            try:
+                get_owner_tracker().record_instruction(
+                    user_id, f"{cmd_type}: {(message.clean_content or '')[:100]}")
+            except Exception:
+                pass
+
         try:
             if cmd_type == "bump_server" or cmd_type == "bump_with":
-                # Trigger an immediate bump batch
+                # Trigger an immediate bump batch — bump_with targets a
+                # specific bot by name, bump_server bumps all of them
                 if hasattr(self, 'bump_scheduler') and self.bump_scheduler:
-                    logger.info(f"Command: bumping servers (requested by {username})")
-                    asyncio.create_task(self.bump_scheduler._perform_bump_batch())
+                    target = params.get("bot_name") if cmd_type == "bump_with" else None
+                    logger.info(f"Command: bumping {target or 'all bots'} (requested by {username})")
+                    self._spawn(self.bump_scheduler._perform_bump_batch(target_name=target))
                 else:
                     logger.warning("Bump scheduler not available for command")
 
             elif cmd_type == "stop_bumping":
-                # Stop the automatic bump scheduler
+                # Stop the automatic bump scheduler — _user_stopped survives
+                # READY refires so a gateway resume doesn't resurrect it.
                 if hasattr(self, 'bump_scheduler') and self.bump_scheduler:
+                    self.bump_scheduler._user_stopped = True
                     self.bump_scheduler._running = False
                     logger.info(f"Command: stopped bump scheduler (requested by {username})")
-                mem.add_instruction(user_id, "stop bumping servers", ch_id)
+                await self._offloop(mem.add_instruction, user_id, "stop bumping servers", ch_id)
 
             elif cmd_type == "join_vc":
                 # Join a voice channel — algorithmic VC detection
-                task = asyncio.create_task(self._handle_vc_join(message, user_id, username))
-                task.add_done_callback(self._log_task_error)
+                self._spawn(self._handle_vc_join(message, user_id, username))
 
             elif cmd_type == "leave_vc":
                 # Leave the current voice channel — silently (no text
@@ -2607,37 +2760,38 @@ class AIPersonaClient(discord.Client):
                 target_name = params.get("target") or params.get("name") or ""
                 start_chat = (cmd_type == "start_chat")
                 if target_name:
-                    asyncio.create_task(self._handle_mention_request(message, target_name, start_chat, username))
+                    self._spawn(self._handle_mention_request(message, target_name, start_chat, username))
                 else:
-                    logger.warning(f"Mention command but no target name extracted from: {trigger_text[:50]}")
+                    logger.warning(f"Mention command but no target extracted from: {(message.clean_content or '')[:50]}")
 
             elif cmd_type == "stop_pinging":
-                # Store instruction to stop pinging
-                mem.add_instruction(user_id, "stop pinging chat revive role", ch_id)
+                # Store instruction to stop pinging — pings_enabled gates
+                # ALL ping types (role/@here/user), not just auto-chat.
+                await self._offloop(mem.add_instruction, user_id, "stop pinging chat revive role", ch_id)
                 if self.proactive_messenger:
-                    self.proactive_messenger.auto_chat_chance = 0
+                    self.proactive_messenger.pings_enabled = False
                     logger.info("Command: chat revive pings disabled")
 
             elif cmd_type == "ping_after_hours":
                 hours = params.get("hours", 16)
-                mem.add_instruction(user_id, f"only ping after {hours} hours", ch_id)
+                await self._offloop(mem.add_instruction, user_id, f"only ping after {hours} hours", ch_id)
                 if self.proactive_messenger:
-                    # Set the dead chat threshold to the specified hours
-                    self.proactive_messenger.dead_threshold_mins = hours * 60
+                    # dead_chat_threshold is in SECONDS (min*60 at init)
+                    self.proactive_messenger.dead_chat_threshold = hours * 3600
                     logger.info(f"Command: ping threshold set to {hours} hours")
 
             elif cmd_type == "set_name":
                 name = params.get("name", "")
                 if name:
                     # Get old name before updating (for logging)
-                    old_profile = mem.get_user_profile(user_id)
+                    old_profile = await self._offloop(mem.get_user_profile, user_id)
                     old_name = old_profile.get("real_name", "")
 
                     # Update profile (replaces old name automatically)
-                    mem.update_user_profile(user_id, username, "real_name", name)
+                    await self._offloop(mem.update_user_profile, user_id, username, "real_name", name)
 
                     # Update facts (algorithmic replacement removes old name fact)
-                    mem.update_user_memory(user_id, username, [f"their real name is {name}"])
+                    await self._offloop(mem.update_user_memory, user_id, username, [f"their real name is {name}"])
 
                     if old_name and old_name.lower() != name.lower():
                         logger.info(f"Command: name updated '{old_name}' -> '{name}' for {username}")
@@ -2647,25 +2801,43 @@ class AIPersonaClient(discord.Client):
             elif cmd_type == "set_hobby":
                 hobby = params.get("hobby", "")
                 if hobby:
-                    mem.update_user_profile(user_id, username, "hobbies", hobby)
+                    await self._offloop(mem.update_user_profile, user_id, username, "hobbies", hobby)
                     logger.info(f"Command: stored hobby '{hobby}' for {username}")
 
             elif cmd_type == "set_personality":
                 personality = params.get("personality", "")
                 if personality:
-                    mem.update_user_profile(user_id, username, "personality", personality)
+                    await self._offloop(mem.update_user_profile, user_id, username, "personality", personality)
                     logger.info(f"Command: stored personality for {username}")
 
             elif cmd_type == "set_location":
                 location = params.get("location", "")
                 if location:
-                    mem.update_user_memory(user_id, username, [f"from {location}"])
+                    await self._offloop(mem.update_user_memory, user_id, username, [f"from {location}"])
                     logger.info(f"Command: stored location '{location}' for {username}")
+
+            elif cmd_type == "set_age":
+                age = params.get("age") or params.get("fact") or ""
+                if not age:
+                    # detect_command captures the number in group(1) of the
+                    # phrase match — params may carry it under either key
+                    import re as _re
+                    m = _re.search(r"(\d+)", message.clean_content or "")
+                    age = m.group(1) if m else ""
+                if age:
+                    await self._offloop(mem.update_user_memory, user_id, username, [f"they're {age} years old"])
+                    logger.info(f"Command: stored age {age} for {username}")
+
+            elif cmd_type in ("recall_name", "recall_all"):
+                # Recall is answered by the model using the memory context —
+                # nothing to execute. Return False so no fake "handled" note
+                # is injected; the reply still generates normally.
+                return False
 
             elif cmd_type == "remember":
                 fact = params.get("fact", "")
                 if fact:
-                    mem.update_user_memory(user_id, username, [fact])
+                    await self._offloop(mem.update_user_memory, user_id, username, [fact])
                     logger.info(f"Command: stored fact for {username}: {fact[:60]}")
 
             elif cmd_type == "speed_up":
@@ -2677,8 +2849,10 @@ class AIPersonaClient(discord.Client):
                 self._speed_multiplier = 1.5  # 50% slower
                 logger.info("Command: slow down responses")
 
+            return True
         except Exception as e:
             logger.warning(f"Command handling failed for {cmd_type}: {e}")
+            return False
 
     async def _handle_reply(self, message: discord.Message, ch_id: str):
         """Generate and send a reply to a message."""
@@ -2710,7 +2884,15 @@ class AIPersonaClient(discord.Client):
                 await asyncio.sleep(min(len(abuse_response) * 0.05, 2.0))
             sent = await message.channel.send(abuse_response)
             self.last_replied[ch_id] = time.time()
+            self.last_sent[ch_id] = abuse_response
             self.record_send(ch_id)
+            # Mirror the normal send bookkeeping — without sticky/convo
+            # windows their follow-up hits the reply gate cold and reads
+            # as the bot "forgetting" it just pushed back.
+            self.sticky_until[ch_id] = time.time() + 120
+            _au = str(message.author.id)
+            self.conversation_tracker.setdefault(ch_id, {})[_au] = time.time()
+            get_re_engagement_tracker().record_bot_message(ch_id)
             if ch_id not in self.history_cache:
                 self.history_cache[ch_id] = deque(maxlen=40)
             self.history_cache[ch_id].append(sent)
@@ -2742,7 +2924,12 @@ class AIPersonaClient(discord.Client):
             logger.debug(f"Late message detected (age: {int(msg_age)}s, since last reply: {int(since_last_reply)}s) — adding {late_delay:.1f}s delay")
 
         notif_delay = 0
-        if self.user in message.mentions or is_dm or message.reference is not None:
+        # A reply-reference to SOMEONE ELSE'S message isn't a notification
+        # for us — only ping/DM/reply-to-OUR-message gets the "opening app
+        # on ping" beat.
+        if (self.user in message.mentions or is_dm
+                or (message.reference is not None
+                    and self._reply_to_us(message, ch_id))):
             notif_delay = random.uniform(2.5, 6.0) * combined_modifier  # Opening app on ping
 
         # Reading time scales with the message's actual length — a human
@@ -2762,7 +2949,8 @@ class AIPersonaClient(discord.Client):
             # Build transcript from the TTL-based message cache
             # Smart context: 4 messages + all messages from the same user
             # within the last 10 minutes (so the bot sees the full burst flow)
-            transcript = self.msg_cache.get_context_text(ch_id, count=8)
+            transcript = self.msg_cache.get_context_text(
+                ch_id, count=8, own_ids={self.user.id})
 
             # Also get reactions from the discord history cache (for vibe)
             ctx_msgs = list(self.history_cache.get(ch_id, []))[-10:]
@@ -2816,12 +3004,14 @@ class AIPersonaClient(discord.Client):
                 cmd_params = {}
 
             if cmd_type:
-                await self._handle_command(cmd_type, cmd_params, message, ch_id)
+                cmd_handled = await self._handle_command(cmd_type, cmd_params, message, ch_id)
                 # Leave commands produce no text at all — the disconnect is
                 # the only acknowledgment. Skip the LLM reply path entirely
                 # (otherwise [COMMAND DETECTED] generates a second message).
-                if cmd_type == "leave_vc":
+                if cmd_type == "leave_vc" and cmd_handled:
                     return
+                if not cmd_handled:
+                    cmd_type = None  # refused/no-op — don't inject a fake "handled" note
 
             # ── Scan recent messages for unexecuted commands ────────────────
             # When the bot is mentioned, check if there were commands in recent
@@ -2844,8 +3034,9 @@ class AIPersonaClient(discord.Client):
                     recent_cmd, recent_params = detect_command(recent_msg.content)
                     if recent_cmd and recent_cmd in ("mention_user", "mention_user_id", "join_vc", "leave_vc", "start_chat"):
                         logger.info(f"Found unexecuted command '{recent_cmd}' in recent message: '{recent_msg.content[:50]}'")
-                        await self._handle_command(recent_cmd, recent_params, message, ch_id)
-                        cmd_type = recent_cmd  # Mark as handled
+                        if await self._handle_command(recent_cmd, recent_params, message, ch_id):
+                            cmd_type = recent_cmd  # Mark as handled
+                            cmd_handled = True
                         break
 
             # ── Outsider action worker ────────────────────────────────────
@@ -2859,7 +3050,9 @@ class AIPersonaClient(discord.Client):
             if not cmd_type:
                 try:
                     worker = get_action_worker(self)
-                    classified = await worker.classify_request(trigger_text, author_id=message.author.id)
+                    classified = await worker.classify_request(
+                        trigger_text, author_id=message.author.id,
+                        channel_id=message.channel.id)
                     if classified and classified[0] == "exec":
                         # Reply FIRST, then the action runs in the background
                         # after a human-like delay — like a person saying
@@ -2881,16 +3074,18 @@ class AIPersonaClient(discord.Client):
                 rules_text = await fetch_guild_rules(message.channel.guild, self.rules_cache)
 
             recent_replies = list(self.reply_history.get(ch_id, []))
-            channel_topic = mem.get_channel_topic(ch_id)
-            channel_style = mem.get_channel_style(ch_id)
-            channel_lessons = mem.get_channel_lessons(ch_id)
+            channel_topic, channel_style, channel_lessons = await asyncio.gather(
+                self._offloop(mem.get_channel_topic, ch_id),
+                self._offloop(mem.get_channel_style, ch_id),
+                self._offloop(mem.get_channel_lessons, ch_id),
+            )
             ch_name = getattr(message.channel, 'name', '') or ''
 
             # ── Channel nature analysis (24h cache, 20 msgs first, 5 msgs refresh) ──
             channel_nature = get_cached_nature(ch_id)
             if channel_nature is None and hasattr(message.channel, 'guild') and message.channel.guild:
                 # Analyze in background (don't block the reply)
-                asyncio.create_task(analyze_channel_nature(message.channel))
+                self._spawn(analyze_channel_nature(message.channel))
                 channel_nature = "general"  # Default while analyzing
             if channel_nature and channel_nature != "general":
                 nature_summary = get_nature_summary(channel_nature)
@@ -2900,11 +3095,10 @@ class AIPersonaClient(discord.Client):
             discord_topic = getattr(message.channel, 'topic', '') or ''
 
             # ── User memory: everything we know about this user ────────────
-            user_memory_text = mem.get_user_memory_text(user_id, username)
-            user_facts_detail = mem.get_all_user_facts(user_id)
+            user_facts_detail = await self._offloop(mem.get_all_user_facts, user_id)
 
             # ── Active instructions from users ─────────────────────────────
-            instructions_text = mem.get_instructions_text()
+            instructions_text = await self._offloop(mem.get_instructions_text)
 
             # Build list of mentioned users (excluding the bot) for context
             mentioned_other_names = [
@@ -2925,7 +3119,8 @@ class AIPersonaClient(discord.Client):
             # persona calibrates familiarity (no teasing strangers, no
             # re-greeting close friends)
             try:
-                rel_line = relationship.describe(user_id, owner=is_owner(message.author.id))
+                rel_line = await self._offloop(
+                    relationship.describe, user_id, is_owner(message.author.id))
                 if detect_loneliness(message.content) or sentiment == "sad":
                     rel_line += " they may be looking for connection — be warm, not jokey."
                 if rel_line:
@@ -3031,14 +3226,18 @@ class AIPersonaClient(discord.Client):
                     transcript = owner_instructions + "\n" + transcript
                 # Record owner interaction
                 get_owner_tracker().record_interaction(user_id)
-            elif detect_command_attempt(trigger_text):
-                # Non-owner trying to command the bot — add pushback context
+            elif detect_command_attempt(trigger_text) and not cmd_handled:
+                # Non-owner trying to command the bot — add pushback context.
+                # Handled safe-commands (set_name/remember/etc.) are not
+                # "attempts" — they ran, so no pushback note.
                 non_owner_context = get_non_owner_command_context(username)
                 transcript = non_owner_context + "\n" + transcript
                 logger.info(f"Non-owner {username} attempted command: {trigger_text[:50]}")
 
-            # Add command context if a command was detected
-            if cmd_type:
+            # Add command context only when the command actually executed —
+            # a refused (non-owner) or no-op command must not get an
+            # "already handled" note or the model claims it did something.
+            if cmd_type and cmd_handled:
                 transcript = f"[COMMAND DETECTED: {cmd_type} — already handled, acknowledge naturally]\n" + transcript
 
             # Action worker coordination: info lookups already ran (facts are
@@ -3278,10 +3477,14 @@ class AIPersonaClient(discord.Client):
                         is_mention=(self.user in message.mentions),
                         mood=self.mood_engine.current_mood,
                         channel_id=ch_id,
+                        record=False,
                     )
                     if algo_emoji:
                         try:
                             await message.add_reaction(algo_emoji)
+                            # Charge the cap only on a landed reaction —
+                            # a failed add_reaction must not burn the slot.
+                            get_tracker().record_reaction(ch_id, algo_emoji)
                             logger.debug(f"Reacted (algorithm): {algo_emoji}")
                         except Exception as e:
                             logger.debug(f"Algorithm reaction failed: {e}")
@@ -3345,8 +3548,10 @@ class AIPersonaClient(discord.Client):
                 self.record_send(ch_id)
                 self.engagement.on_sent(ch_id)
 
-                # Mark unanswered questions as answered (we just replied)
-                self.unanswered_tracker.mark_answered(ch_id)
+                # Mark THIS user's unanswered questions answered — wiping
+                # the whole channel deque would drop other people's pending
+                # questions we never addressed.
+                self.unanswered_tracker.mark_answered(ch_id, user_id)
 
                 # Record bot message for re-engagement tracking
                 get_re_engagement_tracker().record_bot_message(ch_id)
@@ -3394,6 +3599,12 @@ class AIPersonaClient(discord.Client):
                             time.time() + _WRAP_QUIET_S
                         # The streak resets — we've closed this conversation
                         self._convo_streak.get(ch_id, {}).pop(user_id, None)
+                        # After wrapping up, sometimes stay "afk" a while —
+                        # the gate ignores ambient lines but mentions still
+                        # break it. A real person doesn't instantly re-open
+                        # the chat they just closed.
+                        if random.random() < 0.25:
+                            self.afk_until[ch_id] = time.time() + random.uniform(1800, 5400)
                         logger.debug(f"[wrap] closed long convo with {username} — quiet for {_WRAP_QUIET_S}s")
                     except Exception:
                         pass
@@ -3404,11 +3615,13 @@ class AIPersonaClient(discord.Client):
                 if sticker_mgr.should_send_sticker(message.content, ch_id):
                     if hasattr(message.channel, 'guild') and message.channel.guild:
                         sticker = sticker_mgr.select_sticker(
-                            message.channel.guild, message.content, ch_id
+                            message.channel.guild, message.content, ch_id,
+                            record=False,
                         )
                         if sticker:
                             try:
                                 await message.channel.send(stickers=[sticker])
+                                sticker_mgr.record_sticker(ch_id, sticker.id)
                                 logger.info(f"Sent sticker: {sticker.name}")
                             except Exception as e:
                                 logger.debug(f"Sticker send failed: {e}")
@@ -3469,12 +3682,12 @@ class AIPersonaClient(discord.Client):
                 # Background web search if needed
                 if search_query and str(search_query).strip() not in ("null", "None", ""):
                     query_clean = str(search_query).strip()[:120]
-                    asyncio.create_task(self._do_background_search(
+                    self._spawn(self._do_background_search(
                         message.channel, transcript, username, user_id, query_clean, ch_id
                     ))
 
                 # Background memory/analysis (very low chance to save tokens)
-                asyncio.create_task(self._background_analysis(
+                self._spawn(self._background_analysis(
                     transcript, username, user_id, ch_id
                 ))
             else:
@@ -3486,11 +3699,23 @@ class AIPersonaClient(discord.Client):
             else:
                 logger.error(f"Error processing reply: {e}")
 
+    def _is_stale_self(self) -> bool:
+        """True when this client instance is no longer the active persona —
+        background work (memory writes, sends) captured at spawn time must
+        not execute under a rotated-in account's namespace/session."""
+        try:
+            from .persona import runtime as _prt
+            return _prt.active().id != self.persona.id
+        except Exception:
+            return False
+
     async def _do_background_search(self, channel, prompt: str, username: str,
                                      user_id: str, query: str, ch_id: str):
         """Run a web search in the background and send an informed follow-up."""
         try:
             await asyncio.sleep(random.uniform(3.0, 8.0))
+            if self._is_stale_self():
+                return
             loop = asyncio.get_running_loop()
             search_result = await loop.run_in_executor(None, web_search.search, query)
             if not search_result:
@@ -3521,6 +3746,9 @@ class AIPersonaClient(discord.Client):
         """Run memory extraction and channel analysis in background (low chance)."""
         try:
             await asyncio.sleep(random.uniform(5, 12))
+            if self._is_stale_self():
+                return  # rotation happened mid-sleep — writes would land
+                # in the NEW persona's namespace, not the one that heard it
             loop = asyncio.get_running_loop()
 
             # Memory extraction (2% chance) — only for high-value messages
@@ -3531,7 +3759,7 @@ class AIPersonaClient(discord.Client):
                         None, lambda: ai_reply.extract_memory(transcript, username)
                     )
                     if new_facts:
-                        mem.update_user_memory(user_id, username, new_facts)
+                        await self._offloop(mem.update_user_memory, user_id, username, new_facts)
 
             # Channel topic update (0.5% chance)
             if random.random() < 0.005:
@@ -3539,7 +3767,7 @@ class AIPersonaClient(discord.Client):
                     None, lambda: ai_reply.extract_channel_topic(transcript)
                 )
                 if topic:
-                    mem.update_channel_topic(ch_id, topic)
+                    await self._offloop(mem.update_channel_topic, ch_id, topic)
 
             # Channel style update (0.5% chance)
             if random.random() < 0.005:
@@ -3547,7 +3775,7 @@ class AIPersonaClient(discord.Client):
                     None, lambda: ai_reply.extract_channel_style(transcript)
                 )
                 if style:
-                    mem.update_channel_style(ch_id, style)
+                    await self._offloop(mem.update_channel_style, ch_id, style)
 
             # Self-reflection (1% chance)
             if random.random() < 0.01:
@@ -3568,6 +3796,12 @@ class AIPersonaClient(discord.Client):
             channel = self.get_channel(payload.channel_id)
             if channel is None:
                 return
+            # Roll BEFORE the REST call — fetch_message is one API request
+            # per reaction in visible channels; on busy servers that's
+            # pure rate-limit exposure for a path that exits 80% of the time.
+            if random.random() > 0.20:
+                return
+
             message = await channel.fetch_message(payload.message_id)
             if message.author != self.user:
                 return
@@ -3579,9 +3813,6 @@ class AIPersonaClient(discord.Client):
             POSITIVE_RX = {"👍", "❤️", "😂", "💀", "🔥", "😭", "💯", "W", "✅", "❤", "😍", "🤣", "😆"}
             NEGATIVE_RX = {"👎", "😒", "🙄", "💔", "❌", "🤦"}
 
-            # 20% chance to react back or respond
-            if random.random() > 0.20:
-                return
             if not self.can_send(ch_id):
                 return
 

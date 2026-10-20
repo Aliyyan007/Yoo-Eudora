@@ -9,7 +9,9 @@ Key design: the `channel_query` accepts:
 """
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 
 import discord
 
@@ -23,6 +25,40 @@ from src.action_engine.utils.logger import logger
 
 _BAD_MENTION = re.compile(r"<@[!&?]*([^0-9>\s][^>]*)>|<#([^0-9>\s][^>]*)>")
 
+# Channel types the bot can post text into — includes stage channels
+# (their text chat is messageable on discord.py-self).
+_TEXT_LIKE = (
+    discord.TextChannel,
+    discord.Thread,
+    discord.VoiceChannel,
+    discord.StageChannel,
+)
+
+
+# ------------------------------------------------------------------
+#  Slash-command list cache — application_commands() is heavily
+#  rate-limited, so bump/slash tools share a short per-channel TTL
+#  (mirrors BumpScheduler._get_bump_commands' 5-minute cache).
+# ------------------------------------------------------------------
+_APP_CMDS_TTL_S = 300
+_app_cmds_cache: dict[int, tuple[float, list]] = {}
+
+
+async def _application_commands(channel) -> list:
+    """Cached wrapper around channel.application_commands()."""
+    now = time.time()
+    hit = _app_cmds_cache.get(channel.id)
+    if hit and (now - hit[0]) < _APP_CMDS_TTL_S:
+        return hit[1]
+    cmds = await channel.application_commands()
+    _app_cmds_cache[channel.id] = (now, list(cmds or []))
+    return _app_cmds_cache[channel.id][1]
+
+
+def _invalidate_app_commands(channel) -> None:
+    """Drop the cached command list (a lookup missed — refetch next time)."""
+    _app_cmds_cache.pop(getattr(channel, "id", 0), None)
+
 
 def _sanitize_content(text: str) -> str:
     """The agent sometimes writes malformed mention syntax into `content`
@@ -35,36 +71,66 @@ def _sanitize_content(text: str) -> str:
         lambda m: (m.group(1) or m.group(2) or "").strip(), text)
 
 
+def _check_send_channel(ctx: ToolContext, ch) -> None:
+    """Gate a resolved send target through the host's channel policy.
+
+    Non-owner exec requests may NOT post into skip-channels (#bump,
+    #bot-commands, #rules, #mod-log, ...) or channels the account can't
+    actually speak in — the persona never talks there, a random user's
+    request shouldn't make it. Owner intent is explicit: owners can post
+    anywhere. Raises PermissionError when blocked (dispatch surfaces it
+    as a normal tool error)."""
+    if getattr(ctx, "is_owner", False):
+        return
+    try:
+        from src.channel_scanner import can_speak_in, is_skip_channel
+    except Exception:  # noqa: BLE001
+        return  # scanner unavailable — an HTTP error will surface anyway
+    name = getattr(ch, "name", "") or ""
+    if is_skip_channel(name):
+        raise PermissionError(
+            f"Can't post in #{name} — it's a restricted channel.")
+    guild = getattr(ch, "guild", None)
+    me = getattr(guild, "me", None) if guild else None
+    if me is not None and not can_speak_in(ch, me):
+        raise PermissionError(
+            f"Can't post in #{name} — no speak permission there.")
+
+
 async def _resolve_text_channel(ctx: ToolContext, query: str):
     """Resolve a text-like channel from a query string.
 
     Handles: 'here'/'this' (current channel), direct IDs, <#id> mentions,
-    and fuzzy name search.
+    and fuzzy name search. Resolved channels pass through the non-owner
+    send gate (_check_send_channel).
     """
     query_lower = query.strip().lower() if query else ""
+    ch = None
 
     # "here" / "this" → use the current channel the user is talking in.
     if query_lower in ("here", "this", "current"):
-        ch = ctx.get_current_channel()
-        if ch and isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-            return ch
+        cand = ctx.get_current_channel()
+        if cand and isinstance(cand, _TEXT_LIKE):
+            ch = cand
         # Fall through to fuzzy search if current channel not available.
 
     # Direct ID or <#id> mention.
-    ch = _try_direct_channel(ctx, query)
-    if ch and isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-        return ch
+    if ch is None:
+        cand = _try_direct_channel(ctx, query)
+        if cand and isinstance(cand, _TEXT_LIKE):
+            ch = cand
 
     # Fuzzy search.
-    guild = ctx.require_guild()
-    text_like = [
-        c for c in guild.channels
-        if isinstance(c, (discord.TextChannel, discord.Thread, discord.VoiceChannel))
-    ]
-    results = fuzzy_search(query, text_like, key=lambda c: c.name, limit=1)
-    if not results:
-        return None
-    return results[0].item
+    if ch is None:
+        guild = ctx.require_guild()
+        text_like = [c for c in guild.channels if isinstance(c, _TEXT_LIKE)]
+        results = fuzzy_search(query, text_like, key=lambda c: c.name, limit=1)
+        if not results:
+            return None
+        ch = results[0].item
+
+    _check_send_channel(ctx, ch)
+    return ch
 
 
 async def send_message(
@@ -229,6 +295,9 @@ async def delete_last_message(
                 deleted += 1
                 if deleted >= count:
                     break
+                # Bulk deletes on a user account rate-limit fast — pace
+                # them exactly like core/self_cleanup.py does.
+                await asyncio.sleep(1.2)
             except discord.HTTPException as e:
                 logger.warning(f"Delete failed: {e}")
                 break

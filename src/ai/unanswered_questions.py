@@ -87,13 +87,15 @@ class UnansweredQuestionTracker:
     """
 
     def __init__(self):
-        # channel_id -> list of (message_text, author_name, timestamp, message_id)
+        # channel_id -> deque of {"text", "author", "author_id", "ts", "id"}
         self._unanswered: Dict[str, deque] = {}
         # Question expiry: 5 minutes
         self._expiry_s = 300
 
-    def record_question(self, channel_id: str, text: str, author_name: str, message_id: int):
-        """Record a potential unanswered question."""
+    def record_question(self, channel_id: str, text: str, author_name: str,
+                        message_id: int, author_id=None):
+        """Record a potential unanswered question. `author_id` lets a later
+        mark_answered(ch_id, user_id=...) clear only that user's questions."""
         if not is_question(text):
             return
 
@@ -101,20 +103,45 @@ class UnansweredQuestionTracker:
             self._unanswered[channel_id] = deque(maxlen=10)
 
         # Don't add duplicates
-        for q_text, _, _, q_id in self._unanswered[channel_id]:
-            if q_id == message_id or q_text == text:
+        for q in self._unanswered[channel_id]:
+            if q["id"] == message_id or q["text"] == text:
                 return
 
-        self._unanswered[channel_id].append((text, author_name, time.time(), message_id))
+        self._unanswered[channel_id].append({
+            "text": text, "author": author_name,
+            "author_id": str(author_id) if author_id is not None else None,
+            "ts": time.time(), "id": message_id,
+        })
         logger.debug(f"Unanswered question tracked in #{channel_id}: '{text[:50]}' by {author_name}")
 
-    def mark_answered(self, channel_id: str):
-        """Mark all unanswered questions in a channel as answered (bot replied)."""
-        if channel_id in self._unanswered:
-            count = len(self._unanswered[channel_id])
-            self._unanswered[channel_id].clear()
+    def mark_answered(self, channel_id: str, user_id=None):
+        """Mark unanswered questions in a channel as answered (bot replied).
+
+        With `user_id`, only that user's pending questions are cleared —
+        replying to one person must not wipe everyone else's questions.
+        Without it, all pending questions clear (legacy behavior)."""
+        dq = self._unanswered.get(channel_id)
+        if not dq:
+            return
+        if user_id is None:
+            count = len(dq)
+            dq.clear()
             if count > 0:
                 logger.debug(f"Marked {count} questions as answered in #{channel_id}")
+            return
+        uid = str(user_id)
+        kept = deque(maxlen=10)
+        removed = 0
+        for q in dq:
+            # Entries without an author_id (recorded before the caller passed
+            # one) can't be attributed — keep them rather than wipe blindly.
+            if q.get("author_id") is not None and q["author_id"] == uid:
+                removed += 1
+            else:
+                kept.append(q)
+        self._unanswered[channel_id] = kept
+        if removed:
+            logger.debug(f"Marked {removed} questions as answered for {uid} in #{channel_id}")
 
     def get_unanswered_questions(self, channel_id: str, max_count: int = 3) -> List[Tuple[str, str]]:
         """
@@ -128,20 +155,18 @@ class UnansweredQuestionTracker:
 
         now = time.time()
         valid = []
-        expired = []
+        expired_ids = set()
 
-        for text, author, ts, msg_id in self._unanswered[channel_id]:
-            age = now - ts
-            if age > self._expiry_s:
-                expired.append((text, author, ts, msg_id))
+        for q in self._unanswered[channel_id]:
+            if now - q["ts"] > self._expiry_s:
+                expired_ids.add(q["id"])
             else:
-                valid.append((text, author))
+                valid.append((q["text"], q["author"]))
 
         # Remove expired
-        if expired:
+        if expired_ids:
             self._unanswered[channel_id] = deque(
-                [(t, a, ts, mid) for t, a, ts, mid in self._unanswered[channel_id]
-                 if (t, a, ts, mid) not in expired],
+                [q for q in self._unanswered[channel_id] if q["id"] not in expired_ids],
                 maxlen=10
             )
 

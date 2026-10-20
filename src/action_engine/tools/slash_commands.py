@@ -15,12 +15,13 @@ from src.action_engine.utils.fuzzy import fuzzy_search
 
 async def list_slash_commands(ctx: ToolContext, channel_query: str = "here") -> dict:
     """List all available slash commands in a channel."""
-    from src.action_engine.tools.messaging import _resolve_text_channel
+    from src.action_engine.tools.messaging import (
+        _application_commands, _resolve_text_channel)
     ch = await _resolve_text_channel(ctx, channel_query)
     if ch is None:
         return {"error": f"No channel matching '{channel_query}'."}
     try:
-        cmds = await ch.application_commands()
+        cmds = await _application_commands(ch)
     except Exception as e:  # noqa: BLE001
         return {"error": f"Failed to fetch slash commands: {e}"}
     result = []
@@ -85,12 +86,13 @@ async def use_slash_command(
             # Resolution blew up — don't silently run another bot's command.
             return {"error": f"Could not resolve bot '{bot_name}'."}
 
-    from src.action_engine.tools.messaging import _resolve_text_channel
+    from src.action_engine.tools.messaging import (
+        _application_commands, _invalidate_app_commands, _resolve_text_channel)
     ch = await _resolve_text_channel(ctx, channel_query)
     if ch is None:
         return {"error": f"No channel matching '{channel_query}'."}
     try:
-        cmds = await ch.application_commands()
+        cmds = await _application_commands(ch)
     except Exception as e:  # noqa: BLE001
         return {"error": f"Failed to fetch slash commands: {e}"}
 
@@ -109,6 +111,7 @@ async def use_slash_command(
         if cmd is None:
             # A specific bot was asked for — do NOT fall back to a same-name
             # command owned by a different bot (wrong bot = wrong action).
+            _invalidate_app_commands(ch)   # maybe stale — refetch next call
             available = {str(getattr(c, "application_id", "")): c.name for c in slash_cmds}
             return {"error": f"Bot '{bot_name or application_id}' has no "
                              f"'/{command_name}' command here.",
@@ -122,6 +125,7 @@ async def use_slash_command(
         if results:
             cmd = results[0].item
     if cmd is None:
+        _invalidate_app_commands(ch)   # maybe stale — refetch next call
         available = [c.name for c in slash_cmds]
         return {"error": f"No slash command '{command_name}'. Available: {available}"}
 

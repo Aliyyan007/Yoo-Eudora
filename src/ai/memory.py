@@ -7,6 +7,7 @@ All data is saved to data/memory.json with atomic writes.
 import os
 import json
 import time
+import threading
 from typing import Optional, List, Dict, Any
 from loguru import logger
 
@@ -18,6 +19,12 @@ _MEMORY_FILE = os.path.join(
 
 # In-memory cache of the loaded memory dict (invalidated on every write)
 _memory_cache = None
+
+# Serializes load-modify-save sequences — writers run on the D1-fallback bg
+# loop thread AND executor threads; without this, a last-writer-wins race
+# silently drops facts. RLock because public helpers nest (e.g.
+# add_memorable_chat -> update_user_profile).
+_LOCK = threading.RLock()
 
 
 def _invalidate_cache():
@@ -117,34 +124,35 @@ def update_user_memory(user_id: str, username: str, new_facts: list):
     """
     if not new_facts:
         return
-    memory = _load_memory()
-    if "users" not in memory:
-        memory["users"] = {}
-    if user_id not in memory["users"]:
-        memory["users"][user_id] = {"name": username, "facts": []}
+    with _LOCK:
+        memory = _load_memory()
+        if "users" not in memory:
+            memory["users"] = {}
+        if user_id not in memory["users"]:
+            memory["users"][user_id] = {"name": username, "facts": []}
 
-    existing_facts = memory["users"][user_id]["facts"]
-    existing_set = set(existing_facts)
+        existing_facts = memory["users"][user_id]["facts"]
+        existing_set = set(existing_facts)
 
-    for fact in new_facts:
-        fact = fact.strip()
-        if not fact:
-            continue
+        for fact in new_facts:
+            fact = fact.strip()
+            if not fact:
+                continue
 
-        # Check if this fact replaces an existing one
-        replaced = _find_contradicting_fact(fact, existing_facts)
-        if replaced:
-            # Remove the old contradicting fact — then still add the new
-            # one below (it IS the newer value; `elif` here used to drop it)
-            existing_facts = [f for f in existing_facts if f != replaced]
-            logger.info(f"Fact replaced: '{replaced}' -> '{fact}'")
-        if fact not in existing_set:
-            existing_facts.append(fact)
-            existing_set.add(fact)
+            # Check if this fact replaces an existing one
+            replaced = _find_contradicting_fact(fact, existing_facts)
+            if replaced:
+                # Remove the old contradicting fact — then still add the new
+                # one below (it IS the newer value; `elif` here used to drop it)
+                existing_facts = [f for f in existing_facts if f != replaced]
+                logger.info(f"Fact replaced: '{replaced}' -> '{fact}'")
+            if fact not in existing_set:
+                existing_facts.append(fact)
+                existing_set.add(fact)
 
-    memory["users"][user_id]["facts"] = existing_facts[-20:]
-    memory["users"][user_id]["last_seen"] = time.time()
-    _save_memory(memory)
+        memory["users"][user_id]["facts"] = existing_facts[-20:]
+        memory["users"][user_id]["last_seen"] = time.time()
+        _save_memory(memory)
     logger.debug(f"Memory updated for {username}: {new_facts}")
 
 
@@ -217,47 +225,48 @@ def update_user_profile(user_id: str, username: str, field: str, value: str):
     """
     if not value or not str(value).strip():
         return
-    memory = _load_memory()
-    if "users" not in memory:
-        memory["users"] = {}
-    if user_id not in memory["users"]:
-        memory["users"][user_id] = {"name": username, "facts": []}
+    with _LOCK:
+        memory = _load_memory()
+        if "users" not in memory:
+            memory["users"] = {}
+        if user_id not in memory["users"]:
+            memory["users"][user_id] = {"name": username, "facts": []}
 
-    value = str(value).strip()
-    if field == "hobbies":
-        if not isinstance(memory["users"][user_id].get("hobbies"), list):
-            memory["users"][user_id]["hobbies"] = []
-        # Split comma-separated hobbies
-        new_hobbies = [h.strip() for h in value.split(",") if h.strip()]
-        existing = set(memory["users"][user_id]["hobbies"])
-        for h in new_hobbies:
-            if h.lower() not in [e.lower() for e in existing]:
-                memory["users"][user_id]["hobbies"].append(h)
-        memory["users"][user_id]["hobbies"] = memory["users"][user_id]["hobbies"][-15:]
-    elif field == "memorable_chats":
-        if not isinstance(memory["users"][user_id].get("memorable_chats"), list):
-            memory["users"][user_id]["memorable_chats"] = []
-        memory["users"][user_id]["memorable_chats"].append({
-            "text": value,
-            "timestamp": time.time(),
-        })
-        # Cap at 10 memorable chats
-        memory["users"][user_id]["memorable_chats"] = \
-            memory["users"][user_id]["memorable_chats"][-10:]
-    else:
-        # REPLACES old value (for real_name, personality, relationship, etc.)
-        old_value = memory["users"][user_id].get(field, "")
-        if old_value and old_value.lower() != value.lower():
-            logger.info(f"Profile field '{field}' updated: '{old_value}' -> '{value}'")
-            # Also remove old fact that references the old value
-            facts = memory["users"][user_id].get("facts", [])
-            memory["users"][user_id]["facts"] = [
-                f for f in facts if old_value.lower() not in f.lower()
-            ]
-        memory["users"][user_id][field] = value
+        value = str(value).strip()
+        if field == "hobbies":
+            if not isinstance(memory["users"][user_id].get("hobbies"), list):
+                memory["users"][user_id]["hobbies"] = []
+            # Split comma-separated hobbies
+            new_hobbies = [h.strip() for h in value.split(",") if h.strip()]
+            existing = set(memory["users"][user_id]["hobbies"])
+            for h in new_hobbies:
+                if h.lower() not in [e.lower() for e in existing]:
+                    memory["users"][user_id]["hobbies"].append(h)
+            memory["users"][user_id]["hobbies"] = memory["users"][user_id]["hobbies"][-15:]
+        elif field == "memorable_chats":
+            if not isinstance(memory["users"][user_id].get("memorable_chats"), list):
+                memory["users"][user_id]["memorable_chats"] = []
+            memory["users"][user_id]["memorable_chats"].append({
+                "text": value,
+                "timestamp": time.time(),
+            })
+            # Cap at 10 memorable chats
+            memory["users"][user_id]["memorable_chats"] = \
+                memory["users"][user_id]["memorable_chats"][-10:]
+        else:
+            # REPLACES old value (for real_name, personality, relationship, etc.)
+            old_value = memory["users"][user_id].get(field, "")
+            if old_value and old_value.lower() != value.lower():
+                logger.info(f"Profile field '{field}' updated: '{old_value}' -> '{value}'")
+                # Also remove old fact that references the old value
+                facts = memory["users"][user_id].get("facts", [])
+                memory["users"][user_id]["facts"] = [
+                    f for f in facts if old_value.lower() not in f.lower()
+                ]
+            memory["users"][user_id][field] = value
 
-    memory["users"][user_id]["last_seen"] = time.time()
-    _save_memory(memory)
+        memory["users"][user_id]["last_seen"] = time.time()
+        _save_memory(memory)
     logger.info(f"User profile updated: {username}.{field} = {value[:60]}")
 
 
@@ -303,24 +312,25 @@ def add_instruction(user_id: str, instruction: str, channel_id: str = ""):
     """
     if not instruction or not str(instruction).strip():
         return
-    memory = _load_memory()
-    if "instructions" not in memory:
-        memory["instructions"] = []
-    instruction = str(instruction).strip()
-    # Check for duplicates
-    for existing in memory["instructions"]:
-        if existing.get("text", "").lower() == instruction.lower():
-            return  # Already stored
-    memory["instructions"].append({
-        "text": instruction,
-        "user_id": user_id,
-        "channel_id": channel_id,
-        "timestamp": time.time(),
-        "active": True,
-    })
-    # Cap at 50 instructions
-    memory["instructions"] = memory["instructions"][-50:]
-    _save_memory(memory)
+    with _LOCK:
+        memory = _load_memory()
+        if "instructions" not in memory:
+            memory["instructions"] = []
+        instruction = str(instruction).strip()
+        # Check for duplicates
+        for existing in memory["instructions"]:
+            if existing.get("text", "").lower() == instruction.lower():
+                return  # Already stored
+        memory["instructions"].append({
+            "text": instruction,
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "timestamp": time.time(),
+            "active": True,
+        })
+        # Cap at 50 instructions
+        memory["instructions"] = memory["instructions"][-50:]
+        _save_memory(memory)
     logger.info(f"Instruction stored from {user_id}: {instruction[:80]}")
 
 
@@ -351,11 +361,12 @@ def get_instructions_text() -> str:
 
 def deactivate_instruction(instruction_text: str):
     """Mark an instruction as inactive (e.g., user said 'ok you can ping now')."""
-    memory = _load_memory()
-    for i in memory.get("instructions", []):
-        if instruction_text.lower() in i.get("text", "").lower():
-            i["active"] = False
-    _save_memory(memory)
+    with _LOCK:
+        memory = _load_memory()
+        for i in memory.get("instructions", []):
+            if instruction_text.lower() in i.get("text", "").lower():
+                i["active"] = False
+        _save_memory(memory)
 
 
 # ── Memorable chats (special conversations to remember) ──────────────────────
@@ -398,12 +409,13 @@ def update_channel_topic(channel_id: str, topic: str):
     """Store a short topic summary for a channel."""
     if not topic:
         return
-    memory = _load_memory()
-    if "channel_topics" not in memory:
-        memory["channel_topics"] = {}
-    memory["channel_topics"][channel_id] = topic[:120]
-    _channel_topic_ts[channel_id] = time.time()
-    _save_memory(memory)
+    with _LOCK:
+        memory = _load_memory()
+        if "channel_topics" not in memory:
+            memory["channel_topics"] = {}
+        memory["channel_topics"][channel_id] = topic[:120]
+        _channel_topic_ts[channel_id] = time.time()
+        _save_memory(memory)
     logger.debug(f"Channel topic updated [{channel_id}]: {topic[:60]}")
 
 
@@ -418,11 +430,12 @@ def update_channel_style(channel_id: str, style: str):
     """Store a learned style profile for a channel."""
     if not style or len(style) < 5:
         return
-    memory = _load_memory()
-    if "channel_styles" not in memory:
-        memory["channel_styles"] = {}
-    memory["channel_styles"][channel_id] = style[:300]
-    _save_memory(memory)
+    with _LOCK:
+        memory = _load_memory()
+        if "channel_styles" not in memory:
+            memory["channel_styles"] = {}
+        memory["channel_styles"][channel_id] = style[:300]
+        _save_memory(memory)
     logger.debug(f"Channel style updated [{channel_id}]: {style[:80]}")
 
 
@@ -437,16 +450,17 @@ def update_channel_lessons(channel_id: str, new_lessons: list):
     """Store learned conversational lessons (cap at 5)."""
     if not new_lessons:
         return
-    memory = _load_memory()
-    if "channel_lessons" not in memory:
-        memory["channel_lessons"] = {}
-    existing = set(memory["channel_lessons"].get(channel_id, []))
-    for lesson in new_lessons:
-        lesson = lesson.strip()
-        if lesson and lesson not in existing:
-            existing.add(lesson)
-    memory["channel_lessons"][channel_id] = list(existing)[-5:]
-    _save_memory(memory)
+    with _LOCK:
+        memory = _load_memory()
+        if "channel_lessons" not in memory:
+            memory["channel_lessons"] = {}
+        existing = set(memory["channel_lessons"].get(channel_id, []))
+        for lesson in new_lessons:
+            lesson = lesson.strip()
+            if lesson and lesson not in existing:
+                existing.add(lesson)
+        memory["channel_lessons"][channel_id] = list(existing)[-5:]
+        _save_memory(memory)
     logger.debug(f"Channel lessons updated [{channel_id}]: {new_lessons}")
 
 
@@ -459,15 +473,16 @@ def get_discovered_channels() -> dict:
 
 def mark_channel_seen(channel_id: str, name: str, guild_id: str):
     """Record that we've seen a channel (for smart selection)."""
-    memory = _load_memory()
-    if "discovered_channels" not in memory:
-        memory["discovered_channels"] = {}
-    memory["discovered_channels"][channel_id] = {
-        "name": name,
-        "guild_id": guild_id,
-        "last_seen": time.time(),
-    }
-    _save_memory(memory)
+    with _LOCK:
+        memory = _load_memory()
+        if "discovered_channels" not in memory:
+            memory["discovered_channels"] = {}
+        memory["discovered_channels"][channel_id] = {
+            "name": name,
+            "guild_id": guild_id,
+            "last_seen": time.time(),
+        }
+        _save_memory(memory)
 
 
 # ── Stale-data sweep ("auto reset", but surgical) ────────────────────────────
@@ -491,54 +506,56 @@ def sweep_stale_memory(max_age_days: int = 60,
       channel_cap by evicting least-recently-seen
     - total users are capped at user_cap by evicting least-recently-seen
     """
-    memory = _load_memory()
-    now = time.time()
-    cutoff = now - max_age_days * 86400
-    stats = {"users_evicted": 0, "users_adopted": 0,
-             "users_over_cap": 0, "channels_evicted": 0,
-             "channels_over_cap": 0}
+    with _LOCK:
+        memory = _load_memory()
+        now = time.time()
+        cutoff = now - max_age_days * 86400
+        stats = {"users_evicted": 0, "users_adopted": 0,
+                 "users_over_cap": 0, "channels_evicted": 0,
+                 "channels_over_cap": 0}
 
-    users = memory.get("users")
-    if isinstance(users, dict) and users:
-        for uid in list(users):
-            seen = users[uid].get("last_seen")
-            if seen is None:
-                users[uid]["last_seen"] = now
-                stats["users_adopted"] += 1
-            elif seen < cutoff:
-                del users[uid]
-                stats["users_evicted"] += 1
-        if len(users) > user_cap:
-            ordered = sorted(users.items(),
-                             key=lambda kv: kv[1].get("last_seen", 0))
-            for uid, _rec in ordered[: len(users) - user_cap]:
-                del users[uid]
-                stats["users_over_cap"] += 1
+        users = memory.get("users")
+        if isinstance(users, dict) and users:
+            for uid in list(users):
+                seen = users[uid].get("last_seen")
+                if seen is None:
+                    users[uid]["last_seen"] = now
+                    stats["users_adopted"] += 1
+                elif seen < cutoff:
+                    del users[uid]
+                    stats["users_evicted"] += 1
+            if len(users) > user_cap:
+                ordered = sorted(users.items(),
+                                 key=lambda kv: kv[1].get("last_seen", 0))
+                for uid, _rec in ordered[: len(users) - user_cap]:
+                    del users[uid]
+                    stats["users_over_cap"] += 1
 
-    channels = memory.get("discovered_channels")
-    if isinstance(channels, dict) and channels:
-        for cid in list(channels):
-            if (channels[cid].get("last_seen") or 0) < cutoff:
-                del channels[cid]
-                stats["channels_evicted"] += 1
-        if len(channels) > channel_cap:
-            ordered = sorted(channels.items(),
-                             key=lambda kv: kv[1].get("last_seen") or 0)
-            for cid, _rec in ordered[: len(channels) - channel_cap]:
-                del channels[cid]
-                stats["channels_over_cap"] += 1
+        channels = memory.get("discovered_channels")
+        if isinstance(channels, dict) and channels:
+            for cid in list(channels):
+                if (channels[cid].get("last_seen") or 0) < cutoff:
+                    del channels[cid]
+                    stats["channels_evicted"] += 1
+            if len(channels) > channel_cap:
+                ordered = sorted(channels.items(),
+                                 key=lambda kv: kv[1].get("last_seen") or 0)
+                for cid, _rec in ordered[: len(channels) - channel_cap]:
+                    del channels[cid]
+                    stats["channels_over_cap"] += 1
 
-    _save_memory(memory)
+        _save_memory(memory)
     return stats
 
 
 def save_server_state(key: str, value: dict):
     """Shared server-state KV fallback (D1 path when available)."""
-    memory = _load_memory()
-    if "_server_state" not in memory:
-        memory["_server_state"] = {}
-    memory["_server_state"][str(key)] = value
-    _save_memory(memory)
+    with _LOCK:
+        memory = _load_memory()
+        if "_server_state" not in memory:
+            memory["_server_state"] = {}
+        memory["_server_state"][str(key)] = value
+        _save_memory(memory)
 
 
 def load_server_state(key: str):

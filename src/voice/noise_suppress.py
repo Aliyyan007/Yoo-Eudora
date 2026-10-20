@@ -24,7 +24,6 @@ class NoiseSuppressor:
 
     def __init__(self, enabled: bool = True):
         self._enabled = enabled
-        self._noise_profile: Optional[np.ndarray] = None
 
     def suppress(self, pcm_16k_float32: np.ndarray) -> np.ndarray:
         """Apply noise suppression to 16kHz float32 mono audio.

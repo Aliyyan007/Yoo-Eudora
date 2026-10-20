@@ -82,6 +82,40 @@ _ABBREVS = [
 ]
 
 
+# ── AI self-identification tells ──────────────────────────────────────────────
+# The persona prompt forbids it, but LLMs leak it anyway under pressure
+# ("as an AI language model i can't help", "i'm just an AI", "my training").
+# Nothing downstream caught it — the verbatim leak is the #1 bot tell, so
+# strip tell-sentences at the send boundary; if the reply IS just a tell,
+# fall back to a casual deflection.
+_AI_TELL_RE = re.compile(
+    r"(?:as\s+(?:an?\s+)?(?:ai|artificial\s+intelligence|llm|language\s+model|chatbot)\b"
+    r"|i(?:'m| am)\s+(?:just\s+)?(?:an?\s+)?(?:ai|artificial\s+intelligence|language\s+model|chatbot)\b"
+    r"|i(?:'m| am)\s+a\s+bot\b"
+    r"|i\s+(?:cannot|can't|can not)\s+(?:assist|help with that|help you with that)\b"
+    r"|i\s+do(?:es)?\s+not\s+have\s+(?:personal\s+)?(?:opinions|feelings|emotions)\b"
+    r"|(?:i\s+was|i'm|i am)\s+(?:trained|programmed|designed|built)\s+(?:by|to)\b"
+    r"|my\s+(?:programming|training\s+data|creators|developers)\b"
+    r"|\b(?:openai|anthropic|chatgpt|gpt-\d|large\s+language\s+model)\b)",
+    re.IGNORECASE,
+)
+
+_AI_TELL_FALLBACKS = [
+    "lol idk", "nah can't help with that one", "no clue tbh",
+    "ehhh beats me", "idk man sorry",
+]
+
+
+def _strip_ai_tells(text: str) -> str:
+    """Remove sentences containing AI self-identification phrases."""
+    if not _AI_TELL_RE.search(text):
+        return text
+    # Split on sentence boundaries, drop the tell-bearing ones
+    parts = re.split(r'(?<=[.!?])\s+', text)
+    kept = [p for p in parts if p.strip() and not _AI_TELL_RE.search(p)]
+    return " ".join(kept).strip()
+
+
 def humanize(text: str) -> str:
     """
     Apply probabilistic casual transforms to make a reply feel less AI-generated.
@@ -95,6 +129,10 @@ def humanize(text: str) -> str:
     """
     if not text:
         return text
+
+    text = _strip_ai_tells(text)
+    if not text:
+        return random.choice(_AI_TELL_FALLBACKS)
 
     r = random.random
 

@@ -53,25 +53,36 @@ _COOLDOWN_FILE = os.path.join(
 )
 
 
+def cooldown_key(api_key: str, model: str) -> str:
+    """Composite cooldown key — Groq rate limits are per (key, model), so a
+    key throttled on one model stays usable on another. Anything writing to
+    _groq_cooldowns (e.g. the whisper ASR client) must use this scheme."""
+    return f"{api_key}|{model}"
+
+
 def _load_cooldowns() -> dict:
-    """Load persisted cooldowns from disk."""
+    """Load persisted cooldowns from disk. Only composite key|model entries
+    are kept — bare api_key entries are legacy/foreign writes that no reader
+    queries."""
     if os.path.exists(_COOLDOWN_FILE):
         try:
             with open(_COOLDOWN_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 now = time.time()
-                return {k: v for k, v in data.items() if v > now}
+                return {k: v for k, v in data.items() if v > now and "|" in k}
         except Exception:
             pass
     return {}
 
 
 def _save_cooldowns(cooldowns: dict):
-    """Persist cooldowns to disk so they survive restarts."""
+    """Persist cooldowns to disk so they survive restarts. Non-composite
+    keys (bare api_key writes from the whisper client) are filtered out —
+    they were never readable by the key|model scheme anyway."""
     try:
         os.makedirs(os.path.dirname(_COOLDOWN_FILE), exist_ok=True)
         with open(_COOLDOWN_FILE, "w", encoding="utf-8") as f:
-            json.dump(cooldowns, f, indent=2)
+            json.dump({k: v for k, v in cooldowns.items() if "|" in k}, f, indent=2)
     except Exception as e:
         logger.debug(f"Failed to save cooldowns: {e}")
 
@@ -491,123 +502,3 @@ def parse_json_array(raw: str) -> list:
             except json.JSONDecodeError:
                 pass
     return []
-
-
-# ── Native function calling (tool use) ─────────────────────────────────────────
-
-def call_with_tools(
-    task: str,
-    system: str,
-    user: str,
-    tools: list,
-    tool_choice: str = "auto",
-    model: str = "openai/gpt-oss-120b",
-    max_tokens: int = 1000,
-    temperature: float = 0.2,
-    previous_messages: list = None,
-) -> dict:
-    """
-    Call Groq with native function calling support.
-
-    Uses the same multi-key rotation as _call_llm.
-    Returns: {"content": str|None, "tool_calls": list|None, "role": "assistant", "finish_reason": str}
-    Returns {"content": "", "tool_calls": None, "role": "assistant", "finish_reason": "error"} on failure.
-    """
-    if not _groq_clients:
-        logger.warning(f"[{task}] No Groq keys configured")
-        return {"content": "", "tool_calls": None, "role": "assistant", "finish_reason": "error"}
-
-    # Build the messages list: system + previous_messages (if any) + user
-    messages = [{"role": "system", "content": system}]
-    if previous_messages:
-        messages.extend(previous_messages)
-    messages.append({"role": "user", "content": user})
-
-    global _groq_current_key_idx
-    n = len(_groq_clients)
-
-    with _llm_lock:
-        deadline = time.time() + _MAX_COOLDOWN_WAIT_S
-
-        while True:
-            now = time.time()
-            if now > deadline:
-                logger.warning(f"[{task}] Gave up waiting for a free key after {_MAX_COOLDOWN_WAIT_S}s")
-                return {"content": "", "tool_calls": None, "role": "assistant", "finish_reason": "error"}
-
-            found_available = False
-            for _ in range(n):
-                idx = _groq_current_key_idx % n
-                client = _groq_clients[idx]
-
-                # Per-(key, model) cooldowns — same scheme as _call_llm
-                cooldown_until = _groq_cooldowns.get(f"{client.api_key}|{model}", 0)
-                if cooldown_until > now:
-                    remaining = int(cooldown_until - now)
-                    logger.debug(f"[{task}] Key {idx+1} cooling on {model} ({remaining}s left), trying next")
-                    _groq_current_key_idx = (idx + 1) % n
-                    continue
-
-                found_available = True
-
-                try:
-                    resp = client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    logger.debug(f"[{task}] Using key {idx+1}/{n} (model: {model})")
-                    msg = resp.choices[0].message
-                    # Serialize tool_calls to a plain dict format
-                    if msg.tool_calls:
-                        serialized_tool_calls = [
-                            {
-                                "id": tc.id,
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
-                                "type": "function",
-                            }
-                            for tc in msg.tool_calls
-                        ]
-                    else:
-                        serialized_tool_calls = None
-                    return {
-                        "content": msg.content,
-                        "tool_calls": serialized_tool_calls,
-                        "role": "assistant",
-                        "finish_reason": resp.choices[0].finish_reason,
-                    }
-
-                except Exception as e:
-                    err = str(e)
-                    if "429" in err or "rate limit" in err.lower() or "exceeded" in err.lower():
-                        is_tpd = "TPD" in err or "tokens per day" in err.lower()
-                        parsed = _parse_groq_wait_time(err)
-                        wait_time = parsed + 5 if parsed > 0 else (14400 if is_tpd else 60)
-                        # Cap cooldown at 24 hours max to prevent runaway values
-                        wait_time = min(wait_time, 86400)
-                        _groq_cooldowns[f"{client.api_key}|{model}"] = time.time() + wait_time
-                        _save_cooldowns(_groq_cooldowns)
-                        _groq_current_key_idx = (idx + 1) % n
-                        limit_type = "TPD" if is_tpd else "RPM/RPD"
-                        logger.warning(f"[{task}] Key {idx+1} {limit_type} limited on {model}. Rotating. Cool {wait_time}s.")
-                    else:
-                        logger.warning(f"[{task}] Groq call failed: {e}")
-                        return {"content": "", "tool_calls": None, "role": "assistant", "finish_reason": "error"}
-                    _groq_current_key_idx = (idx + 1) % n
-                    break
-
-            if not found_available:
-                soonest = min(_groq_cooldowns.get(f"{c.api_key}|{model}", 0) for c in _groq_clients)
-                wait_s = max(soonest - time.time(), 0) + 1
-                wait_s = min(wait_s, max(deadline - time.time(), 0))
-                if wait_s <= 0:
-                    logger.warning(f"[{task}] No time left, giving up")
-                    return {"content": "", "tool_calls": None, "role": "assistant", "finish_reason": "error"}
-                logger.info(f"[{task}] All keys cooling — waiting {wait_s:.0f}s for soonest key...")
-                time.sleep(wait_s)

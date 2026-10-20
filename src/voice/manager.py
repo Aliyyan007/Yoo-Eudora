@@ -74,8 +74,23 @@ class VoiceManager:
         # Track which users we've greeted in VC
         self._greeted_users: Dict[int, Set[int]] = {}  # guild_id -> set of user_ids
 
+        # In-flight VC-session tasks (join/user greetings) — tracked so
+        # leave_vc/shutdown can cancel them instead of letting them speak
+        # against a torn-down pipeline
+        self._tasks: Set[asyncio.Task] = set()
+        # Idempotency guard — on_ready can refire and teardown may run twice
+        self._shutdown = False
+
         # Proactive engagement — bot asks questions when VC goes quiet
         self._proactive: ProactiveEngager = ProactiveEngager(self)
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """Track a fire-and-forget task so it can be cancelled on leave/
+        shutdown instead of outliving the VC session."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     def is_in_vc(self, guild_id: int) -> bool:
         return guild_id in self._current_vcs
@@ -138,12 +153,20 @@ class VoiceManager:
                     persona_gender=self._persona_gender,
                 )
                 pipeline.set_voice_client(vc, loop)
-                pipeline._guild_id = guild_id
                 pipeline._relocate_cb = lambda ch, gid=guild_id: self._after_vc_move(client, gid, ch)
+                pipeline._moved_cb = lambda ch, gid=guild_id: self._on_vc_moved(gid, ch)
                 pipeline._leave_cb = lambda g=channel.guild: self.leave_vc(client, g)
                 # Outsider action worker — spoken action requests go to the
                 # isolated engine (leave stays native via _leave_cb above).
                 pipeline._action_cb = lambda uid, txt, g=channel.guild: self._run_voice_action(client, uid, txt, g)
+                # Clean up any pipeline being overwritten — a stale one
+                # leaks its worker tasks, VAD/ASR state and hmm player
+                old_pipeline = self._pipelines.pop(guild_id, None)
+                if old_pipeline is not None:
+                    try:
+                        await old_pipeline.cleanup()
+                    except Exception as e:
+                        logger.debug(f"[voice] Stale pipeline cleanup failed: {e}")
                 self._pipelines[guild_id] = pipeline
 
                 # Start comfort noise to keep voice indicator active
@@ -165,7 +188,13 @@ class VoiceManager:
                         audio_data = bytes(packet.payload) if hasattr(packet, 'payload') else b""
                         if not audio_data:
                             return
-                        self._last_speaking[guild_id] = time.time()
+                        # NOTE: _last_speaking is NOT updated here — Discord
+                        # streams DTX/silence packets continuously, so bumping
+                        # it per-packet defeated silence detection entirely
+                        # (get_silence_duration stayed ~0 forever → silence-
+                        # leave/nudge/leave-score never fired). Real activity
+                        # is merged from pipeline.get_last_speech_time() in
+                        # _check_current_vc instead.
                         # Update display name tracking for proactive engagement
                         member = channel.guild.get_member(user_id)
                         if member:
@@ -192,7 +221,7 @@ class VoiceManager:
                             await self._speak_join_greeting(pipeline, names)
                         except Exception as e:
                             logger.debug(f"[voice] Join greeting error: {e}")
-                    asyncio.create_task(_delayed_greeting())
+                    self._spawn(_delayed_greeting())
 
                 return True
             except Exception as e:
@@ -263,14 +292,16 @@ class VoiceManager:
             return "i'm not in a vc rn"
 
         try:
-            # Clean up pipeline
+            # Cancel session-scoped tasks (join/user greetings) — they hold
+            # this guild's pipeline and would otherwise speak into a dead VC
+            for task in self._tasks:
+                if not task.done():
+                    task.cancel()
+            # Clean up pipeline (cleanup() also clears display names, speech
+            # counts and last-speech times)
             pipeline = self._pipelines.pop(guild_id, None)
             if pipeline:
                 await pipeline.cleanup()
-                # Clear display name tracking for this guild's users
-                pipeline._user_display_names.clear()
-                pipeline._user_speech_count.clear()
-                pipeline._user_last_speech_time.clear()
 
             # Disconnect
             voice_client = discord.utils.get(client.voice_clients, guild=guild)
@@ -306,7 +337,7 @@ class VoiceManager:
     async def monitor_vcs(self, client: discord.Client):
         """Background task: auto-join/leave VCs, text silent VC members."""
         logger.info("Voice monitor background task started")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Start proactive engagement (bot asks questions when VC is quiet)
         self._proactive.start(client)
@@ -544,7 +575,16 @@ class VoiceManager:
         anyone's still listening), clean up pipelines, stop the proactive
         engager loop. Without this the connection is force-dropped by
         client.close(): mid-sentence vanish, a leaked engager task, and the
-        next persona free to hop into the call we just left."""
+        next persona free to hop into the call we just left.
+
+        Idempotent — on_ready refires can recreate the manager and trigger
+        a double teardown."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
         for guild_id in set(self._current_vcs) | set(self._pipelines):
             try:
                 guild = client.get_guild(guild_id)
@@ -592,7 +632,16 @@ class VoiceManager:
         if guild is None:
             return
         await self.leave_vc(client, guild)
-        await self.join_vc(client, channel, asyncio.get_event_loop())
+        await self.join_vc(client, channel, asyncio.get_running_loop())
+
+    def _on_vc_moved(self, guild_id: int, channel) -> None:
+        """Bookkeeping after a successful vc.move_to — the pipeline's
+        _do_vc_move calls this so _current_vcs/_vc_joined_at don't stay
+        pointed at the old channel (the relocate-callback path already
+        resyncs via leave+join)."""
+        self._current_vcs[guild_id] = channel.id
+        self._last_speaking[guild_id] = time.time()
+        self._vc_joined_at[guild_id] = time.time()
 
     def _leave_score(self, guild_id: int, members: list, silence: float) -> float:
         """0-1 algorithmic leave urge — combines stay duration, VC dryness
@@ -689,7 +738,7 @@ class VoiceManager:
                         # Build a greeting using the on_transcript callback's LLM
                         # but with a greeting-specific prompt
                         try:
-                            asyncio.create_task(self._speak_greeting(pipeline, display_name))
+                            self._spawn(self._speak_greeting(pipeline, display_name))
                         except Exception as e:
                             logger.debug(f"[voice] Greeting task error: {e}")
 
@@ -734,7 +783,7 @@ class VoiceManager:
                 f"Say ONLY what you'd speak out loud."
             )
 
-            response = await asyncio.get_event_loop().run_in_executor(
+            response = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: llm.call_voice(
                     "voice_greeting", system, user_prompt,

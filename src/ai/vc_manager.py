@@ -121,6 +121,18 @@ class VCManager:
         self._empty_check_interval_s = 30  # check every 30 seconds
         self._independent_join_chance = 0.05  # 5% chance to join an active VC independently
 
+    def reset_for_new_client(self):
+        """Drop all state that references a previous client's session.
+
+        The singleton survives persona rotation — channel ids, VoiceClient
+        refs, silence timers and 'already told shy' memory from the dead
+        account must not leak into the new persona (it would think it's
+        still in VCs it never joined and skip its own shy intro)."""
+        self._told_shy.clear()
+        self._current_vc.clear()
+        self._last_speaking.clear()
+        self._last_request_channel.clear()
+
     def has_been_told_shy(self, user_id: int) -> bool:
         """Check if a user has already been told about the shyness recently."""
         last_told = self._told_shy.get(user_id, 0)

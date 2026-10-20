@@ -4,21 +4,33 @@ from __future__ import annotations
 import discord
 
 from src.action_engine.tools.context import ToolContext
-from src.action_engine.tools.messages import get_message_by_link
 
 
 def _resolve_emoji_payload(ctx: ToolContext, emoji: str) -> str:
-    """Resolve an emoji name to a usable payload (custom emoji ID or unicode)."""
+    """Resolve an emoji name to a usable payload (custom emoji ID or unicode).
+
+    Guild-emoji name resolution runs FIRST — a 1-2 char custom emoji name
+    (":)", "ok") used to be swallowed by the unicode shortcut and never
+    resolved. Plain unicode emoji fall through untouched.
+    """
     emoji = str(emoji or "")
-    if emoji.startswith("<") or len(emoji) <= 2:
+    if not emoji:
         return emoji
-    guild = ctx.require_guild()
-    match = next((e for e in guild.emojis if e.name.lower() == emoji.lower()), None)
-    if match:
-        return str(match)
-    from src.action_engine.utils.fuzzy import best_match
-    r = best_match(emoji, guild.emojis, key=lambda e: e.name, score_cutoff=50)
-    return str(r.item) if r else emoji
+    if emoji.startswith("<"):
+        return emoji  # already a <:name:id>/<a:name:id> payload
+    try:
+        guild = ctx.require_guild()
+    except Exception:  # noqa: BLE001
+        guild = None
+    if guild is not None:
+        match = next((e for e in guild.emojis if e.name.lower() == emoji.lower()), None)
+        if match:
+            return str(match)
+        from src.action_engine.utils.fuzzy import best_match
+        r = best_match(emoji, guild.emojis, key=lambda e: e.name, score_cutoff=50)
+        if r:
+            return str(r.item)
+    return emoji  # unicode emoji or unresolvable — pass through
 
 
 async def react_to_message(
@@ -29,12 +41,10 @@ async def react_to_message(
     `emoji` can be a unicode emoji ("🔥", "👍") or a custom guild emoji name
     ("pepe") which is resolved from the guild's emoji list.
     """
-    info = await get_message_by_link(ctx, message_link)
-    if "error" in info:
-        return info
-
     payload = _resolve_emoji_payload(ctx, emoji)
 
+    # Single fetch → react. The old path fetched the message twice AND ran
+    # a Groq-vision serialisation purely for error-checking.
     try:
         p = [x for x in message_link.split("/") if x.isdigit()]
         cid, mid = int(p[-2]), int(p[-1])
@@ -43,6 +53,8 @@ async def react_to_message(
         await msg.add_reaction(payload)
     except discord.HTTPException as e:
         return {"error": f"Reaction failed: {e}"}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"Could not fetch message: {e}"}
     return {"ok": True, "emoji": payload, "message_link": message_link}
 
 

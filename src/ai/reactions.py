@@ -235,11 +235,15 @@ def select_emoji(
     text: str,
     mood: str = "chill",
     channel_id: str = "",
+    record: bool = True,
 ) -> Optional[str]:
     """
     Algorithmically select an emoji based on message content and mood.
 
     Returns an emoji string or None.
+    `record=True` (legacy default) charges the cooldown/daily counters at
+    decision time; pass record=False and call get_tracker().record_reaction()
+    after add_reaction succeeds so failed sends don't burn the budget.
     """
     # Determine content category
     categories = []
@@ -302,8 +306,9 @@ def select_emoji(
     # Random selection
     emoji = random.choice(available)
 
-    # Record the reaction
-    _tracker.record_reaction(channel_id, emoji)
+    # Record the reaction (skip when the caller records after a successful send)
+    if record:
+        _tracker.record_reaction(channel_id, emoji)
 
     return emoji
 
@@ -315,15 +320,31 @@ def react_to_message(
     is_mention: bool = False,
     mood: str = "chill",
     channel_id: str = "",
+    record: bool = True,
 ) -> Optional[str]:
     """
     Main entry point: decide whether to react and select an emoji.
 
     Returns an emoji string or None (if no reaction).
+    `record=False` peeks only — caller records via get_tracker().record_reaction()
+    once the reaction actually lands.
     """
     if not should_react(
         text, is_directed_at_bot, is_reply_to_bot, is_mention, mood, channel_id
     ):
         return None
 
-    return select_emoji(text, mood, channel_id)
+    return select_emoji(text, mood, channel_id, record=record)
+
+
+def reset_daily_counters():
+    """Reset every per-day reaction/sticker/GIF counter — call once per day
+    (discord_client._reset_daily_counters_if_needed). Without this the daily
+    caps are one-way valves: once hit, the features die for the process."""
+    _tracker.reset_daily()
+    try:
+        from .stickers_gifs import get_sticker_manager, get_gif_manager
+        get_sticker_manager().reset_daily()
+        get_gif_manager().reset_daily()
+    except Exception as e:
+        logger.debug(f"Sticker/GIF daily reset failed: {e}")

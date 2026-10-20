@@ -71,15 +71,28 @@ _OWNER_ONLY = {
     "get_my_profile",
     # moving the bot's own voice connection around on anyone's say-so
     "move_voice",
+    # putting arbitrary text in the bot's mouth via TTS
+    "say_in_vc",
 }
 
 # Non-owner tools where role pings are silently stripped â€” they can resolve
 # @everyone/@here and mass-ping the whole server.
-_MASS_MENTION = re.compile(r"@everyone|@here|<@&\d+>", re.IGNORECASE)
+_MASS_MENTION = re.compile(
+    r"@\s*everyone|@\s*here|<@\s*&\s*\d+>", re.IGNORECASE)
 _STRIP_PING_ROLES = {
     "send_message", "send_dm", "send_gif", "send_vc_text",
     "send_multiple_gifs",
 }
+
+# Batch tools with a `count` arg — bypassing the host's per-send cooldowns
+# on a selfbot account rate-limits (and bans) fast. Non-owners get a small
+# cap; even owners get a sane ceiling.
+_BATCH_COUNT_TOOLS = {
+    "send_multiple_gifs", "send_multiple_stickers", "react_to_recent",
+    "delete_last_message",
+}
+_NONOWNER_BATCH_MAX = 5
+_OWNER_BATCH_MAX = 10
 
 # Human-readable labels for performed tools â€” fed back into the main reply
 # context so the bot can acknowledge the action naturally.
@@ -211,6 +224,20 @@ def _looks_like_chat(text: str) -> bool:
     return not _ASK_FORM.search(t)
 
 
+# Agent failure/empty sentinels — parenthesized literals the agent returns
+# when it couldn't produce an answer. They must never leak into the reply
+# as "[LOOKED UP for them — the answer: (no reply)]".
+_INFO_SENTINELS = (
+    "(sorry", "(no reply", "(reached max tool rounds", "(null", "(noaction",
+)
+
+
+def _is_sentinel(answer: Optional[str]) -> bool:
+    """True when the agent's return text is a sentinel, not a real answer."""
+    a = (answer or "").strip().lower()
+    return not a or any(a.startswith(s) for s in _INFO_SENTINELS)
+
+
 class ActionWorker:
     """The 'outsider' engine: classify â†’ guard â†’ run â†’ silent."""
 
@@ -220,20 +247,51 @@ class ActionWorker:
         self._ready = False
         self._inflight: set = set()          # (scope_id, user_id) dedup
         self._tasks: set = set()             # background exec tasks (awaitable)
+        self._init_lock = asyncio.Lock()     # one-shot init, no double-start
 
     # ------------------------------------------------------------------ #
-    def _ensure_ready(self) -> bool:
+    async def _ensure_ready(self) -> bool:
         """Lazily wire the vendored engine. Never raises â€” a misconfigured
         engine must not take the reply path down with it."""
         if self._ready:
             return True
+        # Two concurrent classify calls used to both run this block and
+        # double-start the scheduler — the lock makes init one-shot.
+        async with self._init_lock:
+            if self._ready:
+                return True
+            return self._init_engine()
+
+    def _init_engine(self) -> bool:
+        """The actual init body — always called under _init_lock."""
         try:
             from src.action_engine.config.settings import settings as _ae_settings
-            # Sync the vendored owner list with the host's OWNER_IDS env â€”
-            # vendored owner-gated tools read settings.owner_ids.
-            owner_env = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID") or ""
-            if owner_env.strip() and _ae_settings.owner_user_id in ("", "0"):
-                _ae_settings.owner_user_id = owner_env
+            # Sync the vendored owner list with the host's owner set —
+            # env (OWNER_IDS / OWNER_ID) PLUS the hardcoded OWNER_IDS in
+            # owner_system. Vendored owner-gated tools read
+            # settings.owner_ids; without the hardcoded merge, owner-only
+            # tools were denied whenever the env var was unset.
+            owners: set = set()
+            for var in ("OWNER_IDS", "OWNER_ID"):
+                raw = os.getenv(var) or ""
+                owners.update(
+                    p.strip() for p in raw.split(",") if p.strip().isdigit())
+            try:
+                from .owner_system import OWNER_IDS as _host_owners
+                owners.update(
+                    str(o).strip() for o in _host_owners
+                    if str(o).strip().isdigit())
+            except Exception:
+                pass
+            if owners:
+                existing = {
+                    p.strip()
+                    for p in str(_ae_settings.owner_user_id or "")
+                    .replace(";", ",").split(",")
+                    if p.strip().isdigit()
+                }
+                _ae_settings.owner_user_id = ",".join(
+                    sorted(existing | owners, key=int))
 
             from src.action_engine.tools.context import ToolContext  # noqa: F401
             from src.action_engine.ai import agent as _agent_mod
@@ -273,6 +331,11 @@ class ActionWorker:
                 if _sched.scheduler is None:
                     _sched.init(self.client)
                     asyncio.create_task(_sched.scheduler.start())
+                else:
+                    _sched.scheduler.bot = self.client
+                    job = getattr(_sched.scheduler, "_job", None)
+                    if job is None or job.done():
+                        asyncio.create_task(_sched.scheduler.start())
             except Exception as e:
                 logger.warning(f"[actions] scheduler init failed (non-fatal): {e}")
 
@@ -292,23 +355,41 @@ class ActionWorker:
     # ------------------------------------------------------------------ #
     def _check_allowed(self, ctx, name, args):
         """(allowed, possibly-sanitized-args)"""
-        if _is_owner_id(ctx.author_id):
-            return True, args
-        if name in _OWNER_ONLY:
+        owner = _is_owner_id(ctx.author_id)
+        if not owner and name in _OWNER_ONLY:
             return False, args
         args = dict(args or {})
+        # Per-call ceiling on batch tools — for EVERYONE. A selfbot
+        # account rate-limits (and bans) fast on bulk sends/reactions;
+        # "send 50 gifs" must never execute literally. Non-owners get a
+        # tighter cap than owners.
+        if name in _BATCH_COUNT_TOOLS and args.get("count") is not None:
+            cap = _OWNER_BATCH_MAX if owner else _NONOWNER_BATCH_MAX
+            try:
+                args["count"] = max(1, min(int(args["count"]), cap))
+            except (TypeError, ValueError):
+                args["count"] = cap
+        if owner:
+            return True, args
         if name in _STRIP_PING_ROLES and args.get("ping_roles"):
             args["ping_roles"] = []          # non-owner: no role pings
         if name in _STRIP_PING_ROLES and args.get("ping_users"):
             # sanity: cap at 5 pings so "ping everyone one-by-one" loops
             args["ping_users"] = list(args["ping_users"])[:5]
         # Mass-ping tokens in TEXT bodies bypass the arg-level strips —
-        # "@everyone"/"@here"/"<@&id>" inside `content` ping for real on a
-        # user account. Strip them for non-owner requests.
-        from .reply import sanitize_mass_mentions
-        for k in ("content", "text", "message"):
-            if isinstance(args.get(k), str) and _MASS_MENTION.search(args[k]):
-                args[k] = sanitize_mass_mentions(args[k])
+        # "@everyone"/"@here"/"<@&id>" ping for real on a user account.
+        # Sanitize EVERY string arg (send_gif's free-text arg is `caption`,
+        # not `content`) and every string inside list args.
+        for k, v in list(args.items()):
+            if isinstance(v, str):
+                if _MASS_MENTION.search(v):
+                    args[k] = _MASS_MENTION.sub("", v)
+            elif isinstance(v, (list, tuple)):
+                args[k] = [
+                    _MASS_MENTION.sub("", x)
+                    if isinstance(x, str) and _MASS_MENTION.search(x) else x
+                    for x in v
+                ]
         return True, args
 
     # ------------------------------------------------------------------ #
@@ -389,11 +470,20 @@ class ActionWorker:
         r"members?|online|channels?|roles?)\b",
         re.I)
 
-    async def classify_request(self, text: str, author_id=None) -> Optional[tuple]:
+    async def classify_request(self, text: str, author_id=None,
+                               *, channel_id=None) -> Optional[tuple]:
         """Cheap gate — returns (kind, categories) with kind 'info' or
         'exec', or None for chat. Callers pass categories through to the
-        queue/run call so the agent gets the router's filtered tool set."""
-        if not _ENABLED or not self._ensure_ready():
+        queue/run call so the agent gets the router's filtered tool set.
+        `channel_id` enables a pre-classification inflight probe — a dup
+        request for the same user+channel short-circuits BEFORE paying
+        for the router + confirm LLM calls."""
+        if not _ENABLED:
+            return None
+        if (channel_id is not None and author_id is not None
+                and (str(channel_id), str(author_id)) in self._inflight):
+            return None
+        if not await self._ensure_ready():
             return None
         if _PROBE_LIKE.search(text or ""):
             return None
@@ -440,16 +530,48 @@ class ActionWorker:
 
     def _ctx_for(self, channel, author_id: int):
         guild = getattr(channel, "guild", None)
+        # Re-resolve through the LIVE client — after a persona rotation the
+        # message's channel/guild objects are bound to the dead client's
+        # ConnectionState, and every tool call through them dies with
+        # "Session is closed". getattr-guarded so test doubles survive.
+        _get_guild = getattr(self.client, "get_guild", None)
+        if guild is not None and callable(_get_guild):
+            live_guild = _get_guild(getattr(guild, "id", 0))
+            if live_guild is not None:
+                guild = live_guild
+        ch_id = getattr(channel, "id", None)
         if guild is None:
-            guilds = getattr(self.client, "guilds", [])
-            guild = guilds[0] if len(guilds) == 1 else None
+            guilds = list(getattr(self.client, "guilds", []) or [])
+            if len(guilds) == 1:
+                guild = guilds[0]
+            elif ch_id is not None:
+                # Owner DM with 2+ guilds: prefer the guild that actually
+                # owns the channel the action is pending in. If none owns
+                # it (real DM), guild stays None — info tools still work
+                # and exec tools get a clean "which server?" error from
+                # require_guild instead of a crash.
+                _get_ch = getattr(self.client, "get_channel", None)
+                live_ch = _get_ch(ch_id) if callable(_get_ch) else None
+                g = getattr(live_ch, "guild", None)
+                if g is not None:
+                    guild = (_get_guild(g.id) if callable(_get_guild)
+                             else None) or g
+                else:
+                    guild = next(
+                        (g for g in guilds
+                         if getattr(g, "get_channel", None)
+                         and g.get_channel(ch_id)),
+                        None,
+                    )
         ctx = self._ctx_cls(
             bot=self.client,
             guild=guild,
-            current_channel_id=channel.id,
+            current_channel_id=ch_id,
             author_id=author_id,
         )
         ctx.performed = []
+        ctx.is_owner = _is_owner_id(author_id)
+        ctx.bot_getter = lambda: self.client
         return ctx
 
     def _recent_context(self, channel) -> Optional[str]:
@@ -471,11 +593,15 @@ class ActionWorker:
 
     async def _run_agent(self, ctx, text: str, categories, mode: str,
                          label: str, speaker_name: Optional[str] = None,
-                         context: Optional[str] = None) -> Optional[str]:
+                         context: Optional[str] = None,
+                         delay: bool = True) -> Optional[str]:
         """Human-like delay â†’ agent.run â†’ done. The agent's reply text is
         NEVER sent to the channel (silent worker); performed tools are
-        tracked on ctx.performed. Returns the agent's reply text."""
-        await asyncio.sleep(random.uniform(_DELAY_MIN, _DELAY_MAX))
+        tracked on ctx.performed. Returns the agent's reply text.
+        `delay=False` skips the human pause — info lookups are invisible
+        to the channel, so a spoken "who's here?" shouldn't wait 2-6s."""
+        if delay:
+            await asyncio.sleep(random.uniform(_DELAY_MIN, _DELAY_MAX))
         agent = self._agent_for(ctx)
         try:
             reply = await asyncio.wait_for(
@@ -494,6 +620,42 @@ class ActionWorker:
         except Exception as e:
             logger.error(f"[actions] {label} worker error: {e!r}")
             return None
+
+    async def shutdown(self) -> None:
+        """Cancel background exec tasks + stop the scheduler before the
+        client is closed (persona rotation). Without this, queued jobs
+        keep running against a dead connection. Idempotent — the worker
+        object itself survives; get_action_worker() rebinds it to the new
+        client and restarts the scheduler loop."""
+        tasks = [t for t in self._tasks if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._inflight.clear()
+        try:
+            from src.action_engine.core import scheduler as _sched
+            if _sched.scheduler is not None:
+                await _sched.scheduler.stop()
+        except Exception as e:
+            logger.debug(f"[actions] scheduler stop failed: {e}")
+        try:
+            from src.action_engine.tools.bump_manager import (
+                cancel_all_auto_bumps)
+            cancel_all_auto_bumps()
+        except Exception:
+            pass
+        logger.info("[actions] worker shut down")
+
+    def cancel_for_client(self, client):
+        """Teardown hook — AIPersonaClient.teardown() calls this (sync) on
+        the rotation path before client.close(). Returns a coroutine for
+        the host to await, or None when this worker isn't bound to that
+        client (nothing to cancel)."""
+        if client is not self.client:
+            return None
+        return self.shutdown()
 
     # ------------------------------------------------------------------ #
     #  TEXT entry points
@@ -516,8 +678,13 @@ class ActionWorker:
         async def _job():
             try:
                 ctx = self._ctx_for(message.channel, message.author.id)
+                # Re-resolve the channel through the live client — the
+                # message's channel object can be stale post-rotation.
+                _get_ch = getattr(self.client, "get_channel", None)
+                live_ch = (_get_ch(message.channel.id)
+                           if callable(_get_ch) else None) or message.channel
                 try:
-                    async with message.channel.typing():
+                    async with live_ch.typing():
                         await self._run_agent(
                             ctx, trigger_text, categories, CHAT_MODE, "text",
                             speaker_name=message.author.display_name,
@@ -549,18 +716,21 @@ class ActionWorker:
             from src.action_engine.config.prompts import CHAT_MODE
             ctx = self._ctx_for(message.channel, message.author.id)
             context = self._recent_context(message.channel)
+            _get_ch = getattr(self.client, "get_channel", None)
+            live_ch = (_get_ch(message.channel.id)
+                       if callable(_get_ch) else None) or message.channel
             try:
-                async with message.channel.typing():
+                async with live_ch.typing():
                     answer = await self._run_agent(
                         ctx, trigger_text, self._INFO_CATS, CHAT_MODE, "info",
                         speaker_name=message.author.display_name,
-                        context=context)
+                        context=context, delay=False)
             except Exception:
                 answer = await self._run_agent(
                     ctx, trigger_text, self._INFO_CATS, CHAT_MODE, "info",
                     speaker_name=message.author.display_name,
-                    context=context)
-            if answer and not answer.startswith("(sorry"):
+                    context=context, delay=False)
+            if answer and not _is_sentinel(answer):
                 return answer
             return None
         finally:
@@ -577,6 +747,10 @@ class ActionWorker:
         self._inflight.add(key)
 
         guild = getattr(voice_channel, "guild", None)
+        _get_guild = getattr(self.client, "get_guild", None)
+        if guild is not None and callable(_get_guild):
+            # same stale-object re-resolution as _ctx_for
+            guild = _get_guild(getattr(guild, "id", 0)) or guild
         member = guild.get_member(user_id) if guild else None
         speaker = getattr(member, "display_name", None) or str(user_id)
 
@@ -605,13 +779,17 @@ class ActionWorker:
         self._inflight.add(key)
         try:
             guild = getattr(voice_channel, "guild", None)
+            _get_guild = getattr(self.client, "get_guild", None)
+            if guild is not None and callable(_get_guild):
+                guild = _get_guild(getattr(guild, "id", 0)) or guild
             member = guild.get_member(user_id) if guild else None
             speaker = getattr(member, "display_name", None) or str(user_id)
             from src.action_engine.config.prompts import VOICE_MODE
             ctx = self._ctx_for(voice_channel, user_id)
             answer = await self._run_agent(
-                ctx, f"[{speaker}]: {transcript}", self._INFO_CATS, VOICE_MODE, "voice-info")
-            if answer and not answer.startswith("(sorry"):
+                ctx, f"[{speaker}]: {transcript}", self._INFO_CATS,
+                VOICE_MODE, "voice-info", delay=False)
+            if answer and not _is_sentinel(answer):
                 return answer
             return None
         finally:
@@ -635,6 +813,11 @@ def get_action_worker(client) -> ActionWorker:
             from src.action_engine.core import scheduler as _sched
             if _sched.scheduler is not None:
                 _sched.scheduler.bot = client
+                # shutdown() stops the tick loop on teardown — restart it
+                # on the new client so persisted tasks keep firing.
+                job = getattr(_sched.scheduler, "_job", None)
+                if job is None or job.done():
+                    asyncio.create_task(_sched.scheduler.start())
         except Exception:
             pass
     return _worker

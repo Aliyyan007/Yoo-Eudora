@@ -131,9 +131,11 @@ def load_rotation_state() -> dict:
     return _read_json(_STATE_FILE, {})
 
 
-def save_rotation_state(persona_id: str, activated_at: float, seq: int) -> None:
+def save_rotation_state(persona_id: str, activated_at: float, seq: int,
+                        window_s: float = 0.0) -> None:
     _atomic_write(_STATE_FILE, {
         "active": persona_id, "activated_at": activated_at, "seq": seq,
+        "window_s": window_s,
     })
 
 

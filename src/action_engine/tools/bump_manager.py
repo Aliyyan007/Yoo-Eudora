@@ -67,13 +67,14 @@ async def find_bump_commands(ctx: ToolContext, channel_query: str = "here") -> d
     Distinguishes bump bots from music bots (e.g. Hydra) by checking the
     command description for server-promotion keywords.
     """
-    from src.action_engine.tools.messaging import _resolve_text_channel
+    from src.action_engine.tools.messaging import (
+        _application_commands, _resolve_text_channel)
     ch = await _resolve_text_channel(ctx, channel_query)
     if ch is None:
         return {"error": f"No channel matching '{channel_query}'."}
 
     try:
-        cmds = await ch.application_commands()
+        cmds = await _application_commands(ch)
     except Exception as e:  # noqa: BLE001
         return {"error": f"Failed to fetch slash commands: {e}"}
 
@@ -120,13 +121,15 @@ async def bump_with_bot(
     channel_query: str = "here",
 ) -> dict:
     """Bump the server using a specific bump bot by its application ID."""
-    from src.action_engine.tools.messaging import _resolve_text_channel
+    from src.action_engine.tools.messaging import (
+        _application_commands, _invalidate_app_commands,
+        _resolve_text_channel)
     ch = await _resolve_text_channel(ctx, channel_query)
     if ch is None:
         return {"error": f"No channel matching '{channel_query}'."}
 
     try:
-        cmds = await ch.application_commands()
+        cmds = await _application_commands(ch)
     except Exception as e:  # noqa: BLE001
         return {"error": f"Failed to fetch slash commands: {e}"}
 
@@ -139,6 +142,7 @@ async def bump_with_bot(
         None,
     )
     if cmd is None:
+        _invalidate_app_commands(ch)   # maybe stale — refetch next call
         return {"error": f"No /bump command found for bot {application_id}."}
 
     bot_info = BUMP_BOTS.get(int(application_id))
@@ -383,11 +387,14 @@ def _schedule_auto_bump(
         wait_sec = (next_time - now).total_seconds()
         if wait_sec > 0:
             await asyncio.sleep(wait_sec)
-        # Re-bump.
+        # Re-bump. Resolve the LIVE client at fire time — ctx.bot may be a
+        # persona client whose session closed hours ago (rotation).
         logger.info(f"Auto-bump: triggering {bot_info['name']} in channel {channel_id}")
         try:
-            ch = ctx.bot.get_channel(channel_id) or await ctx.bot.fetch_channel(channel_id)
-            cmds = await ch.application_commands()
+            bot = ctx.get_live_bot() if hasattr(ctx, "get_live_bot") else ctx.bot
+            ch = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            from src.action_engine.tools.messaging import _application_commands
+            cmds = await _application_commands(ch)
             cmd = next(
                 (c for c in cmds
                  if isinstance(c, discord.SlashCommand)

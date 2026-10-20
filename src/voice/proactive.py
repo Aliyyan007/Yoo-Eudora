@@ -181,8 +181,9 @@ class ProactiveEngager:
         if u == 1 and silence_duration < _SILENCE_THRESHOLD_S * 3:
             return
 
-        # Don't engage if someone's mic is currently active
-        for uid, active in pipeline._user_mic_active.items():
+        # Don't engage if someone's mic is currently active — list() copy,
+        # the dict is also mutated from the packet/recv threads
+        for uid, active in list(pipeline._user_mic_active.items()):
             if active:
                 logger.debug(f"[proactive] User {uid} mic is active, not engaging")
                 return
@@ -295,7 +296,7 @@ class ProactiveEngager:
                 target_name, other_names, history_text, presence_check
             )
 
-            response = await asyncio.get_event_loop().run_in_executor(
+            response = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: llm.call_voice(
                     "proactive_question", system, user_prompt,

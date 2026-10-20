@@ -127,7 +127,27 @@ class MessageCache:
         if is_important:
             logger.debug(f"Message cache: stored IMPORTANT message ({category}) from {author}: {content[:50]}")
 
-    def get_context(self, ch_id: str, count: int = 4) -> List[dict]:
+    @staticmethod
+    def _own_matchers(own_ids):
+        """Build (bot_authored, own_account) predicates. When the caller
+        passes `own_ids` (the active persona's user id(s)):
+
+        - bot_authored: `is_bot` flag OR author in own_ids — used to find the
+          latest HUMAN speaker (a stale entry recorded under a previous
+          persona's session still counts as bot-authored).
+        - own_account: author in own_ids only — used for the "You" label so
+          the previous persona's lines aren't attributed to this account.
+
+        Without `own_ids` both collapse to the stored `is_bot` flag."""
+        if own_ids is None:
+            return (lambda m: m["is_bot"], lambda m: m["is_bot"])
+        own = {str(i) for i in own_ids}
+        return (
+            lambda m: m["is_bot"] or str(m.get("author_id")) in own,
+            lambda m: str(m.get("author_id")) in own,
+        )
+
+    def get_context(self, ch_id: str, count: int = 4, own_ids=None) -> List[dict]:
         """
         Get context messages for a channel using a smart algorithm:
 
@@ -139,6 +159,7 @@ class MessageCache:
         when a user sent a multi-message burst (e.g., "I'm gonna sleep" ->
         "OKay" — the bot sees both, not just "OKay").
         """
+        is_bot_authored, _ = self._own_matchers(own_ids)
         now = time.time()
         with self._lock:
             messages = list(self._cache.get(ch_id, []))
@@ -155,7 +176,7 @@ class MessageCache:
         # Find the latest non-bot author (the user we're replying to)
         latest_user_id = None
         for m in reversed(active):
-            if not m["is_bot"]:
+            if not is_bot_authored(m):
                 latest_user_id = m["author_id"]
                 break
 
@@ -180,12 +201,13 @@ class MessageCache:
 
         return base
 
-    def get_context_text(self, ch_id: str, count: int = 4) -> str:
+    def get_context_text(self, ch_id: str, count: int = 4, own_ids=None) -> str:
         """
         Get a formatted transcript of context messages for the AI prompt.
         Uses the smart context algorithm (4 messages + user burst within 10 min).
         """
-        msgs = self.get_context(ch_id, count)
+        _, is_own_account = self._own_matchers(own_ids)
+        msgs = self.get_context(ch_id, count, own_ids=own_ids)
         if not msgs:
             return ""
 
@@ -202,7 +224,7 @@ class MessageCache:
             else:
                 time_label = f"{age // 86400}d ago"
 
-            label = "You" if m["is_bot"] else m["author"]
+            label = "You" if is_own_account(m) else m["author"]
             content = m["content"]
             if not content:
                 content = "[shared an image/attachment]"

@@ -74,9 +74,6 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "get_recent_joins", "description": "List members who joined the server most recently.",
         "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}}}},
     {"type": "function", "function": {
-        "name": "get_recent_leaves", "description": "List members who recently left the server.",
-        "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}}}},
-    {"type": "function", "function": {
         "name": "get_recent_messages", "description": "Read latest N messages of a text channel. Embeds as JSON, images described via vision.",
         "parameters": {"type": "object", "properties": {"channel_query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["channel_query"]}}},
     {"type": "function", "function": {
@@ -403,7 +400,6 @@ _DISPATCH: dict[str, ToolFn] = {
     "get_member_count": members.get_member_count,
     "get_online_members": members.get_online_members,
     "get_recent_joins": members.get_recent_joins,
-    "get_recent_leaves": members.get_recent_leaves,
     "get_recent_messages": messages.get_recent_messages,
     "get_message_by_link": messages.get_message_by_link,
     "send_message": messaging.send_message,
@@ -477,7 +473,7 @@ _CATEGORIES: dict[str, str] = {
     "search_members": "members", "get_member_details": "members",
     "get_member_mention": "members", "get_member_count": "members",
     "get_online_members": "members", "get_recent_joins": "members",
-    "get_recent_leaves": "members", "identify_bots": "members",
+    "identify_bots": "members",
     "get_recent_messages": "messages", "get_message_by_link": "messages",
     "send_message": "messaging", "send_dm": "messaging",
     "delete_message": "messaging", "delete_last_message": "messaging",

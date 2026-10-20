@@ -115,6 +115,10 @@ class ProactiveMessenger:
         self.proactive_interval = proactive_interval_min
         self.auto_chat_chance = auto_chat_chance
         self._running = False
+        # Owner-kill-switch for pings: discord_client's stop_pinging command
+        # sets this False — revives still go out, just without any
+        # role/@here/user ping prefixes.
+        self.pings_enabled = True
         self.last_proactive = 0
         self.last_auto_chat = time.time()
         self.last_activity: dict = {}  # channel_id -> timestamp
@@ -192,9 +196,9 @@ class ProactiveMessenger:
                 # Only revive if we haven't sent a proactive message in the last 30 min
                 # (increased from 5 min to reduce ping irritation)
                 if (now - self.last_proactive) > 1800:
-                    await self._revive_dead_chat(channel_id)
-                    self.last_proactive = now
-                    return  # One revival per cycle
+                    if await self._revive_dead_chat(channel_id):
+                        self.last_proactive = now
+                        return  # One revival per cycle
 
             # 2. Random auto-chat (channel has some activity but is slowing down)
             # Send a random message with auto_chat_chance probability
@@ -218,17 +222,20 @@ class ProactiveMessenger:
                         self.last_auto_chat = now
                     return  # One auto-chat per cycle
 
-    async def _revive_dead_chat(self, channel_id: int):
+    async def _revive_dead_chat(self, channel_id: int) -> bool:
         """Send a message to revive a dead channel (with ping role).
-        Uses ping controller to prevent over-pinging."""
+        Uses ping controller to prevent over-pinging.
+        Returns True only when a message was actually sent — the caller sets
+        last_proactive on it so a gated/blocked revive doesn't burn the
+        global 30-min revive window."""
         channel = self.client.get_channel(channel_id)
         if not channel:
-            return
+            return False
 
         # Check permissions
         if hasattr(channel, 'guild') and channel.guild:
             if not can_speak_in(channel, channel.guild.me):
-                return
+                return False
 
         ch_id = str(channel_id)
         eng_log = get_engagement_log()
@@ -242,9 +249,10 @@ class ProactiveMessenger:
                                             history_msgs=self.client.history_cache.get(ch_id),
                                             bot_user=self.client.user):
             logger.debug(f"[engage] #{channel.name} gated — skipping revive")
-            return
+            return False
 
         ping_ctrl = get_ping_controller()
+        loop = asyncio.get_running_loop()
 
         # Decide the ping target FIRST — the message text is generated with
         # the pinged user's name in context so it never attributes personal
@@ -252,32 +260,33 @@ class ProactiveMessenger:
         ping_prefix = ""
         pinged_user = None
         role = None
-        if self.ping_role_id and hasattr(channel, 'guild') and channel.guild:
-            role = channel.guild.get_role(self.ping_role_id)
-            if role is None:
-                # ID may be stale — fall back to a name match ("chat revive",
-                # "revive", ...) so a bad/stale id never silently disables it
-                for r in channel.guild.roles:
-                    if "revive" in (r.name or "").lower():
-                        role = r
-                        logger.info(f"[engage] revive role id stale — matched '{r.name}' by name")
-                        break
+        if self.pings_enabled:
+            if self.ping_role_id and hasattr(channel, 'guild') and channel.guild:
+                role = channel.guild.get_role(self.ping_role_id)
                 if role is None:
-                    logger.debug(f"[engage] CHAT_REVIVE_PING_ROLE {self.ping_role_id} not found in {channel.guild.name}")
-        if role and ping_ctrl.can_ping_role(ch_id):
-            ping_prefix = f"<@&{role.id}> "
-        elif ping_ctrl.can_ping_here(ch_id) and random.random() < 0.30:
-            ping_prefix = "@here "
-        elif ping_ctrl.can_ping_user(ch_id) and hasattr(channel, 'guild') and channel.guild:
-            pinged_user = select_online_user(
-                channel.guild, exclude_ids={self.client.user.id}, channel=channel,
-                history_msgs=self.client.history_cache.get(ch_id))
-            if pinged_user:
-                ping_prefix = f"<@{pinged_user.id}> "
+                    # ID may be stale — fall back to a name match ("chat revive",
+                    # "revive", ...) so a bad/stale id never silently disables it
+                    for r in channel.guild.roles:
+                        if "revive" in (r.name or "").lower():
+                            role = r
+                            logger.info(f"[engage] revive role id stale — matched '{r.name}' by name")
+                            break
+                    if role is None:
+                        logger.debug(f"[engage] CHAT_REVIVE_PING_ROLE {self.ping_role_id} not found in {channel.guild.name}")
+            if role and ping_ctrl.can_ping_role(ch_id):
+                ping_prefix = f"<@&{role.id}> "
+            elif ping_ctrl.can_ping_here(ch_id) and random.random() < 0.30:
+                ping_prefix = "@here "
+            elif ping_ctrl.can_ping_user(ch_id) and hasattr(channel, 'guild') and channel.guild:
+                pinged_user = select_online_user(
+                    channel.guild, exclude_ids={self.client.user.id}, channel=channel,
+                    history_msgs=self.client.history_cache.get(ch_id))
+                if pinged_user:
+                    ping_prefix = f"<@{pinged_user.id}> "
 
         # Try AI-generated message first, fall back to random
-        topic = mem.get_channel_topic_fresh(ch_id)
-        loop = asyncio.get_running_loop()
+        topic = await loop.run_in_executor(
+            None, lambda: mem.get_channel_topic_fresh(ch_id))
         message = await loop.run_in_executor(
             None, lambda: ai_reply.generate_proactive_message(
                 topic, for_user=getattr(pinged_user, "display_name", None))
@@ -287,11 +296,12 @@ class ProactiveMessenger:
         message = ping_prefix + message
 
         if role and ping_prefix.startswith("<@&"):
-            ping_ctrl.record_role_ping(ch_id)
+            await loop.run_in_executor(None, ping_ctrl.record_role_ping, ch_id)
         elif ping_prefix.startswith("@here"):
-            ping_ctrl.record_here_ping(ch_id)
+            await loop.run_in_executor(None, ping_ctrl.record_here_ping, ch_id)
         elif pinged_user:
-            ping_ctrl.record_user_ping(ch_id, user_id=pinged_user.id)
+            await loop.run_in_executor(
+                None, lambda: ping_ctrl.record_user_ping(ch_id, user_id=pinged_user.id))
             if hasattr(self.client, 'conversation_tracker'):
                 if ch_id not in self.client.conversation_tracker:
                     self.client.conversation_tracker[ch_id] = {}
@@ -305,6 +315,7 @@ class ProactiveMessenger:
         eng_log.mark_sent(ch_id)
         eng_log.record(ch_id, sent, kind="revive")
         logger.info(f"Revived dead chat in #{channel.name}: {message}")
+        return True
 
     async def _send_random_chat(self, channel_id: int):
         """Send a random spontaneous message to a channel (no ping role).
@@ -377,8 +388,9 @@ class ProactiveMessenger:
                 # First message: AI-generated or random
                 if i == 0:
                     ch_id = str(channel_id)
-                    topic = mem.get_channel_topic_fresh(ch_id)
                     loop = asyncio.get_running_loop()
+                    topic = await loop.run_in_executor(
+                        None, lambda: mem.get_channel_topic_fresh(ch_id))
                     msg = await loop.run_in_executor(
                         None, lambda: ai_reply.generate_proactive_message(topic)
                     )
@@ -442,8 +454,9 @@ class ProactiveMessenger:
                     continue
 
                 ch_id = str(best_ch.id)
-                topic = mem.get_channel_topic_fresh(ch_id)
                 loop = asyncio.get_running_loop()
+                topic = await loop.run_in_executor(
+                    None, lambda: mem.get_channel_topic_fresh(ch_id))
                 msg = await loop.run_in_executor(
                     None, lambda: ai_reply.generate_proactive_message(topic)
                 )

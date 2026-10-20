@@ -152,11 +152,15 @@ class StickerManager:
         guild: discord.Guild,
         text: str,
         channel_id: str,
+        record: bool = True,
     ) -> Optional[discord.GuildSticker]:
         """
         Algorithmically select a sticker from the guild's collection.
 
         Returns a GuildSticker or None if no suitable sticker found.
+        `record=True` (legacy default) charges cooldown/daily counters at
+        decision time; pass record=False and call record_sticker() after the
+        send succeeds so a failed send doesn't burn the budget.
         """
         try:
             stickers = list(guild.stickers)
@@ -202,16 +206,18 @@ class StickerManager:
                 for sticker in available:
                     name_lower = sticker.name.lower()
                     if any(kw in name_lower for kw in keywords):
-                        self._record_sticker(channel_id, sticker.id)
+                        if record:
+                            self.record_sticker(channel_id, sticker.id)
                         return sticker
 
         # No keyword match — pick random
         sticker = random.choice(available)
-        self._record_sticker(channel_id, sticker.id)
+        if record:
+            self.record_sticker(channel_id, sticker.id)
         return sticker
 
-    def _record_sticker(self, channel_id: str, sticker_id: int):
-        """Record that a sticker was sent."""
+    def record_sticker(self, channel_id: str, sticker_id: int):
+        """Record that a sticker was sent (call after the send succeeds)."""
         self._last_sticker[channel_id] = time.time()
         if channel_id not in self._recent_stickers:
             self._recent_stickers[channel_id] = deque(maxlen=5)

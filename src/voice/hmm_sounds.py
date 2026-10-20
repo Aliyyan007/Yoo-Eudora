@@ -234,10 +234,12 @@ class HmmSoundPlayer:
                 if silence_duration < self._next_hmm_threshold:
                     continue
 
-                # Check if anyone's mic is active
-                for uid, active in self._pipeline._user_mic_active.items():
-                    if active:
-                        continue
+                # Check if anyone's mic is active — a live mic means someone
+                # is mid-sentence; don't talk over them. (The old `continue`
+                # only skipped to the next dict item, not the while-loop —
+                # the guard was a no-op.)
+                if any(list(self._pipeline._user_mic_active.values())):
+                    continue
 
                 # Probability check — not every silence gets a hmm
                 if random.random() > _HMM_PROBABILITY:
@@ -302,9 +304,14 @@ class HmmSoundPlayer:
             play_done = asyncio.Event()
 
             def _on_done(error):
+                # Runs on the player thread — asyncio.Event.set() isn't
+                # thread-safe, hop back onto the loop to signal it.
                 if error:
                     logger.debug(f"[hmm] Playback error: {error}")
-                play_done.set()
+                try:
+                    loop.call_soon_threadsafe(play_done.set)
+                except Exception:
+                    pass  # loop already closed (teardown mid-playback)
 
             vc.play(source, after=_on_done)
 

@@ -35,6 +35,7 @@ class GroqWhisperTwoPass:
         self._language = language
         self._groq_clients = None
         self._groq_cooldowns = None
+        self._save_cooldowns = None
         self._current_key_idx = 0
 
     def _init_clients(self):
@@ -44,6 +45,7 @@ class GroqWhisperTwoPass:
         from ..ai import llm
         self._groq_clients = llm._groq_clients
         self._groq_cooldowns = llm._groq_cooldowns
+        self._save_cooldowns = getattr(llm, "_save_cooldowns", None)
 
     async def preload(self) -> None:
         """Nothing to preload — API-based, no local model."""
@@ -77,7 +79,7 @@ class GroqWhisperTwoPass:
         wav_bytes = self._pcm_to_wav(audio_int16, 16000)
 
         # Call Groq API in thread pool with a 10s timeout (one call took 74s before!)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         t0 = time.time()
 
         try:
@@ -173,8 +175,11 @@ class GroqWhisperTwoPass:
 
             client = self._groq_clients[idx]
 
-            # Check cooldown
-            cooldown_until = self._groq_cooldowns.get(client.api_key, 0)
+            # Check cooldown — this dict is SHARED with llm.py, which keys
+            # it by "api_key|model". Writing bare api_key would both miss
+            # existing cooldowns AND poison the key space.
+            cooldown_key = f"{client.api_key}|{self._model}"
+            cooldown_until = self._groq_cooldowns.get(cooldown_key, 0)
             if _time.time() < cooldown_until:
                 continue
 
@@ -199,10 +204,16 @@ class GroqWhisperTwoPass:
             except Exception as e:
                 err = str(e)
                 if "429" in err or "rate limit" in err.lower():
-                    # Rate limited — cool this key and try next
+                    # Rate limited — cool this key+model (llm.py scheme) and
+                    # try next
                     is_tpd = "TPD" in err or "tokens per day" in err.lower()
                     wait_time = 3600 if is_tpd else 60
-                    self._groq_cooldowns[client.api_key] = _time.time() + wait_time
+                    self._groq_cooldowns[cooldown_key] = _time.time() + wait_time
+                    if self._save_cooldowns is not None:
+                        try:
+                            self._save_cooldowns(self._groq_cooldowns)
+                        except Exception:
+                            pass
                     logger.warning(f"[groq-whisper] Key {idx+1} rate limited, cooling {wait_time}s")
                     continue
                 elif "404" in err or "model_not_found" in err:

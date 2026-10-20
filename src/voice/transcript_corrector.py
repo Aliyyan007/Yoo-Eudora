@@ -55,18 +55,17 @@ async def auto_correct_transcript(transcript: str) -> str:
     if word_count < _MIN_WORDS_TO_CORRECT:
         return transcript
 
-    # Skip correction for ALL-CAPS text from streaming ASR — the Groq Whisper
-    # API two-pass will replace it with proper-case text anyway, so correcting
-    # the uppercase version is a waste of time.
-    if transcript.isupper():
-        return transcript
+    # NOTE: the streaming ASR emits ALL-CAPS text — that's exactly the input
+    # that needs correcting (the caller only invokes this when the stream
+    # result won, i.e. no better-cased Whisper transcript exists). An earlier
+    # isupper() early-return here made this function a permanent no-op.
 
     try:
         from ..ai import llm
 
         # Use call_voice (gpt-oss-20b, reasoning_effort=low) for fast correction
         corrected = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
+            asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: llm.call_voice(
                     "transcript_correction",
@@ -105,14 +104,3 @@ async def auto_correct_transcript(transcript: str) -> str:
         logger.debug(f"[correct] Failed ({e}), using original: '{transcript[:50]}'")
 
     return transcript
-
-
-def _looks_clean(text: str) -> bool:
-    """Check if a transcript looks clean enough to skip correction.
-    A transcript is 'clean' if it has proper capitalization and no
-    obvious ASR artifacts."""
-    # If it has mixed case (not all upper), it's probably from Whisper
-    # and already decent quality
-    has_upper = any(c.isupper() for c in text)
-    has_lower = any(c.islower() for c in text)
-    return has_upper and has_lower

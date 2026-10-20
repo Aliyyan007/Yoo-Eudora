@@ -63,6 +63,9 @@ class BumpScheduler:
         self.bump_bots = bump_bots or DEFAULT_BUMP_BOTS
         self.post_bump_callback = post_bump_callback
         self._running = False
+        # Set by the "stop bumping" chat command — unlike _running (which
+        # READY refires consult before respawning), this survives resumes.
+        self._user_stopped = False
         self._cached_commands = None
         self._last_cache_refresh = 0
         self._cache_refresh_interval = 300  # Refresh command cache every 5 min
@@ -138,6 +141,7 @@ class BumpScheduler:
     async def stop(self):
         """Stop the bump loop."""
         self._running = False
+        self._user_stopped = True
         logger.info("Bump scheduler stopped")
 
     def _bot_ready_time(self, bot_name: str, cooldown_hours: float) -> float:
@@ -203,6 +207,7 @@ class BumpScheduler:
 
         logger.info(f"=== Bump check: {len(ready_bots)} bot(s) ready: {[b[0] for b in ready_bots]} ===")
 
+        successful = 0
         for i, (bot_name, bot_id, cooldown) in enumerate(ready_bots, 1):
             logger.info(f"Bumping with {bot_name} [{i}/{len(ready_bots)}] (cooldown: {cooldown}h)")
             success = await self._trigger_bump(channel, bot_name, bot_id)
@@ -224,8 +229,12 @@ class BumpScheduler:
                 logger.debug(f"Waiting {delay}s before next bump...")
                 await asyncio.sleep(delay)
 
-        # Trigger post-bump messaging callback
-        if self.post_bump_callback and len(ready_bots) > 0:
+            if success:
+                successful += 1
+
+        # Trigger post-bump messaging only when a bump actually fired —
+        # an all-fail cycle shouldn't spark fake "we bumped!" chatter.
+        if self.post_bump_callback and successful > 0:
             try:
                 await self.post_bump_callback()
             except Exception as e:
@@ -309,22 +318,30 @@ class BumpScheduler:
             logger.error(f"Failed to bump with {bot_name}: {e}")
             return False
 
-    async def _perform_bump_batch(self):
-        """Force-bump all bots immediately (used for manual/command triggers).
+    async def _perform_bump_batch(self, target_name: Optional[str] = None):
+        """Force-bump bots immediately (used for manual/command triggers).
 
-        This bumps ALL bots regardless of cooldown status. Used when a user
-        explicitly asks to bump the server.
+        This bumps regardless of cooldown status. With ``target_name`` set,
+        only the bot whose name matches (the "bump with X" command) fires.
         """
         channel = await self._resolve_channel()
         if not channel:
             logger.error(f"Could not find bump channel {self.channel_id}")
             return
 
+        bots = list(self.bump_bots)
+        if target_name:
+            tl = target_name.lower().strip()
+            bots = [b for b in bots if tl in b[0].lower()]
+            if not bots:
+                logger.warning(f"Manual bump: no bump bot matching '{target_name}'")
+                return
+
         logger.info(f"=== Manual bump batch in #{channel.name} ===")
         results: Dict[str, bool] = {}
 
-        for i, (bot_name, bot_id, _cooldown) in enumerate(self.bump_bots, 1):
-            logger.info(f"Bumping with {bot_name} [{i}/{len(self.bump_bots)}]")
+        for i, (bot_name, bot_id, _cooldown) in enumerate(bots, 1):
+            logger.info(f"Bumping with {bot_name} [{i}/{len(bots)}]")
             success = await self._trigger_bump(channel, bot_name, bot_id)
             results[bot_name] = success
 
@@ -333,7 +350,7 @@ class BumpScheduler:
                 self._save_state()
 
             # Human-like delay between bumps (5-15 seconds)
-            if i < len(self.bump_bots):
+            if i < len(bots):
                 delay = random.randint(5, 15)
                 logger.debug(f"Waiting {delay}s before next bump...")
                 await asyncio.sleep(delay)
@@ -341,7 +358,7 @@ class BumpScheduler:
         # Summary
         successful = sum(1 for v in results.values() if v)
         failed = sum(1 for v in results.values() if not v)
-        logger.info(f"Manual bump batch complete: {successful}/{len(self.bump_bots)} successful, {failed} failed")
+        logger.info(f"Manual bump batch complete: {successful}/{len(bots)} successful, {failed} failed")
 
         # Trigger post-bump messaging callback
         if self.post_bump_callback and successful > 0:

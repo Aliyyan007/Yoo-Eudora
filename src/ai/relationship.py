@@ -121,6 +121,18 @@ def _flush(uid: str):
         logger.debug(f"relationship flush failed for {uid}: {e}")
 
 
+def flush_all():
+    """Flush every cached user's stats to storage, regardless of the debounce
+    timer. Call during teardown — otherwise up to _FLUSH_INTERVAL_S of stats
+    per user evaporate at each rotation. Blocks on storage (up to ~30s/user
+    worst case when D1 is down) — async callers should offload it."""
+    for uid in list(_stats):
+        try:
+            _flush(uid)
+        except Exception as e:
+            logger.debug(f"relationship flush_all failed for {uid}: {e}")
+
+
 # ── Recording ─────────────────────────────────────────────────────────────────
 
 def record_message(user_id):

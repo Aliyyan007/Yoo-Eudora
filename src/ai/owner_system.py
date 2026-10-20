@@ -21,6 +21,7 @@ import re
 import time
 import random
 from typing import Optional, List, Dict, Tuple
+from collections import deque
 from loguru import logger
 
 
@@ -201,10 +202,12 @@ class OwnerPreferenceTracker:
     """
 
     def __init__(self):
-        # owner_id -> list of (instruction, timestamp)
-        self._instructions: Dict[str, List[Tuple[str, float]]] = {}
+        # owner_id -> deque of (instruction, timestamp), capped so a chatty
+        # owner can't grow memory unboundedly
+        self._instructions: Dict[str, deque] = {}
         # owner_id -> last interaction time
         self._last_interaction: Dict[str, float] = {}
+        self._max_instructions = 20
 
     def record_instruction(self, owner_id: str, instruction: str):
         """Record an instruction from an owner."""
@@ -212,7 +215,7 @@ class OwnerPreferenceTracker:
             return
 
         if owner_id not in self._instructions:
-            self._instructions[owner_id] = []
+            self._instructions[owner_id] = deque(maxlen=self._max_instructions)
 
         self._instructions[owner_id].append((instruction, time.time()))
         self._last_interaction[owner_id] = time.time()

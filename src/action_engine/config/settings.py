@@ -12,13 +12,16 @@ import re
 from pathlib import Path
 from typing import List
 
-from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Load .env from the project root (the "Engager Bot" folder).
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+# .env lives at <repo>/config/.env — the same file src/main.py and
+# src/ai/llm.py already load into os.environ at startup. We do NOT call
+# load_dotenv() ourselves: pydantic reads the file via `env_file` for its
+# own fields, and re-injecting the file's vars into os.environ here would
+# leak real credentials into test runs that deliberately strip them.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_ENV_PATH = _PROJECT_ROOT / "config" / ".env"
 
 
 def _collect_groq_keys() -> List[str]:
@@ -48,7 +51,7 @@ class Settings(BaseSettings):
     """Validated, typed settings for the whole bot."""
 
     model_config = SettingsConfigDict(
-        env_file=str(_PROJECT_ROOT / ".env"),
+        env_file=str(_ENV_PATH),
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",
@@ -77,10 +80,12 @@ class Settings(BaseSettings):
     # --- Groq ---
     groq_model_text: str = Field("openai/gpt-oss-120b", alias="GROQ_MODEL_TEXT")
     groq_model_chat: str = Field("openai/gpt-oss-20b", alias="GROQ_MODEL_CHAT")
-    # ROUTER_MODEL: the cheap arbiter classifying ACTION vs CHAT. Scout
-    # isn't available on every Groq tier; 3.3-70b is the universal fallback.
+    # ROUTER_MODEL: the cheap arbiter classifying ACTION vs CHAT.
+    # llama-3.3-70b-versatile was retired on Groq's free tier (every call
+    # 404'd → silent CHAT fallback); gpt-oss-20b is the live cheap default —
+    # the same model config.yaml uses for intent detection.
     router_model: str = Field(
-        "llama-3.3-70b-versatile", alias="ROUTER_MODEL")
+        "openai/gpt-oss-20b", alias="ROUTER_MODEL")
     groq_model_vision: str = Field(
         "meta-llama/llama-4-scout-17b-16e-instruct", alias="GROQ_MODEL_VISION"
     )

@@ -41,18 +41,26 @@ from .ai import llm
 
 def load_env_and_channels():
     """Load all configuration from environment variables."""
-    # Discord token
+    # Discord token — either the legacy single token or ANY persona token
+    # (isla/rowan/eudora). A persona-only install must not hard-fail on
+    # DISCORD_TOKEN when its accounts are configured.
     token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        logger.error("DISCORD_TOKEN not set in .env")
+    persona_tokens = [
+        os.getenv(p.token_env) for p in PROFILES.values()
+        if (os.getenv(p.token_env) or "").strip()
+    ]
+    if not (token or persona_tokens):
+        logger.error("No account token set — set DISCORD_TOKEN or a persona token (DISCORD_TOKEN_EUDORA/ISLA/ROWAN) in .env")
         sys.exit(1)
 
-    # Bump channel
+    # Bump channel — only required when bumping is wanted; without it the
+    # persona client still runs (scheduler just stays disabled).
     bump_channel_id = os.getenv("BUMP_CHANNEL_ID")
-    if not bump_channel_id:
-        logger.error("BUMP_CHANNEL_ID not set in .env")
-        sys.exit(1)
-    bump_channel_id = int(bump_channel_id)
+    if bump_channel_id:
+        bump_channel_id = int(bump_channel_id)
+    else:
+        bump_channel_id = 0
+        logger.warning("BUMP_CHANNEL_ID not set — bump scheduler disabled")
 
     # Text channels (comma-separated)
     text_channel_str = os.getenv("TEXT_CHANNEL_IDS", "")
@@ -154,14 +162,15 @@ async def main():
         async def post_bump_callback():
             await proactive.send_post_bump_messages()
 
-        bump_scheduler = BumpScheduler(
-            client=client,
-            channel_id=config["bump_channel_id"],
-            base_interval_hours=config["base_interval"],
-            jitter_hours=config["jitter_hours"],
-            post_bump_callback=post_bump_callback,
-        )
-        client.bump_scheduler = bump_scheduler
+        if config["bump_channel_id"]:
+            bump_scheduler = BumpScheduler(
+                client=client,
+                channel_id=config["bump_channel_id"],
+                base_interval_hours=config["base_interval"],
+                jitter_hours=config["jitter_hours"],
+                post_bump_callback=post_bump_callback,
+            )
+            client.bump_scheduler = bump_scheduler
         # NOTE: do NOT spawn scheduler.start() here — it awaits
         # client.wait_until_ready() which raises RuntimeError on a client
         # that hasn't logged in yet. The task died ~0.2s after every

@@ -167,20 +167,31 @@ class StatusManager:
     """
 
     def __init__(self):
-        self._last_status_update: float = 0
-        self._last_bio_update: float = 0
-        self._current_status: str = ""
-        self._current_bio: str = ""
+        # Keyed by persona id — the singleton outlives rotation, so dedup
+        # state for one account must never suppress another's first update.
+        self._last_status_update: dict = {}
+        self._last_bio_update: dict = {}
+        self._current_status: dict = {}
+        self._current_bio: dict = {}
         self._status_cooldown_s = 1800  # 30 minutes
         self._bio_check_interval_s = 86400  # 24 hours (check daily)
 
+    @staticmethod
+    def _ns() -> str:
+        """Current persona namespace ("" when persona runtime is absent)."""
+        try:
+            from ..persona.runtime import active as _active_persona
+            return _active_persona().id or ""
+        except Exception:
+            return ""
+
     def should_update_status(self) -> bool:
         """Check if status should be updated (cooldown expired)."""
-        return (time.time() - self._last_status_update) > self._status_cooldown_s
+        return (time.time() - self._last_status_update.get(self._ns(), 0)) > self._status_cooldown_s
 
     def should_update_bio(self) -> bool:
         """Check if bio should be checked for monthly update."""
-        return (time.time() - self._last_bio_update) > self._bio_check_interval_s
+        return (time.time() - self._last_bio_update.get(self._ns(), 0)) > self._bio_check_interval_s
 
     async def update_status(self, client: discord.Client, mood: str):
         """
@@ -189,18 +200,19 @@ class StatusManager:
         if not self.should_update_status():
             return
 
+        ns = self._ns()
         status_text = generate_status(mood)
         status_mode = get_status_mode(mood)
 
         # Don't update if same as current
-        if status_text == self._current_status:
+        if status_text == self._current_status.get(ns, ""):
             return
 
         try:
             activity = discord.CustomActivity(name=status_text)
             await client.change_presence(activity=activity, status=status_mode)
-            self._current_status = status_text
-            self._last_status_update = time.time()
+            self._current_status[ns] = status_text
+            self._last_status_update[ns] = time.time()
             logger.info(f"Status updated: '{status_text}' ({status_mode})")
         except Exception as e:
             logger.warning(f"Status update failed: {e}")
@@ -214,6 +226,7 @@ class StatusManager:
         if not self.should_update_bio():
             return
 
+        ns = self._ns()
         try:
             from ..persona.runtime import active as _active_persona
             _p = _active_persona()
@@ -225,25 +238,27 @@ class StatusManager:
             new_bio = get_current_month_bio()
 
         # Don't update if same as current
-        if new_bio == self._current_bio:
-            self._last_bio_update = time.time()
+        if new_bio == self._current_bio.get(ns, ""):
+            self._last_bio_update[ns] = time.time()
             return
 
         try:
             await client.user.edit(bio=new_bio)
-            self._current_bio = new_bio
-            self._last_bio_update = time.time()
+            self._current_bio[ns] = new_bio
+            self._last_bio_update[ns] = time.time()
             logger.info(f"Bio updated (monthly): {new_bio[:50]}...")
         except Exception as e:
             logger.warning(f"Bio update failed: {e}")
 
     def get_status(self) -> dict:
         """Get current status info for debugging."""
+        ns = self._ns()
+        bio = self._current_bio.get(ns, "")
         return {
-            "current_status": self._current_status,
-            "current_bio": self._current_bio[:50] + "..." if self._current_bio else "",
-            "last_status_update": self._last_status_update,
-            "last_bio_update": self._last_bio_update,
+            "current_status": self._current_status.get(ns, ""),
+            "current_bio": bio[:50] + "..." if bio else "",
+            "last_status_update": self._last_status_update.get(ns, 0),
+            "last_bio_update": self._last_bio_update.get(ns, 0),
         }
 
 

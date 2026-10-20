@@ -24,8 +24,8 @@ from __future__ import annotations
 import asyncio
 import os
 import queue as _queue
+import threading
 import time
-import struct
 from typing import Optional, Callable, Awaitable
 
 import numpy as np
@@ -223,7 +223,6 @@ class VoicePipeline:
         # Per-user state
         self._user_vads: dict[int, SileroVAD] = {}
         self._user_asrs: dict[int, StreamingASR] = {}
-        self._user_speaking: dict[int, bool] = {}
         self._user_prerolls: dict[int, PrerollRingBuffer] = {}
         self._user_in_speech: dict[int, bool] = {}
         self._user_last_voice_time: dict[int, float] = {}
@@ -240,6 +239,10 @@ class VoicePipeline:
         # prediction, filter history) and must never be shared across users
         self._user_decoders: dict = {}        # user_id -> opuslib.Decoder
         self._user_resamplers: dict = {}      # user_id -> Resampler
+        # Per-user lock serializing access to that stateful DSP state —
+        # _dsp_frame runs on the voice-dsp pool while vad.reset() /
+        # cleanup_user's pops happen on the loop thread.
+        self._user_locks: dict[int, threading.Lock] = {}
         self._user_agc_gain: dict[int, float] = {}    # user_id -> smoothed AGC gain
         self._user_rms_ema: dict[int, float] = {}     # user_id -> speech energy EMA
         self._user_last_response: dict[int, float] = {}  # user_id -> last reply ts
@@ -278,6 +281,7 @@ class VoicePipeline:
         # incomplete-clause partial — prevents infinite deferral.
         self._user_endpoint_extended: set = set()
         self._relocate_cb = None   # set by manager — leave+join fallback for vc.move_to
+        self._moved_cb = None      # set by manager — bookkeeping after a successful vc.move_to
         self._leave_cb = None      # set by manager — spoken "leave the vc" → disconnect
 
         # Two-pass ASR (shared, lazily loaded)
@@ -320,9 +324,12 @@ class VoicePipeline:
         self._is_speaking = False  # Bot is currently speaking
         self._speak_active = False  # True for entire _speak() incl. TTS-open window (barge-in only clears _is_speaking)
         self._speak_deadline = 0.0  # Safety: auto-reset _is_speaking after 35s
-        self._play_queue: Optional[_queue.Queue] = None
         self._voice_client = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # In-flight tasks spawned by the pipeline (finalize, deferred
+        # finalize) — tracked so cleanup() can cancel them instead of
+        # letting them run against torn-down state.
+        self._tasks: set[asyncio.Task] = set()
 
         # Comfort noise — keeps the Discord voice indicator active like a real human
         self._comfort_noise: Optional[ComfortNoiseSource] = None
@@ -425,6 +432,22 @@ class VoicePipeline:
             threshold_low=_VAD_THRESHOLD_LOW,
             frame_window=_VAD_FRAME_WINDOW,
         )
+
+    def _user_lock(self, user_id: int) -> threading.Lock:
+        """Per-user lock serializing access to stateful DSP objects
+        (decoder, resampler, VAD). Used by _dsp_frame on the voice-dsp
+        threads AND by vad.reset()/cleanup_user() on the loop thread —
+        setdefault is atomic, so all contenders get the same lock."""
+        return self._user_locks.setdefault(user_id, threading.Lock())
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """Track an in-flight task so cleanup() can cancel it — bare
+        create_task's used to survive teardown and run against dead state."""
+        loop = self._loop or asyncio.get_running_loop()
+        task = loop.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     def _get_preroll(self, user_id: int) -> PrerollRingBuffer:
         if user_id not in self._user_prerolls:
@@ -556,10 +579,12 @@ class VoicePipeline:
     def _ack_done(self, error) -> None:
         """After the ack finishes, restart comfort noise (a no-op if a real
         reply has already taken the player — start_comfort_noise bails while
-        _speak_active is set)."""
+        _speak_active is set). Runs on the PLAYER thread — call_later isn't
+        thread-safe, so hop onto the loop first."""
         try:
             if self._loop and self._loop.is_running():
-                self._loop.call_later(0.3, self.start_comfort_noise)
+                self._loop.call_soon_threadsafe(
+                    lambda: self._loop.call_later(0.3, self.start_comfort_noise))
         except Exception:
             pass
 
@@ -658,7 +683,7 @@ class VoicePipeline:
         try:
             from ..ai import llm
             from ..ai import prompts as ai_prompts
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             resp = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
@@ -763,7 +788,7 @@ class VoicePipeline:
             from ..ai import llm
             from ..persona.runtime import active as _active_persona
             _p = _active_persona()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             resp = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
@@ -825,6 +850,14 @@ class VoicePipeline:
         try:
             if self._voice_client and self._voice_client.is_connected():
                 await self._voice_client.move_to(channel)
+                # Sync the manager's bookkeeping — without this _current_vcs
+                # still points at the OLD channel and silence checks, nudges
+                # and voice-state handling all target the wrong room.
+                if self._moved_cb:
+                    try:
+                        self._moved_cb(channel)
+                    except Exception as e:
+                        logger.debug(f"[voice] moved bookkeeping failed: {e}")
                 return
         except Exception as e:
             logger.debug(f"[voice] vc.move_to failed ({e!r}) — falling back to leave+join")
@@ -847,36 +880,44 @@ class VoicePipeline:
         """Sync DSP for a packet batch — runs on the voice-dsp thread:
         Opus decode → AGC → resample (only if VAD needs 16k) → VAD."""
         in_speech = self._user_in_speech.get(user_id, False)
-        pcms = []
-        any_voice_data = False
-        for pkt in packets:
-            # DTX/comfort-silence packets are ≤8 bytes — skip decoding them
-            # outside speech; they carry no voice energy
-            if len(pkt) <= 8 and not in_speech:
-                pcms.append(b"\x00" * 1920)
-                continue
-            try:
-                pcm = self._decode_opus(user_id, pkt)
-            except Exception as e:
-                logger.error(f"Opus decode error for user {user_id}: {e!r}")
-                continue
-            if pcm:
-                pcms.append(pcm)
-                any_voice_data = True
-        if not pcms:
-            return None, None
-        pcm_48k = b"".join(pcms)
-        if not any_voice_data:
-            # Whole batch was DTX silence — skip AGC/resample/VAD entirely
-            return pcm_48k, None
-        # Boost feeble/quiet audio — one boost covers VAD, streaming ASR,
-        # and the buffered two-pass Whisper input
-        pcm_48k = self._apply_agc(user_id, pcm_48k)
-        vad = self._get_vad(user_id)
-        if getattr(vad, "input_rate", 16000) == 48000:
-            # webrtcvad eats 48kHz directly — no per-packet resample needed
-            return pcm_48k, vad.feed(pcm_48k)
-        return pcm_48k, vad.feed(self._resample_48k_to_16k(user_id, pcm_48k))
+        # Serialize on the per-user lock — the decoder/resampler/VAD are
+        # stateful and this runs concurrently with _whisper_pass's resample,
+        # _finalize_inner's vad.reset() and cleanup_user's pops.
+        with self._user_lock(user_id):
+            if user_id not in self._user_pkt_queues:
+                # cleanup_user ran while this frame was queued on the pool —
+                # bail instead of resurrecting decoder/resampler/VAD state
+                return None, None
+            pcms = []
+            any_voice_data = False
+            for pkt in packets:
+                # DTX/comfort-silence packets are ≤8 bytes — skip decoding them
+                # outside speech; they carry no voice energy
+                if len(pkt) <= 8 and not in_speech:
+                    pcms.append(b"\x00" * 1920)
+                    continue
+                try:
+                    pcm = self._decode_opus(user_id, pkt)
+                except Exception as e:
+                    logger.error(f"Opus decode error for user {user_id}: {e!r}")
+                    continue
+                if pcm:
+                    pcms.append(pcm)
+                    any_voice_data = True
+            if not pcms:
+                return None, None
+            pcm_48k = b"".join(pcms)
+            if not any_voice_data:
+                # Whole batch was DTX silence — skip AGC/resample/VAD entirely
+                return pcm_48k, None
+            # Boost feeble/quiet audio — one boost covers VAD, streaming ASR,
+            # and the buffered two-pass Whisper input
+            pcm_48k = self._apply_agc(user_id, pcm_48k)
+            vad = self._get_vad(user_id)
+            if getattr(vad, "input_rate", 16000) == 48000:
+                # webrtcvad eats 48kHz directly — no per-packet resample needed
+                return pcm_48k, vad.feed(pcm_48k)
+            return pcm_48k, vad.feed(self._resample_48k_to_16k(user_id, pcm_48k))
 
     async def _process_packets(self, user_id: int, packets: list) -> None:
         """Process a batch of incoming Opus packets.
@@ -934,7 +975,6 @@ class VoicePipeline:
         # ── Speech start: drain pre-roll into ASR ─────────────────────────
         if vad_result.speech_started and not in_speech:
             self._user_in_speech[user_id] = True
-            self._user_speaking[user_id] = True
             # Seed with a carried fragment when the previous breath was
             # endpointed early (<2s ago) — it's this utterance's first half
             carry = self._user_carry_pcm.pop(user_id, None)
@@ -1075,7 +1115,9 @@ class VoicePipeline:
                 # never real speech — drop it.
                 import re
                 norm = re.sub(r"[^\w\s]", "", text).strip().lower()
-                names = {n.lower() for n in self._user_display_names.values() if n}
+                # list() copy — the recv thread mutates _user_display_names
+                # while this runs on the dsp pool
+                names = {n.lower() for n in list(self._user_display_names.values()) if n}
                 if (not norm or norm in names
                         or (len(norm.split()) <= 3 and prompt
                             and norm in prompt.lower())):
@@ -1091,7 +1133,7 @@ class VoicePipeline:
         better when the model knows the vocabulary: who's in the call, the
         persona's name, and what was just said."""
         bits = []
-        names = sorted({n for n in self._user_display_names.values() if n})
+        names = sorted({n for n in list(self._user_display_names.values()) if n})
         if names:
             bits.append("names in the call: " + ", ".join(names[:8]))
         last = self._user_last_transcript.get(user_id)
@@ -1156,7 +1198,7 @@ class VoicePipeline:
                     pass  # fall through to normal endpoint
 
             logger.info(f"[voice] Watchdog endpoint for user {user_id} (silence={silence_duration:.2f}s)")
-            self._loop.create_task(self._finalize_and_respond(user_id))
+            self._spawn(self._finalize_and_respond(user_id))
         except Exception as e:
             logger.error(f"[voice] Watchdog error for user {user_id}: {e!r}")
 
@@ -1217,39 +1259,34 @@ class VoicePipeline:
         return ema is not None and ema < _FEEBLE_RMS
 
     def _resample_48k_to_16k(self, user_id: int, pcm_48k: bytes) -> bytes:
-        """Resample 48kHz to 16kHz using high-quality soxr resampler.
-        Falls back to scipy anti-aliased resampling, then simple decimation.
+        """Resample 48kHz to 16kHz using the per-user streaming resampler
+        (soxr; decimation fallback lives inside Resampler itself).
 
         Resamplers are keyed per user — soxr keeps filter state between
         frames, so sharing one across users cross-contaminates their audio.
+        Callers must hold the per-user lock: ResampleStream isn't
+        thread-safe (this is why the Whisper pass uses a fresh one-shot).
         """
-        if user_id not in self._user_resamplers:
-            try:
-                from ._resampler import Resampler
-                self._user_resamplers[user_id] = Resampler(48000, 16000)
-            except Exception:
-                self._user_resamplers[user_id] = None
-        resampler = self._user_resamplers[user_id]
-        if resampler is not None:
-            return resampler.feed(pcm_48k)
-        # Fallback: scipy anti-aliased resampling
-        try:
-            from scipy.signal import resample_poly
-            import numpy as np
-            samples = np.frombuffer(pcm_48k, dtype=np.int16).astype(np.float32)
-            resampled = resample_poly(samples, 1, 3)
-            return resampled.astype(np.int16).tobytes()
-        except ImportError:
-            pass
-        # Last resort: simple decimation (causes aliasing)
-        import struct
-        samples = struct.unpack(f'<{len(pcm_48k)//2}h', pcm_48k)
-        decimated = samples[::3]
-        return struct.pack(f'<{len(decimated)}h', *decimated)
+        resampler = self._user_resamplers.get(user_id)
+        if resampler is None:
+            from ._resampler import Resampler
+            resampler = self._user_resamplers.setdefault(
+                user_id, Resampler(48000, 16000))
+        return resampler.feed(pcm_48k)
 
     def _resample_48k_to_16k_float32(self, user_id: int, pcm_48k: bytes) -> np.ndarray:
-        """Resample 48kHz int16 PCM to 16kHz float32 numpy array (for Whisper)."""
-        pcm_16k_int16 = self._resample_48k_to_16k(user_id, pcm_48k)
+        """Resample 48kHz int16 PCM to 16kHz float32 numpy array (for Whisper).
+
+        Uses a FRESH one-shot resampler — the per-user streaming resampler in
+        _user_resamplers is concurrently fed the NEXT utterance's packets by
+        _dsp_frame on another dsp thread, so sharing it corrupted both
+        streams (and ResampleStream isn't thread-safe anyway)."""
+        try:
+            from ._resampler import Resampler
+            pcm_16k_int16 = Resampler(48000, 16000).feed(pcm_48k)
+        except Exception:
+            # Last resort: naive decimation (aliases, but better than nothing)
+            pcm_16k_int16 = np.frombuffer(pcm_48k, dtype=np.int16)[::3].tobytes()
         if not pcm_16k_int16:
             return np.zeros(0, dtype=np.float32)
         return np.frombuffer(pcm_16k_int16, dtype=np.int16).astype(np.float32) / 32768.0
@@ -1267,8 +1304,7 @@ class VoicePipeline:
             if user_id not in self._user_finalize_queued:
                 self._user_finalize_queued.add(user_id)
                 try:
-                    asyncio.get_running_loop().create_task(
-                        self._deferred_finalize(user_id))
+                    self._spawn(self._deferred_finalize(user_id))
                 except Exception:
                     self._user_finalize_queued.discard(user_id)
             logger.debug(f"[voice] Finalize superseded — queued re-finalize for user {user_id}")
@@ -1318,7 +1354,6 @@ class VoicePipeline:
 
         # Mark as no longer in speech
         self._user_in_speech[user_id] = False
-        self._user_speaking[user_id] = False
         self._user_mic_active[user_id] = False
         self._user_ack_at.pop(user_id, None)
 
@@ -1335,10 +1370,13 @@ class VoicePipeline:
         # Reset the VAD — it may still be mid-utterance (forced endpoint or the
         # deferred-feeble path). A fresh state guarantees the next voice onset
         # produces a new speech_started instead of desyncing into silence.
+        # Under the per-user lock: _dsp_frame's vad.feed() runs on a dsp
+        # thread and would otherwise race this reset.
         vad = self._user_vads.get(user_id)
         if vad is not None:
             try:
-                vad.reset()
+                with self._user_lock(user_id):
+                    vad.reset()
             except Exception:
                 pass
 
@@ -1681,6 +1719,9 @@ class VoicePipeline:
         try:
             from ..ai import output_guard as _og
             if _og.leaks_internals(response) or _og.is_degenerate(response):
+                import random as _r  # MUST be inside the branch — the leave_cmd
+                # early-return's local import never runs on this path, and an
+                # unbound _r here made the guard fail OPEN (bad reply spoken)
                 logger.warning(f"[voice] suppressed leaking/degenerate reply: {response[:60]!r}")
                 await self._speak(_r.choice(["wdym?", "huh?", "sorry what?", "what?"]))
                 return
@@ -1802,10 +1843,15 @@ class VoicePipeline:
             player_error = [None]
 
             def _on_playback_done(error):
+                # Runs on the player thread — asyncio.Event.set() isn't
+                # thread-safe, hop back onto the loop to signal it.
                 if error:
                     player_error[0] = error
                     logger.error(f"[voice] Player thread error: {error!r}")
-                play_done.set()
+                try:
+                    self._loop.call_soon_threadsafe(play_done.set)
+                except Exception:
+                    pass  # loop already closed (teardown mid-playback)
 
             # Feed text in chunks and collect audio packets
             async def _feed_and_collect():
@@ -1945,10 +1991,15 @@ class VoicePipeline:
                 player_error = [None]
 
                 def _on_playback_done(error):
+                    # Runs on the player thread — asyncio.Event.set() isn't
+                    # thread-safe, hop back onto the loop to signal it.
                     if error:
                         player_error[0] = error
                         logger.error(f"[voice] Player thread error: {error!r}")
-                    play_done.set()
+                    try:
+                        self._loop.call_soon_threadsafe(play_done.set)
+                    except Exception:
+                        pass  # loop already closed (teardown mid-playback)
 
                 import re as _re
                 from ..ai.reply import clean_for_speech
@@ -1984,10 +2035,13 @@ class VoicePipeline:
                                     break
                                 sent, buf = buf[:m.start()], buf[m.end():]
                                 await _push(sent)
-                        # Tail: leftover fragment without a boundary — keep it
-                        # if it's substantial (mirrors the dangling-fragment rule)
+                        # Tail: leftover fragment without a boundary — push
+                        # whatever's left, even a 1-word reply. Dropping a
+                        # short tail made the whole turn return False and the
+                        # caller re-ran the FULL LLM call for nothing.
+                        # (_push still filters anything unspeakable.)
                         tail = buf.strip()
-                        if tail and len(tail.split()) >= 2:
+                        if tail:
                             await _push(tail)
                         if produced[0]:
                             await tts.end_turn()
@@ -2054,9 +2108,11 @@ class VoicePipeline:
         if self._voice_client and self._voice_client.is_playing():
             self._voice_client.stop()
         self._is_speaking = False
-        # Restart comfort noise after a brief pause (called from barge-in)
+        # Restart comfort noise after a brief pause — may be called from a
+        # non-loop thread, so schedule it thread-safely
         if self._loop and self._loop.is_running():
-            self._loop.call_later(0.3, self.start_comfort_noise)
+            self._loop.call_soon_threadsafe(
+                lambda: self._loop.call_later(0.3, self.start_comfort_noise))
 
     def get_active_users(self) -> list:
         """Get list of (user_id, display_name, last_speech_time, speech_count)
@@ -2114,19 +2170,26 @@ class VoicePipeline:
 
     async def cleanup_user(self, user_id: int) -> None:
         """Clean up resources for a user who left the channel."""
-        self._user_vads.pop(user_id, None)
+        # Pop the packet queue/worker first so no NEW dsp frames queue up —
+        # then take the per-user lock so a _dsp_frame already in-flight on
+        # the pool finishes before we pop its decoder/resampler/VAD.
+        self._user_pkt_queues.pop(user_id, None)
+        pkt_task = self._user_pkt_workers.pop(user_id, None)
+        if pkt_task and not pkt_task.done():
+            pkt_task.cancel()
+        with self._user_lock(user_id):
+            self._user_vads.pop(user_id, None)
+            self._user_decoders.pop(user_id, None)
+            self._user_resamplers.pop(user_id, None)
+            self._user_agc_gain.pop(user_id, None)
+            self._user_rms_ema.pop(user_id, None)
         asr = self._user_asrs.pop(user_id, None)
         if asr:
             await asr.close()
-        self._user_speaking.pop(user_id, None)
         self._user_prerolls.pop(user_id, None)
         self._user_in_speech.pop(user_id, None)
         self._user_last_voice_time.pop(user_id, None)
         self._user_utterance_pcm.pop(user_id, None)
-        self._user_decoders.pop(user_id, None)
-        self._user_resamplers.pop(user_id, None)
-        self._user_agc_gain.pop(user_id, None)
-        self._user_rms_ema.pop(user_id, None)
         self._user_last_response.pop(user_id, None)
         self._user_utt_start.pop(user_id, None)
         self._user_farewell_at.pop(user_id, None)
@@ -2141,10 +2204,9 @@ class VoicePipeline:
         self._irritation.clear(user_id)
         self._finalizing.discard(user_id)
         self._user_carry_pcm.pop(user_id, None)
-        self._user_pkt_queues.pop(user_id, None)
-        pkt_task = self._user_pkt_workers.pop(user_id, None)
-        if pkt_task and not pkt_task.done():
-            pkt_task.cancel()
+        self._user_mic_active.pop(user_id, None)
+        self._user_display_names.pop(user_id, None)
+        self._user_speech_count.pop(user_id, None)
         task = self._user_watchdog_tasks.pop(user_id, None)
         if task is not None:
             task.cancel()
@@ -2157,10 +2219,18 @@ class VoicePipeline:
         if self._hmm_player is not None:
             self._hmm_player.stop()
             self._hmm_player = None
-        for uid in list(self._user_asrs.keys()):
+        # Cancel in-flight spawned tasks (finalizes, deferred finalizes) —
+        # bare create_task's used to survive teardown
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+        # Union of all per-user keys — a user whose stream-ASR was never
+        # opened (or is disabled) still has a VAD/decoder/worker to drop
+        all_users = set(self._user_asrs) | set(self._user_vads) | set(self._user_pkt_queues)
+        for uid in all_users:
             await self.cleanup_user(uid)
         self._user_vads.clear()
-        self._user_speaking.clear()
         self._user_prerolls.clear()
         self._user_in_speech.clear()
         self._user_last_voice_time.clear()
@@ -2190,6 +2260,15 @@ class VoicePipeline:
             task.cancel()
         self._user_watchdog_tasks.clear()
         self._user_wd_gen.clear()
+        # Per-user activity maps — left uncleared they kept dead VCs
+        # "active" (silence-leave never fired) and leaked user names
+        self._user_mic_active.clear()
+        self._user_display_names.clear()
+        self._user_speech_count.clear()
+        self._user_last_speech_time.clear()
+        self._user_locks.clear()
+        self._last_bot_speech_time = 0.0
+        self._last_proactive_time = 0.0
         if self._dsp_pool is not None:
             self._dsp_pool.shutdown(wait=False)
             self._dsp_pool = None

@@ -34,6 +34,20 @@ class _KeyState:
     errors: int = 0
 
 
+async def _close_stream(stream) -> None:
+    """Best-effort close of an abandoned stream iterator (SDK exposes
+    `close()`; newer versions may expose `aclose()`)."""
+    try:
+        closer = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+        if closer is None:
+            return
+        res = closer()
+        if asyncio.iscoroutine(res):
+            await res
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @dataclass
 class GroqPool:
     keys: list[str] = field(default_factory=list)
@@ -106,12 +120,14 @@ class GroqPool:
                 kwargs = dict(
                     model=model,
                     messages=messages,
-                    tools=tools,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     **extra,
                 )
                 if tools:
+                    # tools=None must NOT be sent — "tools": null makes
+                    # Groq reject the payload on some models.
+                    kwargs["tools"] = tools
                     kwargs["tool_choice"] = tool_choice
                 resp = await st.client.chat.completions.create(**kwargs)
                 # reset error counter on success
@@ -195,6 +211,9 @@ class GroqPool:
                         chunk = await asyncio.wait_for(
                             it.__anext__(), timeout=8.0)
                     except asyncio.TimeoutError:
+                        # Abandoning a live stream iterator leaks the
+                        # underlying HTTP connection — close it first.
+                        await _close_stream(stream)
                         if first:
                             raise RuntimeError("stream stalled before first token")
                         break  # partial content is better than none
