@@ -2,9 +2,20 @@
 Mood engine — simulates emotional state that drifts over time.
 11 mood states that affect reply style, with content-aware nudges.
 """
+import re
 import time
 import random
 from loguru import logger
+
+
+def _kw_hit(kw: str, txt: str) -> bool:
+    """Substring match is wrong for word keywords — bare "w" (Discord slang
+    for "win") sits inside every word containing 'w' ("what", "now",
+    "weekend"), and "how" hits inside "show"/"however". Emoji and other
+    non-word keywords keep plain containment since \b can't anchor them."""
+    if kw[:1].isalnum() and kw[-1:].isalnum():
+        return bool(re.search(rf"\b{re.escape(kw)}\b", txt))
+    return kw in txt
 
 # All possible moods
 MOODS = [
@@ -70,7 +81,7 @@ class MoodEngine:
             txt = trigger_text.lower()
             nudge = None
             for keywords, target_moods in CONTENT_NUDGES.items():
-                if any(kw in txt for kw in keywords):
+                if any(_kw_hit(kw, txt) for kw in keywords):
                     nudge = random.choice(target_moods)
                     break
 

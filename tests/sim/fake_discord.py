@@ -13,6 +13,8 @@ import time as _time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional
 
+import discord
+
 
 _id_counter = itertools.count(10_000_000)
 
@@ -40,17 +42,49 @@ class FakeUser:
         self.avatar = None
         self.discriminator = "0"
         self._edits: List[dict] = []      # recorded profile edits
-        self.status = "online"
+        # discord.py Member.status is a Status enum — the member tools and
+        # re_engagement compare against it directly.
+        self.status = discord.Status.online
+        # User-level attrs the action tools read for member summaries.
+        self.activities: List[Any] = []
+        self.voice = None
+        self.banner = None
+        self.public_flags = None
+        self.display_avatar = None
+        self.created_at = _snowflake_created_at(_time.time())
+        # discord.py User.send() -> create_dm().send(). Lazily created so
+        # tests can read `user.dm_channel.sent_log` after a DM tool ran.
+        self._dm_channel: Optional["FakeDMChannel"] = None
 
     @property
     def mention(self) -> str:
         return f"<@{self.id}>"
+
+    @property
+    def dm_channel(self) -> Optional["FakeDMChannel"]:
+        """discord.py: the open DM channel with this user, if any."""
+        return self._dm_channel
+
+    async def create_dm(self) -> "FakeDMChannel":
+        """discord.py: open (or reuse) the DM channel with this user."""
+        if self._dm_channel is None:
+            self._dm_channel = FakeDMChannel(recipient=self)
+        return self._dm_channel
+
+    async def send(self, content: str = None, **kwargs) -> "FakeMessage":
+        """discord.py User.send — content lands in the DM channel, never
+        a guild channel."""
+        dm = await self.create_dm()
+        return await dm.send(content, **kwargs)
 
     def __eq__(self, other):
         return getattr(other, "id", None) == self.id
 
     def __hash__(self):
         return hash(self.id)
+
+    def __str__(self):
+        return self.name
 
     def __repr__(self):
         return f"<FakeUser {self.name}#{self.id}>"
@@ -80,6 +114,11 @@ class FakeMember(FakeUser):
     @display_name.setter
     def display_name(self, value):
         self.global_name = value
+
+    @property
+    def top_role(self):
+        """discord.py: the member's highest role, None when roleless."""
+        return self.roles[-1] if self.roles else None
 
 
 class FakeRole:
@@ -127,6 +166,8 @@ class FakeMessageReference:
 class FakeReadState:
     def __init__(self, last_acked_id: int = 0):
         self.last_acked_id = last_acked_id
+        self.badge_count = 0            # discord ReadState: unread @mentions
+        self.last_viewed = None
 
 
 class FakePermissions:
@@ -173,6 +214,10 @@ class FakeMessage:
         self.reactions: List[FakeReaction] = []
         self.role_mentions: List[FakeRole] = []
         self.edited_at = None
+        self.stickers: List[Any] = []       # discord.Message.stickers
+        self.pinned = False                 # discord.Message.pinned
+        self.deleted = False                # tombstone — lets tests observe
+                                            # deletion on the msg object itself
 
     @property
     def clean_content(self) -> str:
@@ -201,6 +246,7 @@ class FakeMessage:
         self.reactions.append(FakeReaction(emoji, count=1, me=True))
 
     async def delete(self):
+        self.deleted = True
         if self in self.channel.messages:
             self.channel.messages.remove(self)
         self.channel.deleted.append(self)
@@ -210,7 +256,10 @@ class FakeMessage:
 # Channels
 # ─────────────────────────────────────────────────────────────────────────────
 
-class FakeTextChannel:
+class FakeTextChannel(discord.TextChannel):
+    """A real ``discord.TextChannel`` subclass — the action tools gate send
+    targets behind ``isinstance(ch, discord.TextChannel)`` checks, so a
+    duck-typed double can never exercise the real resolution path."""
     def __init__(self, channel_id: int = None, name: str = "general",
                  guild=None, topic: str = ""):
         self.id = channel_id if channel_id is not None else next_id()
@@ -220,8 +269,9 @@ class FakeTextChannel:
         self.messages: List[FakeMessage] = []
         self.sent_log: List[dict] = []     # every send() call: {content, kwargs}
         self.deleted: List[FakeMessage] = []
-        self.mention_count = 0
-        self.read_state = FakeReadState()
+        # discord.TextChannel exposes mention_count/read_state as read-only
+        # properties — back them with our own state instead of assigning.
+        self._fake_read_state = FakeReadState()
         self._perms = FakePermissions()
         self.typing_calls = 0
         # Set by the world — echoes our own sends back through on_message,
@@ -233,6 +283,16 @@ class FakeTextChannel:
     @property
     def mention(self):
         return f"<#{self.id}>"
+
+    @property
+    def read_state(self) -> FakeReadState:
+        """discord.py 2.1 ReadState — mention_count derives badge_count
+        from this (production reads mention_count for unread pings)."""
+        return self._fake_read_state
+
+    @property
+    def mention_count(self) -> int:
+        return self._fake_read_state.badge_count
 
     @property
     def last_message_id(self):
@@ -269,7 +329,9 @@ class FakeTextChannel:
                 after: datetime = None, **_) -> AsyncIterator[FakeMessage]:
         msgs = [m for m in self.messages
                 if after is None or m.created_at > after]
-        msgs = sorted(msgs, key=lambda m: m.created_at,
+        # Discord returns history by snowflake id (monotonic), not wall
+        # time — same-timestamp messages must keep newest-id-first order.
+        msgs = sorted(msgs, key=lambda m: m.id,
                       reverse=not oldest_first)[:limit]
 
         async def _gen():
@@ -290,12 +352,14 @@ class FakeVoiceChannel:
         self.members = list(members or [])
 
 
-class FakeDMChannel:
-    """Stand-in patched over discord.DMChannel for isinstance checks."""
+class FakeDMChannel(discord.DMChannel):
+    """A real ``discord.DMChannel`` subclass — ``_should_respond`` routes
+    DMs on ``isinstance(channel, discord.DMChannel)``."""
     def __init__(self, channel_id: int = None, recipient: FakeUser = None):
         self.id = channel_id if channel_id is not None else next_id()
         self.recipient = recipient
-        self.guild = None
+        # discord.DMChannel.guild is a read-only property returning None —
+        # don't assign it.
         self.name = None
         self.messages: List[FakeMessage] = []
         self.sent_log: List[dict] = []
@@ -311,7 +375,7 @@ class FakeDMChannel:
         return msg
 
     def history(self, limit: int = 50, **kw):
-        msgs = sorted(self.messages, key=lambda m: m.created_at, reverse=True)[:limit]
+        msgs = sorted(self.messages, key=lambda m: m.id, reverse=True)[:limit]
 
         async def _gen():
             for m in msgs:
@@ -333,6 +397,18 @@ class FakeGuild:
         self.roles: List[FakeRole] = []
         self.me: Optional[FakeMember] = None
         self.owner_id = 0
+        # discord.Guild.emojis / .stickers — emoji + sticker tools read them.
+        self.emojis: List[Any] = []
+        self.stickers: List[Any] = []
+
+    @property
+    def channels(self) -> List[Any]:
+        """discord.py Guild.channels — every channel (text + voice here)."""
+        return self.text_channels + self.voice_channels
+
+    @property
+    def member_count(self) -> int:
+        return len(self.members)
 
     def add_member(self, user: FakeUser) -> FakeMember:
         m = user if isinstance(user, FakeMember) else FakeMember(

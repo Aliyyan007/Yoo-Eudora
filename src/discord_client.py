@@ -2177,9 +2177,13 @@ class AIPersonaClient(discord.Client):
                     return False, "sticky-no-perms"
 
             # Bot-suspicion backoff — while the channel suspects a bot, half
-            # of the non-question ambient replies get swallowed. (Direct
-            # mentions / replies-to-us already returned earlier.)
+            # of the non-question ambient replies get swallowed. Direct
+            # mentions / replies-to-us are excluded here: this check runs
+            # inside the sticky branch BEFORE the mention gate, so without
+            # the guard a 50% roll could swallow a straight ping.
             if (self._bot_suspicion_until.get(ch_id, 0) > now
+                    and not mentions_bot
+                    and not self._reply_to_us(message, ch_id)
                     and not is_question(message.content)
                     and random.random() < 0.5):
                 return False, "suspicion-backoff"
@@ -2996,6 +3000,8 @@ class AIPersonaClient(discord.Client):
             logger.debug(f"[cmd] trigger_text='{trigger_text[:100]}'")
             cmd_type, cmd_params = detect_command(trigger_text)
             logger.info(f"[cmd] detect_command result: cmd_type={cmd_type}, params={cmd_params}")
+            cmd_handled = False   # stays False when no command ran — referenced
+                                  # later by the attempt-pushback note below
 
             # Fallback: check vc_manager's more comprehensive VC join detection
             if not cmd_type and detect_vc_join_request(trigger_text):
@@ -3380,23 +3386,26 @@ class AIPersonaClient(discord.Client):
                 _grounded = server_directory.ground_channel_mentions(reply_text, message.guild)
                 reply_text = _grounded or server_directory.NO_CHANNEL_FALLBACK
 
-                # Dedup check
+                # Dedup check — a verbatim repeat of the last reply. Ambient
+                # messages can drop silently; a directly-addressed one must
+                # regenerate instead of going quiet (a question met with
+                # silence reads broken, not human).
                 last = self.last_sent.get(ch_id, "")
-                if ai_reply.is_duplicate(reply_text, last):
+                _is_dup = bool(reply_text) and ai_reply.is_duplicate(reply_text, last)
+                if _is_dup and not is_directly_addressed:
                     logger.debug(f"Skipping duplicate reply: '{reply_text[:40]}'")
                     return
 
                 # Near-repeat check against recent replies — regenerates once
                 # with an anti-repeat nudge when the reply is too similar to
-                # something she just said. Only a true near-duplicate of the
-                # LAST reply drops outright — in ongoing convos about the same
-                # topic, word overlap is normal and silence reads worse.
+                # something she just said (a verbatim repeat of the last reply
+                # takes this path when the message was directly addressed).
                 _recent_own = list(self.reply_history.get(ch_id, []))[-3:]
                 _thresh = 0.62 if len(reply_text.split()) <= 6 else 0.78
-                if _recent_own and any(
+                if _is_dup or (_recent_own and any(
                         ai_reply._similarity_ratio(reply_text, prev) >= _thresh
                         or ai_reply._shares_phrase(reply_text, prev)
-                        for prev in _recent_own):
+                        for prev in _recent_own)):
                     logger.debug(f"Near-repeat reply '{reply_text[:40]}' — regenerating")
                     try:
                         _rr = await loop.run_in_executor(
@@ -3413,17 +3422,36 @@ class AIPersonaClient(discord.Client):
                             )
                         )
                         _cand = ai_reply.humanize(str(_rr.get("reply") or "").strip())[:2000] if _rr else ""
-                        # only a genuine repeat of the immediately-previous
-                        # reply is worse than silence — topic-overlap is fine
-                        if _cand and _cand not in ("null", "None") and not (
-                                _recent_own and
-                                ai_reply._similarity_ratio(_cand, _recent_own[-1]) >= 0.75):
+                        # Only take the regen if it actually ISN'T a repeat —
+                        # verbatim or near-identical to ANY of the last 3 own
+                        # replies is still parroting (checking only the last
+                        # one lets a repeat of an older reply slip through).
+                        _cand_repeats = _cand and any(
+                            ai_reply.is_duplicate(_cand, p) or
+                            ai_reply._similarity_ratio(_cand, p) >= 0.75
+                            for p in _recent_own)
+                        if _cand and _cand not in ("null", "None") and not _cand_repeats:
                             reply_text = _cand
                             reaction_emoji = _rr.get("reaction") or reaction_emoji
                             _grounded = server_directory.ground_channel_mentions(reply_text, message.guild)
                             reply_text = _grounded or server_directory.NO_CHANNEL_FALLBACK
                     except Exception as e:
                         logger.debug(f"Anti-repeat retry failed: {e}")
+
+                # Verbatim last resort — the regen attempt above either wasn't
+                # needed (ambient dup already returned) or it came back a
+                # repeat itself. A directed message can't stay silent AND
+                # can't echo something said moments ago — a short "same
+                # thing" ack is how a human handles being asked twice.
+                if is_directly_addressed and (
+                        ai_reply.is_duplicate(reply_text, last)
+                        or any(ai_reply._similarity_ratio(reply_text, p) >= 0.85
+                               for p in _recent_own)):
+                    reply_text = random.choice([
+                        "lol same as before", "still the same 🙃",
+                        "u already asked me that", "same thing rn",
+                        "like i just said 👀", "nothing new honestly",
+                    ])
 
                 # Wrap replies can't end with a question — 'okie, what's
                 # next?' after a dry closer defeats the whole wrap. Runs

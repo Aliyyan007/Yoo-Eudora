@@ -166,8 +166,12 @@ def detect_conversation_nature(text: str, trigger: str = "") -> dict:
     """
     combined = (text + " " + trigger).lower()
 
-    is_question = "?" in combined or any(
-        w in combined for w in ["what", "why", "how", "when", "where", "who", "which", "can u", "could u", "do u"]
+    is_question = "?" in combined or bool(re.search(
+        # Word-boundary match — substring matching made "who" hit inside
+        # "whole"/"show"/"whenever", flagging non-questions as questions.
+        # (Clitic forms like "whats"/"hows" are still caught.)
+        r"\b(?:whats?|whos?|why|hows?|when|where|which)\b", combined)) or any(
+        p in combined for p in ["can u", "could u", "do u"]
     )
 
     is_story = any(

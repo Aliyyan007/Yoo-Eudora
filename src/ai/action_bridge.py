@@ -352,6 +352,19 @@ class ActionWorker:
         self._agent = agent  # tests poke at this handle to reset the pool
         return agent
 
+    def _client_closed(self) -> bool:
+        """The bound client is dead. teardown() marks it (_torn_down)
+        before close() runs, so check both — entry points must no-op
+        instead of queueing tool work that would fire on a closed session
+        in the gap between teardown and the next persona's rebind."""
+        try:
+            if getattr(self.client, "_torn_down", False):
+                return True
+            is_closed = getattr(self.client, "is_closed", None)
+            return bool(is_closed and is_closed())
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ #
     def _check_allowed(self, ctx, name, args):
         """(allowed, possibly-sanitized-args)"""
@@ -478,7 +491,7 @@ class ActionWorker:
         `channel_id` enables a pre-classification inflight probe — a dup
         request for the same user+channel short-circuits BEFORE paying
         for the router + confirm LLM calls."""
-        if not _ENABLED:
+        if not _ENABLED or self._client_closed():
             return None
         if (channel_id is not None and author_id is not None
                 and (str(channel_id), str(author_id)) in self._inflight):
@@ -666,6 +679,8 @@ class ActionWorker:
         out first, then the action fires after a human-like delay (the
         requester sees 'on it' then the thing happens, like a person).
         False when a request for this user+channel is already inflight."""
+        if self._client_closed():
+            return False
         key = (str(message.channel.id), str(message.author.id))
         if key in self._inflight:
             return False
@@ -708,6 +723,8 @@ class ActionWorker:
     async def run_text_info(self, message, trigger_text: str) -> Optional[str]:
         """Run an INFO lookup now (read-only tools) and return the answer
         text â€” the caller relays it through the normal reply engine."""
+        if self._client_closed():
+            return None
         key = (str(message.channel.id), str(message.author.id))
         if key in self._inflight:
             return None
@@ -741,6 +758,8 @@ class ActionWorker:
     # ------------------------------------------------------------------ #
     def queue_voice_action(self, user_id: int, transcript: str, voice_channel,
                            categories=None) -> bool:
+        if self._client_closed():
+            return False
         key = (str(getattr(voice_channel, "id", 0)), str(user_id))
         if key in self._inflight:
             return False
@@ -773,6 +792,8 @@ class ActionWorker:
         return True
 
     async def run_voice_info(self, user_id: int, transcript: str, voice_channel) -> Optional[str]:
+        if self._client_closed():
+            return None
         key = (str(getattr(voice_channel, "id", 0)), str(user_id))
         if key in self._inflight:
             return None
