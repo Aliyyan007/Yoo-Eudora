@@ -190,9 +190,15 @@ class SimWorld:
                               mentions=self._resolve_mentions(content, mentions),
                               reference=ref, **msg_kw)
         task = asyncio.create_task(self.client.on_message(msg))
-        # Advance virtual time so read/typing/send delays elapse
+        # Advance virtual time so read/typing/send delays elapse. A task
+        # mid-executor-hop can park its next virtual sleep just past the
+        # settle window — keep pumping until the task completes (bounded)
+        # instead of stranding the send on the next advance.
         await self.clock.advance(advance)
-        # Let any trailing task work finish
+        for _ in range(6):
+            if task.done():
+                break
+            await self.clock.advance(30)
         if not task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5)

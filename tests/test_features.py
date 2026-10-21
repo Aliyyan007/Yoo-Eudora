@@ -313,7 +313,14 @@ async def test_sustained_message_volume(world):
             await world.say(p, f"<@{world.bot_user.id}> you there?")
 
     n = len(world.sent())
+    # ~70 sends burns through the 60/channel daily cap — the mention would
+    # get correctly deferred. Reset the day so we're testing "still alive",
+    # not "still under cap".
+    world.client.daily_count_ch.clear()
     await world.say(world.alice, f"<@{world.bot_user.id}> still here?")
+    # The mention may have queued behind a pending-queue drain — those are
+    # spawned tasks world.say's pump doesn't wait on. Flush explicitly.
+    await world.advance(120)
     assert len(world.sent()) > n, "bot wedged after sustained volume"
 
 

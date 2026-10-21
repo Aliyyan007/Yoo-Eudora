@@ -273,6 +273,9 @@ async def test_dismissal_in_sticky_sets_backoff(world):
     await _say_reply(world, world.alice, f"<@{world.bot_user.id}> hey")
     ch_id = _ch_id(world)
     assert world.client.sticky_until.get(ch_id, 0) > world.clock.time()
+    # Spawned follow-ups (mood GIF, bursts) can still be in flight — flush
+    # before capturing the baseline or they land inside the dismissal window
+    await world.advance(30)
 
     n = len(world.sent())
     await world.say(world.alice, "shut up")

@@ -59,6 +59,10 @@ def main() -> int:
         f"PublicKey = {public_key}\n"
         f"AllowedIPs = {allowed}\n"
         f"Endpoint = {endpoint}\n"
+        # Keep the NAT mapping warm — without a persistent keepalive the peer
+        # goes quiet in ~15s behind NAT, and wireproxy re-handshakes every
+        # ~30s ("stopped hearing back" spam + brief stalls on each rekey).
+        "PersistentKeepalive = 25\n"
         "\n[http]\n"
         f"BindAddress = 127.0.0.1:{port}\n"
     )

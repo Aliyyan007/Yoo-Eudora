@@ -118,7 +118,15 @@ async def test_lookahead_catches_multipart(world):
 async def test_unanswered_question_surfaces_in_context(world):
     """An ambient question nobody answered gets included when the bot
     replies later — [UNANSWERED...] note in the prompt."""
-    await world.say(world.alice, "what time does the event start?", advance=1)
+    # Dispatch manually with a tiny advance — records the question but
+    # parks its reply mid-read-delay so the question stays unanswered when
+    # bob's prompt is built (world.say's pump would let it complete).
+    ch = world.channel()
+    m = fd.make_message(ch, world.alice, "what time does the event start?",
+                        at=world.clock.time())
+    import asyncio as _aio
+    _aio.create_task(world.client.on_message(m))
+    await world.advance(0.05)
     n = len(world.llm.calls)
     await world.say(world.bob, f"<@{world.bot_user.id}> yo")
     hits = [c for c in world.llm.calls[n:]
