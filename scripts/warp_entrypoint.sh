@@ -23,7 +23,10 @@ start_warp() {
         "$WARP_DIR/wgcf-profile.conf" "$WARP_DIR/wireproxy.conf" "$WARP_PORT" || return 1
     cd /app || return 1
 
-    wireproxy -c "$WARP_DIR/wireproxy.conf" &
+    # -s silences wireproxy's own logger — its chatter is never actionable
+    # here (the curl probe + app-level checks report real failures), and its
+    # keepalive chatter floods the console otherwise.
+    wireproxy -c "$WARP_DIR/wireproxy.conf" -s &
     echo "[warp] wireproxy started (pid $!), waiting for proxy on :$WARP_PORT"
 
     for _ in $(seq 1 45); do
