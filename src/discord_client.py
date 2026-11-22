@@ -3519,17 +3519,29 @@ class AIPersonaClient(discord.Client):
                 # something she just said (a verbatim repeat of the last reply
                 # takes this path when the message was directly addressed).
                 _recent_own = list(self.reply_history.get(ch_id, []))[-3:]
+                # Turn-shape pass — the prompt forbids repeated edge-slang,
+                # echoed openers and question-on-question chains but models
+                # slip them anyway; fix them in code before send. Pure-question
+                # chains join the regen path below.
+                reply_text = ai_reply.enforce_turn_shape(reply_text, _recent_own)
+                _q_chain = ai_reply.question_chain(reply_text, last)
                 _thresh = 0.62 if len(reply_text.split()) <= 6 else 0.78
-                if _is_dup or (_recent_own and any(
+                if _is_dup or _q_chain or (_recent_own and any(
                         ai_reply._similarity_ratio(reply_text, prev) >= _thresh
                         or ai_reply._shares_phrase(reply_text, prev)
                         for prev in _recent_own)):
                     logger.debug(f"Near-repeat reply '{reply_text[:40]}' — regenerating")
+                    _nudge = ("[CRITICAL: you already said this. Reply with something "
+                              "DIFFERENT — new angle, shorter, or just react vibe-wise. "
+                              "Never repeat yourself.]")
+                    if _q_chain:
+                        _nudge += ("[Do NOT end with a question — you asked one last "
+                                   "turn. React, relate, or state something instead.]")
                     try:
                         _rr = await loop.run_in_executor(
                             None,
                             lambda: ai_reply.generate_reply(
-                                transcript + "\n\n[CRITICAL: you already said this. Reply with something DIFFERENT — new angle, shorter, or just react vibe-wise. Never repeat yourself.]",
+                                transcript + "\n\n" + _nudge,
                                 username, user_id, trigger_text or "[shared something]",
                                 self.mood_engine.current_mood, recent_replies, rules_text,
                                 channel_style, self.my_profile_text, channel_lessons,
@@ -3540,6 +3552,8 @@ class AIPersonaClient(discord.Client):
                             )
                         )
                         _cand = ai_reply.humanize(str(_rr.get("reply") or "").strip())[:2000] if _rr else ""
+                        if _cand:
+                            _cand = ai_reply.enforce_turn_shape(_cand, _recent_own)
                         # Only take the regen if it actually ISN'T a repeat —
                         # verbatim or near-identical to ANY of the last 3 own
                         # replies is still parroting (checking only the last
@@ -3548,6 +3562,8 @@ class AIPersonaClient(discord.Client):
                             ai_reply.is_duplicate(_cand, p) or
                             ai_reply._similarity_ratio(_cand, p) >= 0.75
                             for p in _recent_own)
+                        if _cand and ai_reply.question_chain(_cand, last):
+                            _cand = ""
                         if _cand and _cand not in ("null", "None") and not _cand_repeats:
                             reply_text = _cand
                             reaction_emoji = _rr.get("reaction") or reaction_emoji
@@ -3577,12 +3593,26 @@ class AIPersonaClient(discord.Client):
                               if a != last and a not in _recent_own]
                     reply_text = random.choice(_fresh or _acks)
 
+                # Stubborn question-chain — regen either didn't run or came
+                # back interrogative anyway. A pure question on a question-
+                # turn is the interrogation tell: keep the statement part,
+                # or fall back to a plain reaction.
+                if ai_reply.question_chain(reply_text, last):
+                    _kept = ai_reply.strip_trailing_question(reply_text)
+                    if len(_kept) >= 3:
+                        reply_text = _kept
+                    else:
+                        reply_text = random.choice([
+                            "hmm same tbh", "fair enough", "felt that",
+                            "makes sense", "true", "real",
+                        ])
+
                 # Wrap replies can't end with a question — 'okie, what's
                 # next?' after a dry closer defeats the whole wrap. Runs
                 # AFTER the near-repeat retry above so regenerated text is
                 # stripped too. An all-question reply becomes a plain ack.
                 if _is_wrap and "?" in reply_text:
-                    _kept = re.sub(r"[^.!?]*\?+", "", reply_text).strip(" ,.!")
+                    _kept = ai_reply.strip_trailing_question(reply_text)
                     reply_text = _kept if len(_kept) >= 3 else random.choice(
                         ["yea fr", "ayy", "for sure", "sounds good",
                          "nice one", "fair enough"])
@@ -3794,9 +3824,18 @@ class AIPersonaClient(discord.Client):
                         pass
 
                 # ── Sticker/GIF sending (low frequency, algorithmic) ────────
-                # Try to send a sticker after the reply (very low chance)
+                # Try to send a sticker after the reply (very low chance).
+                # Single-signal rule: when their message echoed our own
+                # question back, the reply we just sent IS the
+                # clarification — a confusion sticker on top is the
+                # redundant 'huh'-then-clarify double signal from the
+                # live logs. Skip it.
+                _was_echo = ai_reply.is_question_echo(
+                    message.content,
+                    list(self.reply_history.get(ch_id, []))[:-1])
                 sticker_mgr = get_sticker_manager()
-                if sticker_mgr.should_send_sticker(message.content, ch_id):
+                if (not _was_echo
+                        and sticker_mgr.should_send_sticker(message.content, ch_id)):
                     if hasattr(message.channel, 'guild') and message.channel.guild:
                         sticker = sticker_mgr.select_sticker(
                             message.channel.guild, message.content, ch_id,
@@ -3817,7 +3856,8 @@ class AIPersonaClient(discord.Client):
                 # Try to send a GIF (low chance, or always if user requested)
                 gif_mgr = get_gif_manager()
                 force_gif = is_gif_request(trigger_text)
-                if gif_mgr.should_send_gif(message.content, ch_id, force=force_gif):
+                if (force_gif or not _was_echo) and gif_mgr.should_send_gif(
+                        message.content, ch_id, force=force_gif):
                     gif_query = gif_mgr.get_gif_query(message.content)
                     if not gif_query and force_gif:
                         gif_query = "cool"

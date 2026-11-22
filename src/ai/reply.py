@@ -191,6 +191,175 @@ def humanize(text: str) -> str:
     return text.strip()
 
 
+# ── Turn-shape enforcement (deterministic, not prompt-level) ────────────
+# The prompt already forbids these patterns; models still slip them through
+# under casual drift. These run on the candidate text BEFORE send so a
+# violation is fixed, not merely discouraged.
+
+# Slang vocatives the persona tags onto message edges — fine as seasoning,
+# but the same one twice running reads as a tic, not a habit.
+_VOCATIVES = (
+    "bruv", "bro", "mate", "innit", "fam", "dude", "sis", "man",
+    "pal", "hun", "babe", "cuz",
+)
+
+# Filler openers safe to drop when they'd echo the previous opener.
+_FILLER_OPENERS = {
+    "just", "so", "like", "well", "honestly", "literally", "basically",
+    "actually", "ngl", "tbh", "lol", "lmao", "fr", "i", "yeah", "nah",
+    "hmm", "ok", "okay", "cool", "true", "real", "same", "fair",
+}
+
+# Core interrogative alternation — shared by _Q_WORDS_RE (anchored match
+# for question detection) and strip_trailing_question (clause-boundary
+# search). Keep them in sync through this one string.
+_Q_TAIL = (
+    r"wh(?:at|o|y|en|ere|ich)(?:'s|'re|s|re)?|how(?:'s|s)?|"
+    r"wyd|wbu|hbu|hru|are (?:u|you)|do (?:u|you)|did (?:u|you)|"
+    r"can (?:u|you)|(?:u|you) (?:good|ok|up|got|think)|got any|"
+    r"u think|you think"
+)
+
+_Q_WORDS_RE = re.compile(r"^(?:" + _Q_TAIL + r")\b", re.IGNORECASE)
+
+
+def _looks_like_question(text: str) -> bool:
+    """True if this message turn is interrogative — a '?' anywhere, or an
+    interrogative clause at the lead or tail ('tired but hanging in
+    there, how's it going bruv' is still a question-turn)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "?" in t:
+        return True
+    if _Q_WORDS_RE.match(t):
+        return True
+    # tail clause after , ; and/but/or
+    parts = re.split(r"[,;]|\band\b|\bbut\b|\bor\b", t)
+    return bool(parts and _Q_WORDS_RE.match(parts[-1].strip()))
+
+
+def _first_word(text: str) -> str:
+    m = re.match(r"[^\w']*([\w']+)", (text or "").strip().lower())
+    return m.group(1) if m else ""
+
+
+def _edge_vocatives(text: str) -> set:
+    """Vocatives used at this message's leading/trailing edge — the spots
+    where they attach as seasoning ('hey bruv', 'how's it going bruv').
+    Mid-sentence 'the man said...' is content, not a tic — untouched."""
+    out = set()
+    for v in _VOCATIVES:
+        if re.search(rf"(?i)(^\s*{v}\b|\b{v}[\s,!?]*$)", text):
+            out.add(v)
+    return out
+
+
+def _drop_repeated_vocative(text: str, prev: str) -> str:
+    """Same edge-vocative two sends running → drop it from the new one."""
+    shared = _edge_vocatives(text) & _edge_vocatives(prev)
+    t = text
+    for v in shared:
+        t2 = re.sub(rf"(?i)^\s*{v}[\s,!?]+", "", t).strip()
+        if t2 == t:
+            t2 = re.sub(rf"(?i)[\s,!?]+{v}\s*$", "", t).strip()
+        if len(t2) >= 3:
+            t = t2
+    return t
+
+
+# Tag-question tails that detach cleanly: 'im good wbu?' -> 'im good'
+_Q_TAGS = (
+    "wbu", "hbu", "hru", "wyd", "u think", "you think", "innit", "right",
+    "yeah", "u ok", "you ok", "u up", "you up", "u good", "you good",
+    "u", "you",
+)
+
+
+def strip_trailing_question(text: str) -> str:
+    """Cut a trailing question clause, keeping a leading statement.
+    'just vibes, what's on your playlist?' -> 'just vibes'
+    'im good wbu?' -> 'im good'
+    'fair enough. anything else?' -> 'fair enough'
+    Returns '' when the whole message is a question (nothing to keep)."""
+    s = (text or "").rstrip()
+    if not s.endswith("?"):
+        return text
+    # sentence-level first: drop every ?-sentence, keep the statements
+    kept = re.sub(r"[^.!?]*\?+", "", s).strip(" ,.!")
+    if len(kept) >= 3 and not _looks_like_question(kept):
+        return kept
+    # detachable tag tail — ', u ok?' / ' wbu?'
+    s2 = re.sub(
+        r"(?i),?\s*(?:" + "|".join(_Q_TAGS) + r")\?+\s*$", "", s
+    ).strip(" ,.!")
+    if s2 != s and len(s2) >= 3 and not _looks_like_question(s2):
+        return s2
+    # clause boundary right before an interrogative clause
+    m = (re.search(r"[,;]\s*(?=" + _Q_TAIL + r")", s)
+         or re.search(r"\s(?:and|but|or)\s+(?=" + _Q_TAIL + r")", s))
+    if m:
+        cand = s[:m.start()].strip(" ,.!;")
+        if len(cand) >= 3:
+            return cand
+    return ""
+
+
+def question_chain(text: str, prev: str) -> bool:
+    """Two interrogative turns in a row — the interrogation pattern that
+    outs a bot faster than any vocabulary leak."""
+    return bool(text and prev
+                and _looks_like_question(prev) and _looks_like_question(text))
+
+
+def is_question_echo(trigger: str, recent_own: list) -> bool:
+    """Their message is a tiny echo of OUR last question — 'playlist?'
+    after 'what's on your playlist?'. That means 'what do you mean', not
+    a new question for us to answer. Every content word of theirs came
+    from our question; a real echo can't add new words."""
+    if not trigger or not recent_own:
+        return False
+    last = recent_own[-1]
+    if not _looks_like_question(last):
+        return False
+    # cut at the apostrophe so "what's" and "what" compare equal
+    def _ws(t):
+        return {w.split("'")[0] for w in re.findall(r"[a-zA-Z']+", t.lower())
+                if len(w) > 2}
+    trig = _ws(trigger)
+    if not trig or len(trig) > 5:
+        return False
+    return trig <= _ws(last)
+
+
+def enforce_turn_shape(text: str, recent_own: list) -> str:
+    """Deterministic naturalness pass over a candidate reply, given the
+    last few own sends. Fixes what prompt rules can't reliably prevent:
+    repeated edge-slang, echoed openers, question-on-question chains.
+    Pure-question chains the strip can't fix are left for the caller to
+    regenerate — use question_chain() to detect that case."""
+    if not text or not recent_own:
+        return text
+    t = _drop_repeated_vocative(text.strip(), recent_own[-1])
+
+    # Repeated opener — drop a leading filler word if it echoes the last
+    # two replies' openers ('just vibes' → 'just a mix of...' is the tell).
+    for prev in recent_own[-2:]:
+        op = _first_word(prev)
+        if op and _first_word(t) == op and op in _FILLER_OPENERS:
+            t2 = re.sub(rf"^{re.escape(op)}[\s,]+", "", t, flags=re.IGNORECASE).strip()
+            if len(t2) >= 3:
+                t = t2
+            break
+
+    # Question-chain — keep the statement part if there is one.
+    if question_chain(t, recent_own[-1]):
+        kept = strip_trailing_question(t)
+        if len(kept) >= 3:
+            t = kept
+    return t
+
+
 # â”€â”€ Spoken-language cleanup for voice / TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Text abbreviations that look fine in a text chat but sound wrong when read
@@ -392,6 +561,7 @@ def generate_reply(
         recent_replies, rules_text, channel_style, my_profile_text,
         channel_lessons, channel_topic, channel_name, discord_topic,
         my_name, mentioned_users, suspicion,
+        echo_of_own_question=is_question_echo(trigger_message, recent_replies),
     )
 
     if image_urls:

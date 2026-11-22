@@ -251,6 +251,7 @@ def build_reply_prompt(
     my_name: str = "",
     mentioned_users: list = None,
     suspicion: bool = False,
+    echo_of_own_question: bool = False,
 ) -> str:
     """Build the full reply prompt with dynamic context pruning."""
     import random
@@ -371,7 +372,11 @@ def build_reply_prompt(
         f"{topic_block}"
         f"[about {username}: {memory_text}]\n\n"
         f"{suspicion_block}"
-        f"[chat log — most recent messages, read carefully]\n{transcript}\n"
+        + ("[NOTE: their message is echoing YOUR last question back at you — "
+           "they mean 'what do you mean'. REPHRASE what you asked in a few "
+           "casual words; do NOT answer your own question.]\n"
+           if echo_of_own_question else "")
+        + f"[chat log — most recent messages, read carefully]\n{transcript}\n"
         f"[message you must respond to] {username}: {trigger_message}\n\n"
         f"REACT to this message like a real person would in casual chat.\n"
         f"STYLE IMPERATIVE: {_ACTIVE.style_line}\n"

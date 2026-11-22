@@ -1,0 +1,31 @@
+Naturalness guard: deterministic turn-shape enforcement at send boundary
+
+Live-log review showed prompt-level rules (anti-interview, no-repeat,
+echoed-question) being ignored under drift: 'bruv' twice running, a
+question every turn, 'just' opener echo, and the bot answering its own
+playlist question when the user echoed 'playlist?' back.
+
+- reply.py: enforce_turn_shape() — strips repeated edge-vocatives and
+  echoed filler openers; question_chain() detects two interrogative
+  turns incl. tail-clause questions; strip_trailing_question() cuts a
+  trailing question clause at sentence/connector/tag boundaries while
+  keeping the statement; is_question_echo() detects 'playlist?'-style
+  echoes of our own last question.
+- discord_client.py: run turn-shape pass after humanize; regen nudge
+  tells the model not to end with a question when last turn asked one;
+  regenerated candidates re-validated; stubborn chains fall back to a
+  plain reaction. Wrap-path strip now uses the clause-aware stripper
+  (keeps 'fair enough' from 'fair enough. anything else?').
+- Single-signal rule: skip the random sticker/GIF when the reply just
+  sent was clarifying our own echoed question — kills the redundant
+  'huh' sticker + clarify text double signal. User-requested GIFs
+  still fire.
+- prompts.py: targeted NOTE when the trigger echoes our own question —
+  rephrase what we asked, never answer it ourselves.
+
+Tests: 13 new naturalness cases (unit + fake-Discord e2e replaying the
+live-log sequence); full suite 219 pass; probe 33/0 fail.
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
