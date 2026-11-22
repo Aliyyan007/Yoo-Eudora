@@ -261,4 +261,11 @@ class PersonaSupervisor:
                     consecutive_fails = 0
 
             await self._stop_account()
+
+            # Human gap between accounts — one going offline and the next
+            # instantly popping online is the rotation's loudest tell. Sit
+            # dark for a couple of minutes like someone closing the app.
+            gap = random.uniform(45, 180)
+            logger.debug(f"[persona] offline gap {gap:.0f}s before next account")
+            await asyncio.sleep(gap)
             seq += 1

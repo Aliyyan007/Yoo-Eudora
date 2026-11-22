@@ -61,6 +61,9 @@ class EngagementLog:
         # ALL persona account ids — engagement walls and cooldowns are
         # server-wide, so another persona's unanswered posts count too.
         self._own_ids: Set[int] = set()
+        # ch_id -> ts of last stale delete (senders insert a settle gap so
+        # old msgs don't vanish the same second a new one appears)
+        self._last_delete: Dict[str, float] = {}
 
         # ── tunables (env) ──
         self.stale_s = _env_int("ENGAGE_STALE_MINUTES", 15) * 60
@@ -81,6 +84,11 @@ class EngagementLog:
         self.max_deletes_per_sweep = _env_int("ENGAGE_MAX_DELETES", 3)
         # min gap between sweeps per channel
         self.sweep_cooldown_s = 120
+
+    def seconds_since_delete(self, ch_id: str) -> float:
+        """Seconds since the last stale-message delete in this channel
+        (inf if never)."""
+        return time.time() - self._last_delete.get(str(ch_id), 0.0)
 
     def register_own_ids(self, ids) -> None:
         """Register every persona account's user id — called on activation so
@@ -351,6 +359,7 @@ class EngagementLog:
                 try:
                     await msg.delete()
                     deleted += 1
+                    self._last_delete[ch_id] = now
                     if rec is not None:
                         tracked.remove(rec)
                     logger.info(f"[engage] deleted stale message in #{getattr(channel, 'name', ch_id)} (age {int(age/60)}m)")

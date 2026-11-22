@@ -27,7 +27,8 @@ RULES_CHANNEL_NAMES = {
 SKIP_CHANNEL_NAMES = RULES_CHANNEL_NAMES | {
     "bot-commands", "bot-logs", "logs", "audit", "mod-log", "mod-logs",
     "staff", "admin", "moderation",
-    "rank", "ranks", "level", "levels", "counting", "boost", "bumps", "bump",
+    "rank", "ranks", "ranking", "level", "levels", "leveling", "counting",
+    "boost", "boosting", "bumps", "bump", "bumping", "bumped", "disboard",
     "bot", "commands", "command", "verify", "verification", "ticket", "tickets",
     "support", "application", "applications", "introduction", "introductions",
     "self-role", "self-roles", "reaction-role", "reaction-roles", "roles",
@@ -36,16 +37,34 @@ SKIP_CHANNEL_NAMES = RULES_CHANNEL_NAMES | {
 }
 
 
+def _name_tokens(channel_name: str) -> set:
+    """Channel name -> word tokens (split on every non-alnum run).
+    '#robotics' -> {'robotics'} — token matching keeps 'bot' skipping
+    #bot-commands without also muting #robotics or #frank-talk."""
+    import re as _re
+    return {t for t in _re.split(r"[^a-z0-9]+", channel_name.lower()) if t}
+
+
+def _kw_match(channel_name: str, keywords) -> bool:
+    """Whole-token match for single words; substring on the normalized name
+    for compound keywords ('self-roles', 'member-count') since a compound
+    can't collide with an innocent longer word the way 'bot' can."""
+    tokens = _name_tokens(channel_name)
+    singles = {kw for kw in keywords if "-" not in kw and " " not in kw}
+    if tokens & singles:
+        return True
+    name_norm = channel_name.lower().replace("_", "-")
+    return any(kw in name_norm for kw in keywords if "-" in kw or " " in kw)
+
+
 def is_rules_channel(channel_name: str) -> bool:
     """Check if a channel name suggests it's a rules/info channel."""
-    name_lower = channel_name.lower().replace("_", "-")
-    return any(kw in name_lower for kw in RULES_CHANNEL_NAMES)
+    return _kw_match(channel_name, RULES_CHANNEL_NAMES)
 
 
 def is_skip_channel(channel_name: str) -> bool:
     """Check if we should skip this channel entirely."""
-    name_lower = channel_name.lower().replace("_", "-")
-    return any(kw in name_lower for kw in SKIP_CHANNEL_NAMES)
+    return _kw_match(channel_name, SKIP_CHANNEL_NAMES)
 
 
 def can_speak_in(channel: discord.TextChannel, me: discord.Member) -> bool:

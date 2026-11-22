@@ -60,7 +60,11 @@ async def test_pending_queue_drains_completely(world):
         m = fd.make_message(ch, world.alice, f"<@{world.bot_user.id}> {txt}",
                             at=world.clock.time(), mentions=[world.bot_user])
         asyncio.ensure_future(world.client.on_message(m))
-    await world.advance(120)
+    # Window is wide — each queued reply now runs a full human pipeline
+    # (read delay, react gap, typing, GIF browse) so two chained replies
+    # can take a couple of virtual minutes. The assert is about the queue
+    # draining AT ALL, not the speed.
+    await world.advance(300)
     ch_id = str(ch.id)
     assert not world.client._pending_messages.get(ch_id), \
         "pending queue left non-empty — channel would wedge"

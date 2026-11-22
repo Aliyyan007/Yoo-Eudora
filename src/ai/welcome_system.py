@@ -59,6 +59,10 @@ class WelcomeSystem:
     def __init__(self):
         # user_id -> timestamp of last greeting (any guild)
         self._greeted_users: Dict[int, float] = {}
+        # In-flight greet claims: a join event holds the slot from gate-pass
+        # to send-complete so a duplicate member_join (gateway replay, rapid
+        # rejoin) can't double-greet during the LLM+send awaits.
+        self._greet_inflight: set = set()
         # Don't greet the same user again within 1 hour
         self._cooldown_s = 3600
         # 2 min minimum between greetings in the same server
@@ -114,6 +118,13 @@ class WelcomeSystem:
                     f"(cooldown)"
                 )
                 return
+
+            # Claim the greet slot BEFORE any await — a second join event
+            # for this user arriving during generation must not double-greet.
+            if user_id in self._greet_inflight:
+                logger.debug(f"[welcome] greet already in-flight for {member}")
+                return
+            self._greet_inflight.add(user_id)
 
             # 2.5 — probabilistic skip: a human doesn't greet EVERY join.
             # Sometimes she just lets them settle in. (env WELCOME_SKIP_CHANCE)
@@ -190,6 +201,8 @@ class WelcomeSystem:
 
         except Exception as exc:  # never crash the bot
             logger.exception(f"[welcome] handle_new_member failed: {exc}")
+        finally:
+            self._greet_inflight.discard(member.id)
 
     # ── Channel selection ─────────────────────────────────────────────────────
 

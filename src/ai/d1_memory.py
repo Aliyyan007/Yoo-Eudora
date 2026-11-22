@@ -13,6 +13,7 @@ Design:
 - A simple in-memory cache with TTL avoids hitting D1 on every read.
 """
 import asyncio
+import concurrent.futures
 import json
 import re as _re
 import threading
@@ -84,6 +85,8 @@ def _get_bg_loop():
         _loop_thread = threading.Thread(target=_start_bg_loop, daemon=True)
         _loop_thread.start()
         _loop_ready.wait(timeout=5)
+    if _loop is None:
+        raise RuntimeError("D1 background loop failed to start")
     return _loop
 
 
@@ -91,7 +94,13 @@ def _run_async(coro):
     """Run an async coroutine on the background loop, return result synchronously."""
     loop = _get_bg_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=30)
+    try:
+        return future.result(timeout=30)
+    except concurrent.futures.TimeoutError:
+        # A wedged D1 must not propagate an obscure exception into the reply
+        # path — close out the future and raise so sync wrappers fall back.
+        future.cancel()
+        raise
 
 
 # ── In-memory cache ───────────────────────────────────────────────────────────

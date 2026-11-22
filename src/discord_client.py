@@ -40,8 +40,9 @@ from .ai import output_guard
 from .ai import relationship
 from .ai.multi_message import determine_message_count, split_into_messages, detect_conversation_nature
 from .ai.channel_nature import analyze_channel_nature, get_cached_nature, get_nature_summary
-from .ai.reactions import react_to_message, get_tracker
+from .ai.reactions import react_to_message, select_emoji, get_tracker, persona_emoji_ok
 from .ai.stickers_gifs import get_sticker_manager, get_gif_manager, is_gif_request
+from .ai import human_timing
 from .ai.status_manager import get_status_manager
 from .ai.user_behavior import should_store_message, extract_potential_facts, get_engagement_tracker
 from .ai.unanswered_questions import get_unanswered_tracker, is_question
@@ -604,26 +605,69 @@ class AIPersonaClient(discord.Client):
     def _get_status_for_mood(self, mood: str) -> str:
         """
         Algorithmically generate a custom Discord status based on the bot's mood.
-        Returns a short status text that fits the Eudora persona.
+        Persona-voiced — three accounts sharing one status vocabulary is a
+        fingerprint; each persona gets its own mood lines, with its own
+        statuses pool as the fallback.
         """
-        mood_statuses = {
-            "flat": "existing",
-            "bored": "so bored innit",
-            "giddy": "feeling good today",
-            "hyped": "let's gooo",
-            "chill": "vibing rn",
-            "playful": "in a silly mood",
-            "proud": "nailed it",
-            "annoyed": "bruv allow it",
-            "sad": "not feeling great",
-            "angry": "don't even",
-            "tired": "so tired rn",
-            "curious": "thinking about stuff",
-            "nostalgic": "reminiscing",
-            "lonely": "anyone up?",
-            "excited": "can't wait fr",
+        _BY_PERSONA = {
+            "eudora": {
+                "flat": "existing",
+                "bored": "so bored innit",
+                "giddy": "feeling good today",
+                "hyped": "let's gooo",
+                "chill": "vibing rn",
+                "playful": "in a silly mood",
+                "proud": "nailed it",
+                "annoyed": "bruv allow it",
+                "sad": "not feeling great",
+                "angry": "don't even",
+                "tired": "so tired rn",
+                "curious": "thinking about stuff",
+                "nostalgic": "reminiscing",
+                "lonely": "anyone up?",
+                "excited": "can't wait fr",
+            },
+            "isla": {
+                "flat": "just here rn",
+                "bored": "boreddd",
+                "giddy": "in a great mood today",
+                "hyped": "BUZZING rn",
+                "chill": "cosy mode",
+                "playful": "feeling silly",
+                "proud": "did the thing!!",
+                "annoyed": "ugh honestly",
+                "sad": "bit down today",
+                "angry": "not the day",
+                "tired": "so sleepy",
+                "curious": "deep in a wikipedia hole",
+                "nostalgic": "in my feels about old songs",
+                "lonely": "anyone free to chat?",
+                "excited": "so excited rn",
+            },
+            "rowan": {
+                "flat": "afk-ish",
+                "bored": "bored out my mind",
+                "giddy": "decent mood",
+                "hyped": "locked in",
+                "chill": "chilling",
+                "playful": "menace mode",
+                "proud": "went well actually",
+                "annoyed": "not today",
+                "sad": "bit of a rough one",
+                "angry": "fuming quietly",
+                "tired": "running on fumes",
+                "curious": "reading up on stuff",
+                "nostalgic": "on an old games kick",
+                "lonely": "anyone on?",
+                "excited": "proper looking forward to it",
+            },
         }
-        return mood_statuses.get(mood, "just vibing")
+        table = _BY_PERSONA.get(self.persona.id, _BY_PERSONA["eudora"])
+        status = table.get(mood)
+        if status:
+            return status
+        pool = getattr(self.persona, "statuses", None) or []
+        return random.choice(pool) if pool else "just vibing"
 
     # ── Event handlers ─────────────────────────────────────────────────────
 
@@ -739,6 +783,13 @@ class AIPersonaClient(discord.Client):
 
         # Set Discord token for native GIF search
         get_gif_manager().set_discord_token(self.http.token)
+        # GIF REST calls must ride the same egress proxy as the client —
+        # a direct connection leaks the real host IP around DISCORD_PROXY.
+        try:
+            get_gif_manager().set_proxy(
+                getattr(self, "proxy", None), getattr(self, "proxy_auth", None))
+        except Exception:
+            pass
 
         # Start engagement engine
         self.engagement.start()
@@ -1111,7 +1162,8 @@ class AIPersonaClient(discord.Client):
                 await self.status_manager.update_bio(self)
             except Exception as e:
                 logger.debug(f"Status update loop error: {e}")
-            await asyncio.sleep(1800)  # Check every 30 minutes
+            # Jittered ~30min — presence changes shouldn't tick like a cron.
+            await asyncio.sleep(random.uniform(1500, 2700))
 
     # ── Voice conversation handlers ────────────────────────────────────────
 
@@ -1519,9 +1571,16 @@ class AIPersonaClient(discord.Client):
                         # Fresh topic only — a stale one fixates on dead convos.
                         loop = asyncio.get_running_loop()
                         topic = await self._offloop(mem.get_channel_topic_fresh, ch_id)
+                        _recent = [
+                            m.content for m in
+                            list(self.history_cache.get(ch_id, ()))[-6:]
+                            if m.content and m.author.id != self.user.id]
                         msg = await loop.run_in_executor(
                             None, lambda: ai_reply.generate_proactive_message(
-                                topic, for_user=getattr(pinged_user, "display_name", None))
+                                topic,
+                                for_user=getattr(pinged_user, "display_name", None),
+                                channel_id=ch_id, recent_lines=_recent,
+                                persona_id=self.persona.id)
                         )
                         if not msg or len(msg) < 3:
                             msg = random.choice([
@@ -1544,8 +1603,9 @@ class AIPersonaClient(discord.Client):
                                 self.conversation_tracker[ch_id] = {}
                             self.conversation_tracker[ch_id][str(pinged_user.id)] = time.time()
 
-                        # Send with typing simulation
-                        typing_dur = random.uniform(1.5, 3.5)
+                        # Send with typing simulation (proportional)
+                        typing_dur = human_timing.typing_seconds(
+                            msg, persona_id=self.persona.id)
                         async with channel.typing():
                             await asyncio.sleep(typing_dur)
                         sent = await channel.send(msg)
@@ -1562,7 +1622,8 @@ class AIPersonaClient(discord.Client):
 
             except Exception as e:
                 logger.debug(f"Re-engagement loop error: {e}")
-            await asyncio.sleep(300)  # Check every 5 minutes
+            # Jittered ~5min — metronome-exact loop intervals are a tell.
+            await asyncio.sleep(random.uniform(240, 420))
 
     async def on_guild_join(self, guild: discord.Guild):
         """Called when joining a new server — scan it."""
@@ -1575,6 +1636,11 @@ class AIPersonaClient(discord.Client):
             # Recently-joined members get a reply boost in plain-text
             # engagement — they're part of the conversation pool now
             self._recent_joins[member.id] = time.time()
+            # Prune stale join markers — the map otherwise grows forever
+            _rj_now = time.time()
+            for _k in [k for k, t in self._recent_joins.items()
+                       if _rj_now - t > 86400]:
+                self._recent_joins.pop(_k, None)
             await get_welcome_system().handle_new_member(member, self)
         except Exception as e:
             logger.debug(f"Welcome system error: {e}")
@@ -1837,14 +1903,12 @@ class AIPersonaClient(discord.Client):
             # Low-effort ack in a sticky convo — no typed reply, but an
             # occasional emoji reaction keeps us present without spamming.
             if respond_reason == "sticky-low-content" and random.random() < 0.35:
-                emoji = "💀" if self.persona.id == "rowan" else random.choice(["😂", "💀", "😭"])
-
-                async def _silent_react():
-                    try:
-                        await message.add_reaction(emoji)
-                    except Exception:
-                        pass
-                self._spawn(_silent_react())
+                self._spawn(self._delayed_standalone_react(message))
+            elif random.random() < 0.10:
+                # Ambient react — a person mid-scroll drops an emoji on a
+                # funny/relatable line without typing a reply. The tracker's
+                # internal chance + cooldown keep this rare.
+                self._spawn(self._delayed_standalone_react(message, ambient=True))
             # Daily-cap drop on a DIRECTED message gets queued so the user
             # still gets answered once the counter resets. Directed caps all
             # carry a prefix (mention-daily-cap, reply-daily-cap, ...) — the
@@ -1908,6 +1972,53 @@ class AIPersonaClient(discord.Client):
             if m.id == ref_id:
                 return m.author == self.user
         return False
+
+    def _delayed_standalone_react(self, message: discord.Message, ambient: bool = False):
+        """Coroutine: react to a message we're NOT replying to, the way a
+        person does — pick an emoji through the tracker (cooldowns/daily
+        cap apply), then land it after a real 'saw it while scrolling'
+        delay. Instant reactions are the single most readable bot tell."""
+        async def _job():
+            try:
+                ch_id = str(message.channel.id)
+                if ambient:
+                    # Full decision pipeline (internal chance + cooldown)
+                    rx = react_to_message(
+                        message.content or "",
+                        is_directed_at_bot=False,
+                        is_reply_to_bot=False,
+                        is_mention=False,
+                        mood=self.mood_engine.current_mood,
+                        channel_id=ch_id,
+                        record=False,
+                        persona_id=self.persona.id,
+                    )
+                else:
+                    # Low-content ack — chance already rolled by the caller,
+                    # but the cooldown/daily cap still applies.
+                    if not get_tracker().can_react(ch_id):
+                        return
+                    rx = select_emoji(
+                        message.content or "",
+                        mood=self.mood_engine.current_mood,
+                        channel_id=ch_id,
+                        record=False,
+                        persona_id=self.persona.id,
+                    )
+                if not rx:
+                    return
+                await asyncio.sleep(human_timing.standalone_react_delay(
+                    len(message.content or ""),
+                    mood=self.mood_engine.current_mood,
+                    persona_id=self.persona.id))
+                if self.is_closed() or self._is_stale_self():
+                    return
+                await message.add_reaction(rx)
+                get_tracker().record_reaction(ch_id, rx)
+                logger.debug(f"Standalone react {rx} in #{message.channel}")
+            except Exception:
+                pass
+        return _job()
 
     async def _process_pending_messages(self, ch_id: str):
         """Process messages that were queued while the bot was typing/sending."""
@@ -1990,15 +2101,16 @@ class AIPersonaClient(discord.Client):
             self.backoff_until[ch_id] = 0
             logger.info(f"Backoff broken by mention in #{message.channel}")
 
-        # AFK check
+        # AFK check — ambient lines ignored, but a mention or a real
+        # question pulls a person back the same way it breaks wrap-quiet.
         afk_end = self.afk_until.get(ch_id, 0)
         if afk_end > now:
             is_mention = self.user in message.mentions
-            if not is_mention:
+            if not is_mention and not is_question(txt_low):
                 return False, "AFK — ignoring"
             else:
                 self.afk_until[ch_id] = 0
-                logger.debug(f"AFK broken by mention in #{message.channel}")
+                logger.debug(f"AFK broken by mention/question in #{message.channel}")
 
         # ── 1. DMs — only the owner can DM the bot ────────────────────────
         if is_dm:
@@ -2329,6 +2441,12 @@ class AIPersonaClient(discord.Client):
                     return False, "conversation-daily-cap"
                 # Check if message is addressed to someone else (don't hijack)
                 if not mentions_others:
+                    # Same exemption as the sticky branch — a bare "lol" from
+                    # a tracked user doesn't earn a typed reply no matter how
+                    # recent the interaction. Replies to us still land.
+                    if (_is_low_content(message.content)
+                            and not self._reply_to_us(message, ch_id)):
+                        return False, "sticky-low-content"
                     age_note = f"{int(conv_age // 60)}m ago" if conv_age > 60 else f"{int(conv_age)}s ago"
                     return True, f"active-conversation (user interacted {age_note})"
 
@@ -2881,11 +2999,11 @@ class AIPersonaClient(discord.Client):
         if abuse_response:
             # Fight back with the abuse response instead of the AI reply
             logger.info(f"Abuse detected from {message.author.name} — fighting back")
-            # Simulate a short typing delay
-            typing_delay = random.uniform(1.0, 3.0)
-            await asyncio.sleep(typing_delay)
+            # Read + type like a person — instant fight-back is a tell
+            await asyncio.sleep(random.uniform(2.0, 5.0))
             async with message.channel.typing():
-                await asyncio.sleep(min(len(abuse_response) * 0.05, 2.0))
+                await asyncio.sleep(human_timing.typing_seconds(
+                    abuse_response, persona_id=self.persona.id))
             sent = await message.channel.send(abuse_response)
             self.last_replied[ch_id] = time.time()
             self.last_sent[ch_id] = abuse_response
@@ -3447,11 +3565,17 @@ class AIPersonaClient(discord.Client):
                         ai_reply.is_duplicate(reply_text, last)
                         or any(ai_reply._similarity_ratio(reply_text, p) >= 0.85
                                for p in _recent_own)):
-                    reply_text = random.choice([
+                    _acks = [
                         "lol same as before", "still the same 🙃",
                         "u already asked me that", "same thing rn",
                         "like i just said 👀", "nothing new honestly",
-                    ])
+                    ]
+                    # The fallback pool can itself repeat — a consecutive
+                    # "same thing rn" IS the wedge signature. Exclude what
+                    # we just sent and shuffle so adjacency never matches.
+                    _fresh = [a for a in _acks
+                              if a != last and a not in _recent_own]
+                    reply_text = random.choice(_fresh or _acks)
 
                 # Wrap replies can't end with a question — 'okie, what's
                 # next?' after a dry closer defeats the whole wrap. Runs
@@ -3476,9 +3600,19 @@ class AIPersonaClient(discord.Client):
                     logger.warning(f"[guard] internals-leak reply suppressed: {reply_text[:80]!r}")
                     return
 
-                # React with emoji — use algorithmic reaction system
-                # First check if AI suggested a reaction, then use our algorithm
-                # to decide whether to actually send it (not on every message)
+                # React with emoji — human order is notice → react → beat →
+                # type. The reaction targets an absolute offset from when
+                # the triggering message arrived so it never lands
+                # sub-second after their text, and typing follows after a
+                # gap rather than on the same tick.
+                _react_landed = False
+                _react_at = human_timing.target_from(
+                    message.created_at.timestamp(),
+                    human_timing.reaction_delay(
+                        len(trigger_text or message.content or ""),
+                        directed=True,
+                        mood=self.mood_engine.current_mood,
+                        persona_id=self.persona.id))
                 if reaction_emoji and str(reaction_emoji).strip() not in ("null", "None", ""):
                     emoji_clean = str(reaction_emoji).strip()
                     # Validate emoji
@@ -3486,13 +3620,19 @@ class AIPersonaClient(discord.Client):
                         re.match(r'^<a?:[a-zA-Z0-9_]+:[0-9]+>$', emoji_clean) is not None
                         or not re.search(r'[a-zA-Z()\[\]{}\\/;:,\.!?\-=_+]', emoji_clean)
                     )
+                    # Per-persona policy — e.g. rowan doesn't drop hearts;
+                    # swap a banned AI pick for his one dry default
+                    if is_valid and not persona_emoji_ok(self.persona.id, emoji_clean):
+                        emoji_clean = "💀" if self.persona.id == "rowan" else "😂"
                     if is_valid:
                         # Use algorithm to decide whether to react (cooldown, daily limit)
                         tracker = get_tracker()
                         if tracker.can_react(ch_id) and not tracker.is_recent_emoji(ch_id, emoji_clean):
                             try:
+                                await asyncio.sleep(human_timing.remaining(_react_at))
                                 await message.add_reaction(emoji_clean)
                                 tracker.record_reaction(ch_id, emoji_clean)
+                                _react_landed = True
                                 logger.debug(f"Reacted (AI): {emoji_clean}")
                             except Exception as e:
                                 logger.debug(f"Reaction failed: {e}")
@@ -3500,19 +3640,24 @@ class AIPersonaClient(discord.Client):
                     # No AI reaction suggested — use our algorithm to potentially react
                     algo_emoji = react_to_message(
                         message.content,
-                        is_directed_at_bot=(self.user in message.mentions or message.reference is not None),
-                        is_reply_to_bot=message.reference is not None,
+                        is_directed_at_bot=(
+                            self.user in message.mentions
+                            or self._reply_to_us(message, ch_id)),
+                        is_reply_to_bot=self._reply_to_us(message, ch_id),
                         is_mention=(self.user in message.mentions),
                         mood=self.mood_engine.current_mood,
                         channel_id=ch_id,
                         record=False,
+                        persona_id=self.persona.id,
                     )
                     if algo_emoji:
                         try:
+                            await asyncio.sleep(human_timing.remaining(_react_at))
                             await message.add_reaction(algo_emoji)
                             # Charge the cap only on a landed reaction —
                             # a failed add_reaction must not burn the slot.
                             get_tracker().record_reaction(ch_id, algo_emoji)
+                            _react_landed = True
                             logger.debug(f"Reacted (algorithm): {algo_emoji}")
                         except Exception as e:
                             logger.debug(f"Algorithm reaction failed: {e}")
@@ -3547,13 +3692,24 @@ class AIPersonaClient(discord.Client):
                 elif not is_mention and not is_question_msg and random.random() < 0.20:
                     use_reply_quote = False
 
+                # The react landed earlier — a person taps the emoji, then
+                # starts composing. Same-tick react+typing reads as a script.
+                if _react_landed:
+                    _rx_gap = human_timing.react_to_typing_gap(
+                        self.persona.id, self.mood_engine.current_mood)
+                    logger.debug(f"React→typing gap {_rx_gap:.1f}s")
+                    await asyncio.sleep(_rx_gap)
+
                 # Send each burst message with natural typing delays
                 for i, burst_text in enumerate(bursts):
                     if not burst_text or not burst_text.strip():
                         continue
 
-                    # Typing simulation (proportional to message length)
-                    typing_dur = max(min(len(burst_text) / random.uniform(5.5, 8.0), 12.0), 2.0)
+                    # Typing simulation (proportional to message length,
+                    # hesitation pauses folded in)
+                    typing_dur = human_timing.typing_seconds(
+                        burst_text, persona_id=self.persona.id,
+                        mood=self.mood_engine.current_mood)
                     logger.debug(f"Typing {typing_dur:.1f}s [mood: {self.mood_engine.current_mood}] burst {i+1}/{len(bursts)}")
                     async with message.channel.typing():
                         await asyncio.sleep(typing_dur)
@@ -3568,7 +3724,7 @@ class AIPersonaClient(discord.Client):
 
                     # Natural delay between bursts (if more to send)
                     if i < len(bursts) - 1:
-                        inter_delay = random.uniform(1.5, 4.0)
+                        inter_delay = human_timing.inter_burst_delay(self.persona.id)
                         await asyncio.sleep(inter_delay)
 
                 self.last_replied[ch_id] = time.time()
@@ -3648,6 +3804,10 @@ class AIPersonaClient(discord.Client):
                         )
                         if sticker:
                             try:
+                                # Drawer-browse beat — a person scrolls the
+                                # sticker panel before one lands.
+                                await asyncio.sleep(
+                                    human_timing.sticker_pick_delay(self.persona.id))
                                 await message.channel.send(stickers=[sticker])
                                 sticker_mgr.record_sticker(ch_id, sticker.id)
                                 logger.info(f"Sent sticker: {sticker.name}")
@@ -3662,12 +3822,23 @@ class AIPersonaClient(discord.Client):
                     if not gif_query and force_gif:
                         gif_query = "cool"
                     if gif_query:
-                        # Search for a GIF using Discord's native GIF search API (falls back to Tenor)
+                        # A person opens the picker, searches, scrolls,
+                        # sometimes re-searches for a better query. The API
+                        # call is fast — the pause is the human part: the
+                        # search runs now and the send lands after a
+                        # realistic browse duration.
+                        _browse = human_timing.gif_browse_delay(
+                            self.persona.id, self.mood_engine.current_mood)
+                        _browse_start = time.time()
                         gif_url = await gif_mgr.search_gif(gif_query)
                         if not gif_url:
                             # Fallback: try scraping Tenor search page
                             gif_url = await gif_mgr.search_gif_fallback(gif_query)
                         if gif_url:
+                            _owed = _browse - (time.time() - _browse_start)
+                            if _owed > 0:
+                                logger.debug(f"GIF browse pause {_owed:.1f}s (query: {gif_query})")
+                                await asyncio.sleep(_owed)
                             try:
                                 await message.channel.send(gif_url)
                                 gif_mgr.record_gif(ch_id)
@@ -3848,6 +4019,10 @@ class AIPersonaClient(discord.Client):
                 if random.random() < 0.30:
                     counter_rx = random.choice(["😭", "💀", "🫡", "🔥"])
                     try:
+                        # They notice the react next time they glance at the
+                        # channel — counter-reacts never land sub-second.
+                        await asyncio.sleep(
+                            human_timing.counter_react_delay(self.persona.id))
                         await message.add_reaction(counter_rx)
                         logger.debug(f"Counter-reacted {counter_rx}")
                     except Exception:
@@ -3855,8 +4030,13 @@ class AIPersonaClient(discord.Client):
             elif emoji in NEGATIVE_RX:
                 if random.random() < 0.25:
                     replies = ["lol ok", "whatever", "fair enough", "idk man", "noted"]
-                    await asyncio.sleep(random.uniform(1.5, 4.0))
-                    await channel.send(random.choice(replies))
+                    _neg = random.choice(replies)
+                    await asyncio.sleep(
+                        human_timing.counter_react_delay(self.persona.id) * 0.5)
+                    async with channel.typing():
+                        await asyncio.sleep(human_timing.typing_seconds(
+                            _neg, persona_id=self.persona.id))
+                    await channel.send(_neg)
                     self.record_send(ch_id)
                     logger.debug(f"Responded to negative reaction")
         except Exception as e:

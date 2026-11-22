@@ -621,10 +621,18 @@ def _is_sane_proactive(text: str) -> bool:
 
 def _is_repeat_proactive(text: str) -> bool:
     """Near-duplicate of, or topic-echo across, recently accepted proactive
-    messages (shared content word in 2+ of the last 5)."""
-    if not _recent_proactive:
+    messages (shared content word in 2+ of the last 5). Checks BOTH the
+    in-memory deque and the persistent topic engine — a restart must not
+    let yesterday's openers resurface."""
+    pool = list(_recent_proactive)
+    try:
+        from . import engagement_topics
+        pool += engagement_topics.global_texts(20)
+    except Exception:
+        pass
+    if not pool:
         return False
-    for prev in _recent_proactive:
+    for prev in pool:
         if _similarity_ratio(text, prev) >= 0.5:
             return True
     def _cwords(t):
@@ -632,23 +640,49 @@ def _is_repeat_proactive(text: str) -> bool:
                 if len(w) >= 4 and w not in _PROACTIVE_STOPWORDS}
     words = _cwords(text)
     if words:
-        shared = sum(1 for prev in list(_recent_proactive)[-5:]
+        shared = sum(1 for prev in pool[-5:]
                      if words & _cwords(prev))
         if shared >= 2:
             return True
     return False
 
 
-def generate_proactive_message(channel_topic: str = "", for_user: str = None) -> str:
+def generate_proactive_message(channel_topic: str = "", for_user: str = None,
+                               channel_id: str = "", recent_lines=None,
+                               persona_id: str = "") -> str:
     """Generate a proactive message to start a conversation.
+
+    Two-stage diversity: the topic engine picks a (genre, angle) pair
+    outside the model — genre can't repeat in this channel for 48h, the
+    angle for 72h globally (persisted, survives redeploys) — then the model
+    only writes the wording. The genre space is what kills the "anyone got
+    a good book recommendation" loop: the model's default small-talk prior
+    is no longer choosing the topic.
+
     for_user: display name of the user the message will ping — keeps the
     text generic (no assumed facts) and stops the model freehand-writing
-    '@name' mentions that render as garbage."""
+    '@name' mentions that render as garbage.
+    channel_id: scopes genre/text dedup to the channel.
+    recent_lines: last few human chat lines — context for the
+    channel_callback genre (riff on what was just said)."""
+    from . import engagement_topics
+    try:
+        from .status_manager import get_time_of_day
+        tod = get_time_of_day()
+    except Exception:
+        tod = ""
+
+    cid = channel_id or "global"
+    ctx = [str(x).strip() for x in (recent_lines or []) if str(x).strip()][:8]
+
     # Topic hint only ~35% of the time — always-on topic anchoring is what
     # had every persona circling the same subject for hours.
     topic_hint = (
         f"[channel topic: {channel_topic}]\n"
         if channel_topic and random.random() < 0.35 else ""
+    )
+    ctx_hint = (
+        f"[recent chat: {' | '.join(ctx[-6:])}]\n" if ctx else ""
     )
     ping_hint = (
         f"[this message pings '{for_user}' — you know nothing personal about "
@@ -659,27 +693,40 @@ def generate_proactive_message(channel_topic: str = "", for_user: str = None) ->
         "[NEVER write '@', usernames or mentions in the message — pings are "
         "added separately.]\n"
     )
-    recents = list(_recent_proactive)[-6:]
+    recents = list(dict.fromkeys(
+        list(_recent_proactive)[-4:] + engagement_topics.recent_texts(cid, 6)))
     recents_hint = (
-        f"[you recently said: {' | '.join(f'"{r}"' for r in recents)} — pick a "
+        f"[you recently said: {' | '.join(f'\"{r}\"' for r in recents)} — pick a "
         "completely DIFFERENT subject; don't reuse these topics or key words]\n"
         if recents else ""
     )
+    recent_fmt = engagement_topics.recent_genres(cid, 4)
+    fmt_hint = (
+        f"[formats you recently used here: {' | '.join(recent_fmt)} — write a "
+        "DIFFERENT format, don't do another one of these]\n"
+        if recent_fmt else ""
+    )
     for attempt in range(2):
+        pick = engagement_topics.pick_angle(
+            cid, persona_id=persona_id,
+            has_context=bool(ctx), tod=tod)
         raw = llm.call_fast(
             task="proactive",
             system=prompts.PROACTIVE_SYSTEM,
-            user=f"{topic_hint if attempt == 0 else ''}{recents_hint}{ping_hint}"
-                 "Start a casual conversation. Single short message only.",
-            temperature=0.9,
-            max_tokens=40,
+            user=f"{topic_hint if attempt == 0 else ''}{ctx_hint}"
+                 f"{recents_hint}{fmt_hint}{ping_hint}"
+                 f"[your angle: {pick['prompt_line']}]\n"
+                 "Write ONE short casual message in YOUR voice for that angle. "
+                 "Single line only.",
+            temperature=0.95,
+            max_tokens=160,   # reasoning-model tokens: 40 was starving both attempts
             want_json=False,
         )
         if not raw:
             continue
         text = raw.strip().strip('"').strip("'")
         # Strip model control tokens that occasionally leak ("<|constrain|>",
-        # "<|end_of_text|>") â€” they render as literal garbage in the channel
+        # "<|end_of_text|>") — they render as literal garbage in the channel
         text = re.sub(r'<\|[^|]*\|>', '', text)
         # Freehand '@name' mentions render as literal garbage — pings are
         # added by the caller, drop any the model wrote anyway. Also strip
@@ -692,11 +739,12 @@ def generate_proactive_message(channel_topic: str = "", for_user: str = None) ->
         text = text.split("\n")[0].strip()
         if len(text) <= 2:
             continue
-        # Retry once without the topic hint on garbage or a repeat, then
-        # give up — callers fall back to the canned lists on "".
+        # Retry with a fresh angle on garbage or a repeat, then give up —
+        # callers fall back to the persona shuffle-bag pools on "".
         if not _is_sane_proactive(text) or _is_repeat_proactive(text):
             logger.debug(f"Proactive candidate rejected: '{text[:60]}'")
             continue
         _recent_proactive.append(text)
+        engagement_topics.record_send(cid, pick["genre"], pick["angle"], text)
         return text
     return ""

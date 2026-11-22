@@ -53,6 +53,24 @@ EXCITED_EMOJIS = ["🔥", "✨", "🎉", "🤩", "💥"]
 # Annoyed/sarcastic
 ANNOYED_EMOJIS = ["🙄", "😒", "🫠", "💀"]
 
+# Per-persona emoji policy — emojis a persona would never send get filtered
+# out of every pool (a bloke dropping ❤️🥰✨ on strangers reads wrong AND
+# outs the shared emoji inventory across accounts).
+_PERSONA_BAN = {
+    "rowan": {"❤️", "❤", "💜", "💙", "💗", "🥰", "😍", "✨", "🎉", "🤩",
+              "🫶", "🫖", "🌧️", "🇬🇧", "🍻"},
+    "eudora": set(),
+    "isla": set(),
+}
+
+# Per-persona react-rate multiplier — rowan reacts noticeably less.
+_PERSONA_RATE = {"rowan": 0.6, "eudora": 1.0, "isla": 1.15}
+
+
+def persona_emoji_ok(persona_id: str, emoji: str) -> bool:
+    """True if this emoji fits the persona's expressiveness policy."""
+    return emoji not in _PERSONA_BAN.get(persona_id or "", set())
+
 # ── Content patterns for emoji selection ─────────────────────────────────────
 
 FUNNY_PATTERNS = [
@@ -175,6 +193,7 @@ def should_react(
     is_mention: bool = False,
     mood: str = "chill",
     channel_id: str = "",
+    persona_id: Optional[str] = None,
 ) -> bool:
     """
     Algorithmically decide whether to react to a message.
@@ -225,6 +244,9 @@ def should_react(
     if mood in ("annoyed", "angry"):
         chance -= 0.05
 
+    # Per-persona expressiveness — a bloke drops fewer reactions
+    chance *= _PERSONA_RATE.get(persona_id or "", 1.0)
+
     # Cap at 40%
     chance = min(chance, 0.40)
 
@@ -236,6 +258,7 @@ def select_emoji(
     mood: str = "chill",
     channel_id: str = "",
     record: bool = True,
+    persona_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Algorithmically select an emoji based on message content and mood.
@@ -293,6 +316,11 @@ def select_emoji(
     for cat in categories:
         candidates.extend(emoji_pools.get(cat, []))
 
+    # Per-persona policy — filter emojis this persona would never send
+    banned = _PERSONA_BAN.get(persona_id or "", set())
+    if banned:
+        candidates = [e for e in candidates if e not in banned]
+
     if not candidates:
         return None
 
@@ -321,6 +349,7 @@ def react_to_message(
     mood: str = "chill",
     channel_id: str = "",
     record: bool = True,
+    persona_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Main entry point: decide whether to react and select an emoji.
@@ -330,11 +359,12 @@ def react_to_message(
     once the reaction actually lands.
     """
     if not should_react(
-        text, is_directed_at_bot, is_reply_to_bot, is_mention, mood, channel_id
+        text, is_directed_at_bot, is_reply_to_bot, is_mention, mood, channel_id,
+        persona_id=persona_id,
     ):
         return None
 
-    return select_emoji(text, mood, channel_id, record=record)
+    return select_emoji(text, mood, channel_id, record=record, persona_id=persona_id)
 
 
 def reset_daily_counters():

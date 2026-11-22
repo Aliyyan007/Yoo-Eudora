@@ -282,6 +282,15 @@ class GIFManager:
         # used as a fallback when Discord's internal API is unavailable.
         # Can be overridden via set_api_key().
         self._tenor_key = "3Z0688EVWYKH"
+        # Egress proxy — must match the client's DISCORD_PROXY so GIF
+        # search doesn't leak the real host IP around the proxy (X2).
+        self._proxy = None
+        self._proxy_auth = None
+
+    def set_proxy(self, proxy=None, proxy_auth=None):
+        """Route GIF REST calls through the same proxy as the client."""
+        self._proxy = proxy or None
+        self._proxy_auth = proxy_auth
 
     def set_api_key(self, key: str):
         """Set the Tenor API key (overrides the default public key)."""
@@ -370,6 +379,8 @@ class GIFManager:
                     url,
                     params=params,
                     headers=headers,
+                    proxy=self._proxy,
+                    proxy_auth=self._proxy_auth,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status != 200:
@@ -432,6 +443,8 @@ class GIFManager:
                     url,
                     json=body,
                     headers=headers,
+                    proxy=self._proxy,
+                    proxy_auth=self._proxy_auth,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     # We don't care about the response — just register the share
@@ -484,7 +497,10 @@ class GIFManager:
                 }
 
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(
+                    url, params=params,
+                    proxy=self._proxy, proxy_auth=self._proxy_auth,
+                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status != 200:
                         logger.debug(f"Tenor API returned status {resp.status}")
                         return None

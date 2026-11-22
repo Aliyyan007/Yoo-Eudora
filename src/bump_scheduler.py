@@ -219,13 +219,18 @@ class BumpScheduler:
                 next_in_h = (next_ready - time.time()) / 3600
                 logger.info(f"{bot_name} bumped. Next eligible in {next_in_h:.1f}h")
             else:
-                # On failure, set a short retry (5 min)
+                # On failure, set a short retry (5 min). Persist it — a crash
+                # between here and the next save otherwise re-fires every bot
+                # on restart regardless of the retry window.
                 self._last_bump_time[bot_name] = time.time() - (cooldown * 3600) + 300
+                self._save_state()
                 logger.warning(f"{bot_name} bump failed. Will retry in 5 min")
 
-            # Human-like delay between bumps (5-15 seconds)
+            # Human-like delay between bumps (5-35 seconds, skewed long —
+            # someone manually bumping two bots doesn't type the second
+            # command inside a tight 15s window every time)
             if i < len(ready_bots):
-                delay = random.randint(5, 15)
+                delay = int(random.triangular(5, 35, 10))
                 logger.debug(f"Waiting {delay}s before next bump...")
                 await asyncio.sleep(delay)
 

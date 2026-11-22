@@ -127,18 +127,14 @@ def split_into_messages(text: str, num_messages: int) -> List[str]:
             idx += take
         return result
 
-    # Fallback: split by word count
+    # Fallback: split by word count — but only when the text is actually
+    # long enough for two sends. A mid-phrase split of a short line
+    # ("fresh | different answer") is something no human types; if the
+    # pieces would be tiny fragments, send it whole.
+    if len(text) < 120:
+        return [text]
     words = text.split()
     if len(words) < num_messages:
-        # Not enough words to split — try character-based split
-        if len(text) >= num_messages * 10:  # Only if text is long enough
-            chunk_size = len(text) // num_messages
-            result = []
-            for i in range(num_messages):
-                start = i * chunk_size
-                end = start + chunk_size if i < num_messages - 1 else len(text)
-                result.append(text[start:end])
-            return result
         return [text]
 
     per_msg = len(words) // num_messages
@@ -149,6 +145,9 @@ def split_into_messages(text: str, num_messages: int) -> List[str]:
         take = per_msg + (1 if i < remainder else 0)
         result.append(" ".join(words[idx:idx + take]))
         idx += take
+
+    if any(len(p.strip()) < 12 for p in result):
+        return [text]
 
     return result
 

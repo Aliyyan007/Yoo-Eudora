@@ -698,17 +698,14 @@ class ActionWorker:
                 _get_ch = getattr(self.client, "get_channel", None)
                 live_ch = (_get_ch(message.channel.id)
                            if callable(_get_ch) else None) or message.channel
-                try:
-                    async with live_ch.typing():
-                        await self._run_agent(
-                            ctx, trigger_text, categories, CHAT_MODE, "text",
-                            speaker_name=message.author.display_name,
-                            context=context)
-                except Exception:
-                    await self._run_agent(
-                        ctx, trigger_text, categories, CHAT_MODE, "text",
-                        speaker_name=message.author.display_name,
-                        context=context)
+                # No typing wrapper for exec actions — the run can take
+                # 10-30s and its output usually lands in a DIFFERENT channel,
+                # so the request channel would show a long 'typing…' with
+                # nothing arriving (bot tell).
+                await self._run_agent(
+                    ctx, trigger_text, categories, CHAT_MODE, "text",
+                    speaker_name=message.author.display_name,
+                    context=context)
             finally:
                 self._inflight.discard(key)
 

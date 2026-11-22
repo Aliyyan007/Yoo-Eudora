@@ -14,78 +14,38 @@ import discord
 from .ai import reply as ai_reply
 from .ai import output_guard
 from .ai import d1_memory as mem  # D1-backed memory (falls back to JSON if D1 unavailable)
+from .ai import engagement_topics, human_timing
 from .channel_scanner import can_speak_in, is_skip_channel, find_most_active_channel
 from .ai.re_engagement import get_ping_controller, get_re_engagement_tracker, select_online_user
 from .ai.engagement_log import get_engagement_log
 
 
-# Random messages for post-bump engagement
-POST_BUMP_MESSAGES = [
-    "yo what's everyone up to",
-    "what y'all doing",
-    "anyone wanna chat",
-    "this server been kinda dead ngl",
-    "yo who's active rn",
-    "what we talking about",
-    "hru everyone",
-    "anyone playing anything rn",
-    "yo chat is dead today fr",
-    "what's good everyone",
-    "anyone else bored rn",
-    "ngl i'm so bored",
-    "yo revive chat",
-    "who's still awake",
-    "what we doing today",
-]
+def _persona_id(client) -> str:
+    """Active persona id for pool/pace lookups ('' if unset)."""
+    return getattr(getattr(client, "persona", None), "id", "") or ""
 
-# Random messages for dead chat revival
-DEAD_CHAT_MESSAGES = [
-    "chat is dead fr",
-    "yo anyone there",
-    "this server been so quiet",
-    "hello?? anyone alive",
-    "revive chat y'all",
-    "why is it so dead in here",
-    "yo chat wake up",
-    "anyone wanna talk",
-    "i'm bored someone talk to me",
-    "ngl this server been dead",
-]
 
-# Random "just chatting" messages — sent even when chat isn't fully dead
-# to make the bot feel alive and spontaneous
-RANDOM_CHAT_MESSAGES = [
-    "yo",
-    "sup",
-    "anyone up",
-    "what's good",
-    "bored fr",
-    "yo anyone wanna talk",
-    "ngl i'm bored",
-    "what everyone doing",
-    "hru",
-    "anyone playing anything",
-    "yo chat",
-    "fr been a minute",
-    "what's the move today",
-    "anyone else just chilling",
-    "yo i just woke up",
-    "what we talking about",
-    "someone talk to me",
-    "i'm so bored rn",
-    "yo who's active",
-    "anyone wanna vibe",
-    "just got on, what'd i miss",
-    "yo this server quiet today",
-    "anyone else here",
-    "what's up everyone",
-    "yo hru guys",
-    "anyone awake",
-    "chat's slow today ngl",
-    "yo anyone wanna play smth",
-    "i'm back, what's good",
-    "who's around",
-]
+def _recent_lines(client, ch_id: str, n: int = 6):
+    """Last n human message contents from the cached channel history —
+    grounding context for the topic engine's channel_callback genre."""
+    try:
+        own = getattr(getattr(client, "user", None), "id", None)
+        out = []
+        for m in list(client.history_cache.get(ch_id, ())):
+            if m.content and getattr(getattr(m, "author", None), "id", None) != own:
+                out.append(m.content)
+        return out[-n:]
+    except Exception:
+        return []
+
+
+def _fallback_or(msg: Optional[str], persona_id: str, kind: str, ch_id: str) -> str:
+    """Return the LLM message if usable, else a persona-voiced canned line
+    drawn via shuffle-bag (every line used once before any repeat)."""
+    if msg and len(msg) >= 3 and not output_guard.is_degenerate(msg) \
+            and not output_guard.leaks_internals(msg):
+        return msg
+    return engagement_topics.fallback_line(persona_id, kind, ch_id)
 
 
 class ProactiveMessenger:
@@ -141,7 +101,8 @@ class ProactiveMessenger:
                 await self._monitor_loop()
             except Exception as e:
                 logger.error(f"Proactive monitor error: {e}")
-            await asyncio.sleep(self.check_interval)
+            # Jittered check interval — a metronome tick is detectable
+            await asyncio.sleep(self.check_interval * random.uniform(0.7, 1.6))
 
     async def stop(self):
         """Stop the proactive messaging loop."""
@@ -284,16 +245,18 @@ class ProactiveMessenger:
                 if pinged_user:
                     ping_prefix = f"<@{pinged_user.id}> "
 
-        # Try AI-generated message first, fall back to random
+        # Try AI-generated message first (topic-engine driven), fall back to
+        # the persona-voiced shuffle-bag pool when the LLM is unavailable
         topic = await loop.run_in_executor(
             None, lambda: mem.get_channel_topic_fresh(ch_id))
+        pid = _persona_id(self.client)
         message = await loop.run_in_executor(
             None, lambda: ai_reply.generate_proactive_message(
-                topic, for_user=getattr(pinged_user, "display_name", None))
+                topic, for_user=getattr(pinged_user, "display_name", None),
+                channel_id=ch_id, recent_lines=_recent_lines(self.client, ch_id),
+                persona_id=pid)
         )
-        if not message or len(message) < 3:
-            message = random.choice(DEAD_CHAT_MESSAGES)
-        message = ping_prefix + message
+        message = ping_prefix + _fallback_or(message, pid, "dead", ch_id)
 
         if role and ping_prefix.startswith("<@&"):
             await loop.run_in_executor(None, ping_ctrl.record_role_ping, ch_id)
@@ -307,8 +270,13 @@ class ProactiveMessenger:
                     self.client.conversation_tracker[ch_id] = {}
                 self.client.conversation_tracker[ch_id][str(pinged_user.id)] = time.time()
 
-        # Send with typing simulation
-        typing_dur = random.uniform(1.5, 3.5)
+        # If the sweep just deleted stale lines, let the channel breathe a
+        # moment — old msgs vanishing the same second a new one appears is a tell
+        if eng_log.seconds_since_delete(ch_id) < 45:
+            await asyncio.sleep(random.uniform(8, 30))
+
+        # Send with typing simulation (proportional to message length)
+        typing_dur = human_timing.typing_seconds(message, persona_id=pid)
         async with channel.typing():
             await asyncio.sleep(typing_dur)
         sent = await channel.send(message)
@@ -318,8 +286,9 @@ class ProactiveMessenger:
         return True
 
     async def _send_random_chat(self, channel_id: int):
-        """Send a random spontaneous message to a channel (no ping role).
-        Uses pre-written messages only — NO AI calls, saves Groq tokens."""
+        """Send a spontaneous message to a channel (no ping role).
+        LLM-first through the topic engine so the content is fresh each
+        time; persona-voiced canned line only when the LLM is unavailable."""
         channel = self.client.get_channel(channel_id)
         if not channel:
             return
@@ -339,11 +308,24 @@ class ProactiveMessenger:
             logger.debug(f"[engage] #{channel.name} gated — skipping auto-chat")
             return
 
-        # Always use pre-written messages for auto-chat (saves Groq tokens)
-        message = random.choice(RANDOM_CHAT_MESSAGES)
+        loop = asyncio.get_running_loop()
+        pid = _persona_id(self.client)
+        topic = await loop.run_in_executor(
+            None, lambda: mem.get_channel_topic_fresh(ch_id))
+        message = await loop.run_in_executor(
+            None, lambda: ai_reply.generate_proactive_message(
+                topic, channel_id=ch_id,
+                recent_lines=_recent_lines(self.client, ch_id),
+                persona_id=pid)
+        )
+        message = _fallback_or(message, pid, "chat", ch_id)
 
-        # Send with typing simulation
-        typing_dur = random.uniform(1.0, 3.0)
+        # Settle gap after a sweep delete
+        if eng_log.seconds_since_delete(ch_id) < 45:
+            await asyncio.sleep(random.uniform(8, 30))
+
+        # Send with typing simulation (proportional)
+        typing_dur = human_timing.typing_seconds(message, persona_id=pid)
         async with channel.typing():
             await asyncio.sleep(typing_dur)
         sent = await channel.send(message)
@@ -352,66 +334,74 @@ class ProactiveMessenger:
         logger.info(f"Random auto-chat in #{channel.name}: {message}")
 
     async def send_post_bump_messages(self):
-        """Send engagement messages after a bump batch to boost chat activity."""
-        logger.info(f"Sending post-bump messages to {len(self.channel_ids)} channels")
+        """Send an engagement message after a bump batch to boost chat
+        activity. ONE channel, not every channel — an account hopping rooms
+        posting the same opener right after each bump is the pattern
+        watchers clock. Sometimes skipped entirely — a person doesn't
+        celebrate every bump."""
+        # ~30% of batches get no chatter at all
+        if random.random() < 0.3:
+            return
 
         eng_log = get_engagement_log()
+        eligible = []
         for channel_id in self.channel_ids:
             channel = self.client.get_channel(channel_id)
             if not channel:
                 continue
-
             if hasattr(channel, 'guild') and channel.guild:
                 if not can_speak_in(channel, channel.guild.me):
                     continue
-
-            # Clean stale unanswered engagement first; unified gate after
             ch_id = str(channel_id)
-            await eng_log.sweep_before_send(channel, self.client.user,
-                                            history_msgs=self.client.history_cache.get(ch_id))
-            if not eng_log.can_send_engagement(ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
-                                            history_msgs=self.client.history_cache.get(ch_id),
-                                            bot_user=self.client.user):
-                logger.debug(f"[engage] #{channel.name} gated — skipping post-bump")
-                continue
-
             # Skip channels with no recent human activity — posting into a
             # dead room right after bumping is the most bot-like thing there is
             if self.last_activity.get(ch_id, 0) < time.time() - 1800:
                 continue
+            eligible.append((channel, ch_id))
+        if not eligible:
+            return
 
-            # Send 1 message after the bump (a multi-message burst reads as spam)
-            num_messages = 1
-            for i in range(num_messages):
-                await asyncio.sleep(random.uniform(8, 20))
+        channel, ch_id = random.choice(eligible)
+        logger.info(f"Sending post-bump message to #{channel.name}")
 
-                # First message: AI-generated or random
-                if i == 0:
-                    ch_id = str(channel_id)
-                    loop = asyncio.get_running_loop()
-                    topic = await loop.run_in_executor(
-                        None, lambda: mem.get_channel_topic_fresh(ch_id))
-                    msg = await loop.run_in_executor(
-                        None, lambda: ai_reply.generate_proactive_message(topic)
-                    )
-                    # AI text can leak internals or go degenerate — fall back
-                    # to a pre-written line instead of sending it
-                    if not msg or len(msg) < 3 or \
-                            output_guard.is_degenerate(msg) or \
-                            output_guard.leaks_internals(msg):
-                        msg = random.choice(POST_BUMP_MESSAGES)
-                else:
-                    msg = random.choice(POST_BUMP_MESSAGES)
+        # The "finished bumping, wandered back to chat" beat — a real pause,
+        # not bump→+10s→engagement on a fixed cadence
+        await asyncio.sleep(random.uniform(30, 300))
 
-                try:
-                    async with channel.typing():
-                        await asyncio.sleep(random.uniform(1.5, 3.0))
-                    sent = await channel.send(msg)
-                    eng_log.mark_sent(ch_id)
-                    eng_log.record(ch_id, sent, kind="post_bump")
-                    logger.info(f"Post-bump message in #{channel.name}: {msg}")
-                except Exception as e:
-                    logger.warning(f"Failed to send post-bump message: {e}")
+        # Clean stale unanswered engagement first; unified gate after
+        await eng_log.sweep_before_send(channel, self.client.user,
+                                        history_msgs=self.client.history_cache.get(ch_id))
+        if not eng_log.can_send_engagement(ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
+                                            history_msgs=self.client.history_cache.get(ch_id),
+                                            bot_user=self.client.user):
+            logger.debug(f"[engage] #{channel.name} gated — skipping post-bump")
+            return
+
+        loop = asyncio.get_running_loop()
+        pid = _persona_id(self.client)
+        topic = await loop.run_in_executor(
+            None, lambda: mem.get_channel_topic_fresh(ch_id))
+        msg = await loop.run_in_executor(
+            None, lambda: ai_reply.generate_proactive_message(
+                topic, channel_id=ch_id,
+                recent_lines=_recent_lines(self.client, ch_id),
+                persona_id=pid)
+        )
+        msg = _fallback_or(msg, pid, "bump", ch_id)
+
+        # Settle gap after a sweep delete
+        if eng_log.seconds_since_delete(ch_id) < 45:
+            await asyncio.sleep(random.uniform(8, 30))
+
+        try:
+            async with channel.typing():
+                await asyncio.sleep(human_timing.typing_seconds(msg, persona_id=pid))
+            sent = await channel.send(msg)
+            eng_log.mark_sent(ch_id)
+            eng_log.record(ch_id, sent, kind="post_bump")
+            logger.info(f"Post-bump message in #{channel.name}: {msg}")
+        except Exception as e:
+            logger.warning(f"Failed to send post-bump message: {e}")
 
     async def proactive_loop(self):
         """
@@ -455,13 +445,16 @@ class ProactiveMessenger:
 
                 ch_id = str(best_ch.id)
                 loop = asyncio.get_running_loop()
+                pid = _persona_id(self.client)
                 topic = await loop.run_in_executor(
                     None, lambda: mem.get_channel_topic_fresh(ch_id))
                 msg = await loop.run_in_executor(
-                    None, lambda: ai_reply.generate_proactive_message(topic)
+                    None, lambda: ai_reply.generate_proactive_message(
+                        topic, channel_id=ch_id,
+                        recent_lines=_recent_lines(self.client, ch_id),
+                        persona_id=pid)
                 )
-                if not msg or len(msg) < 3:
-                    msg = random.choice(RANDOM_CHAT_MESSAGES)
+                msg = _fallback_or(msg, pid, "chat", ch_id)
 
                 # Clean stale engagement first; unified gate decides
                 eng_log = get_engagement_log()
@@ -473,8 +466,12 @@ class ProactiveMessenger:
                     logger.debug(f"[engage] #{best_ch.name} gated — skipping proactive")
                     continue
 
-                # Send with typing simulation
-                typing_dur = random.uniform(1.5, 3.5)
+                # Settle gap after a sweep delete
+                if eng_log.seconds_since_delete(ch_id) < 45:
+                    await asyncio.sleep(random.uniform(8, 30))
+
+                # Send with typing simulation (proportional)
+                typing_dur = human_timing.typing_seconds(msg, persona_id=pid)
                 async with best_ch.typing():
                     await asyncio.sleep(typing_dur)
                 sent = await best_ch.send(msg)

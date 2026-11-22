@@ -96,20 +96,24 @@ def _parse_groq_wait_time(err_msg: str) -> int:
     if not match:
         return 0
     time_str = match.group(1)
-    total = 0
+    total = 0.0
     if time_str.endswith('s') and time_str[:-1].replace('.', '', 1).isdigit():
         if 'm' not in time_str and 'h' not in time_str:
             return int(float(time_str[:-1]))
-    parts = re.findall(r"(\d+)([hms])", time_str)
+    # 'ms' must be tried before 'm' — "500ms" is half a second, and without
+    # this it parses as 500 minutes and parks a key ~8h on a routine 429.
+    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|[hms])", time_str)
     for val, unit in parts:
-        val = int(val)
+        val = float(val)
         if unit == 'h':
             total += val * 3600
         elif unit == 'm':
             total += val * 60
+        elif unit == 'ms':
+            total += val / 1000.0
         elif unit == 's':
             total += val
-    return total
+    return int(total)
 
 
 def get_key_count() -> int:

@@ -56,10 +56,16 @@ def is_degenerate(text: str, max_len: int = 400) -> bool:
 # "which model" style confusion echoes pass.
 _PROVIDER_LEAK = re.compile(
     r"\b(?:openai|gpt[-\s]?[0-9o]+|gpt\b|groq|deepseek|anthropic|claude|"
-    r"gemini|llama|mistral|qwen|copilot|llm\b|my\s+(?:system\s+)?prompt|"
-    r"system\s+prompt|digitalocean|vercel|netlify|heroku|railway|gcp|azure|"
-    r"aws\b|vps\b|droplet|ec2\b|kubernetes|docker|container|"
+    r"gemini|mistral|qwen|copilot|llm\b|my\s+(?:system\s+)?prompt|"
+    r"system\s+prompt|digitalocean|vercel|netlify|heroku|railway|"
     r"my\s+deployment|my\s+hosting|hosting\s+platform)\b",
+    re.IGNORECASE)
+# Everyday words that are ALSO infra terms — only a leak when they sit next
+# to ops context ("the", "my", "a", "on") — 'i saw a llama' or 'the aws
+# outage' as a news mention must not silence a reply.
+_OPS_WORD = re.compile(
+    r"\b(?:the|my|an?|your|this|that|on|in|its)\s+"
+    r"(?:llama|qwen|aws|vps|droplet|ec2|kubernetes|docker|container)s?\b",
     re.IGNORECASE)
 _API_ADMISSION = re.compile(
     r"\b(?:api\s*keys?|the\s+\w+\s+api|(?:use[sd]?|using)\s+an?\s+api|"
@@ -82,6 +88,8 @@ def leaks_internals(text: str) -> bool:
     if not t:
         return False
     if _PROVIDER_LEAK.search(t):
+        return True
+    if _OPS_WORD.search(t):
         return True
     if _API_ADMISSION.search(t) and not t.endswith("?"):
         return True
