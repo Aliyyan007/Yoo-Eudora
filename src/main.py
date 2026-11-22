@@ -156,6 +156,7 @@ async def main():
                 int(os.getenv("PROACTIVE_MAX_MIN", "80")),
             ),
             auto_chat_chance=float(os.getenv("AUTO_CHAT_CHANCE", "0.10")),
+            revive_give_up_hours=float(os.getenv("REVIVE_GIVE_UP_HOURS", "4")),
         )
         client.proactive_messenger = proactive
 

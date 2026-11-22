@@ -580,6 +580,11 @@ def select_online_user(
         exclude_ids = set(exclude_ids) | set(own_user_ids())
     except Exception:
         pass
+    # guild.me is always available even before the persona registry is
+    # populated (fresh registry / first-ever run) — never ping ourselves.
+    me = getattr(guild, "me", None)
+    if me is not None:
+        exclude_ids.add(me.id)
 
     # Don't re-ping someone pinged recently — falls back to them only if
     # literally everyone else has been pinged too

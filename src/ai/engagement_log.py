@@ -124,6 +124,12 @@ class EngagementLog:
         dq = self._tracked.get(ch_id)
         return bool(dq) and (time.time() - dq[-1]["ts"]) < within_s
 
+    def consecutive_fails(self, ch_id: str) -> int:
+        """Fully-unanswered engagement cycles in a row for this channel.
+        Senders use it to de-escalate: a server that ignored the last ping
+        shouldn't get another broadcast ping on the next revive."""
+        return self._fails.get(ch_id, 0)
+
     def unanswered_count(self, ch_id: str, history_msgs=None, bot_user=None) -> int:
         """Best-effort count of tracked msgs with no visible responses —
         plus untracked own msgs still visible in history (post-restart walls)."""

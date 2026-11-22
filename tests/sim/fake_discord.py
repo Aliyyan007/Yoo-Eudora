@@ -174,6 +174,8 @@ class FakePermissions:
     def __init__(self, send=True, read=True, history=True):
         self.send_messages = send
         self.read_messages = read
+        # real discord.py: view_channel and read_messages are the same bit
+        self.view_channel = read
         self.read_message_history = history
 
 

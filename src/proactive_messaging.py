@@ -66,12 +66,19 @@ class ProactiveMessenger:
         check_interval_min: int = 5,
         proactive_interval_min: tuple = (30, 60),
         auto_chat_chance: float = 0.25,  # Reduced from 0.35
+        revive_give_up_hours: float = 4.0,
     ):
         self.client = client
         self.channel_ids = channel_ids
         self.ping_role_id = ping_role_id
         self.dead_chat_threshold = dead_chat_threshold_min * 60
         self.check_interval = check_interval_min * 60
+        # A channel silent longer than this isn't "dead", it's abandoned —
+        # nobody is there to revive. Reviving (and worse, pinging) into a
+        # void at 4am is the most bot-like thing the loop can do; the first
+        # human message back resets the clock naturally anyway.
+        self.revive_give_up_s = max(
+            dead_chat_threshold_min * 60 + 1, revive_give_up_hours * 3600)
         self.proactive_interval = proactive_interval_min
         self.auto_chat_chance = auto_chat_chance
         self._running = False
@@ -147,26 +154,33 @@ class ProactiveMessenger:
         if now < self._warmup_until:
             return  # just came online — lurk before posting
 
+        # 1. Dead chat revival — collect every channel silent past the
+        # threshold but still inside the give-up window, then revive the
+        # FRESHEST one first: the more recently humans were active, the more
+        # likely someone's still around to bite. A gated channel falls
+        # through to the next candidate instead of burning the cycle.
+        # channel_ids is a set — iterating it picks a dead channel at
+        # arbitrary, not best-first.
+        if (now - self.last_proactive) > 1800:
+            dead = []
+            for channel_id in self.channel_ids:
+                silence_duration = now - await self._last_seen(channel_id)
+                if self.dead_chat_threshold < silence_duration <= self.revive_give_up_s:
+                    dead.append((silence_duration, channel_id))
+            for _, channel_id in sorted(dead):
+                if await self._revive_dead_chat(channel_id):
+                    self.last_proactive = now
+                    return  # One revival per cycle
+
+        # 2. Random auto-chat (channel has some activity but is slowing down)
+        # Send a random message with auto_chat_chance probability
+        # Only if: silence > 5 min, we haven't auto-chatted in 10+ min,
+        # AND real humans actually spoke here in the last 30 min —
+        # chatting into a bot-only/empty room is pure bot behavior.
         for channel_id in self.channel_ids:
             ch_id = str(channel_id)
-            last_msg = await self._last_seen(channel_id)
-            silence_duration = now - last_msg
-
-            # 1. Dead chat revival (silent for > threshold)
-            if silence_duration > self.dead_chat_threshold:
-                # Only revive if we haven't sent a proactive message in the last 30 min
-                # (increased from 5 min to reduce ping irritation)
-                if (now - self.last_proactive) > 1800:
-                    if await self._revive_dead_chat(channel_id):
-                        self.last_proactive = now
-                        return  # One revival per cycle
-
-            # 2. Random auto-chat (channel has some activity but is slowing down)
-            # Send a random message with auto_chat_chance probability
-            # Only if: silence > 5 min, we haven't auto-chatted in 10+ min,
-            # AND real humans actually spoke here in the last 30 min —
-            # chatting into a bot-only/empty room is pure bot behavior.
-            elif silence_duration > 300 and (now - self.last_auto_chat) > 600:
+            silence_duration = now - await self._last_seen(channel_id)
+            if silence_duration > 300 and (now - self.last_auto_chat) > 600:
                 if random.random() < self.auto_chat_chance:
                     try:
                         from .persona import runtime as _prt
@@ -236,7 +250,12 @@ class ProactiveMessenger:
                         logger.debug(f"[engage] CHAT_REVIVE_PING_ROLE {self.ping_role_id} not found in {channel.guild.name}")
             if role and ping_ctrl.can_ping_role(ch_id):
                 ping_prefix = f"<@&{role.id}> "
-            elif ping_ctrl.can_ping_here(ch_id) and random.random() < 0.30:
+            # @here broadcasts to everyone online — fire it at most once per
+            # dead streak. If the last revive was ignored, a second broadcast
+            # is just spam; later revives go user-ping or plain text.
+            elif ping_ctrl.can_ping_here(ch_id) \
+                    and eng_log.consecutive_fails(ch_id) == 0 \
+                    and random.random() < 0.30:
                 ping_prefix = "@here "
             elif ping_ctrl.can_ping_user(ch_id) and hasattr(channel, 'guild') and channel.guild:
                 pinged_user = select_online_user(
