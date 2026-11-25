@@ -7,11 +7,14 @@ import os
 import re
 import json
 import time
+import random
 import threading
 from typing import Optional, List
 from loguru import logger
 from groq import Groq
 from dotenv import load_dotenv
+
+from . import metrics
 
 # Load .env from config directory
 _ENV_PATH = os.path.join(
@@ -40,7 +43,17 @@ def _load_keys() -> List[str]:
 
 _groq_keys = _load_keys()
 _groq_clients = [Groq(api_key=k) for k in _groq_keys] if _groq_keys else []
-_groq_cooldowns: dict = {}  # api_key -> cooldown_until timestamp
+_groq_cooldowns: dict = {}  # composite key|model -> cooldown_until timestamp
+# Transient network/5xx failures get short exponential per-(key, model)
+# cooldowns. Before this existed, a dead network path caused a tight retry
+# loop for the whole 90s wait budget — hundreds of instant failed HTTPS
+# attempts and a wall of warnings while a single human-facing reply waited.
+_groq_transient_cooldowns: dict = {}
+_groq_transient_failures: dict = {}
+# Invalid/expired keys are not transient. Keep them out of rotation longer
+# than a connection blip, but still retry eventually in case the operator
+# replaces the key in-place or a provider-side auth edge recovers.
+_groq_auth_cooldowns: dict = {}
 _groq_current_key_idx = 0
 _llm_lock = threading.Lock()
 _MAX_COOLDOWN_WAIT_S = 90
@@ -88,6 +101,67 @@ def _save_cooldowns(cooldowns: dict):
 
 
 _groq_cooldowns = _load_cooldowns()
+
+
+def _key_unavailable_until(api_key: str, model: str) -> float:
+    """Soonest timestamp this (key, model) pair may be tried again.
+
+    Combines provider rate-limit cooldowns, transient network backoffs, and
+    auth cooldowns. Rate-limit state is persisted; the other two are local
+    process state because they describe this runtime/network path, not a
+    provider quota window.
+    """
+    ck = cooldown_key(api_key, model)
+    return max(
+        _groq_cooldowns.get(ck, 0.0),
+        _groq_transient_cooldowns.get(ck, 0.0),
+        _groq_auth_cooldowns.get(api_key, 0.0),
+    )
+
+
+def _note_key_success(api_key: str, model: str) -> None:
+    """Clear transient/auth failure state after one confirmed good call."""
+    ck = cooldown_key(api_key, model)
+    with _llm_lock:
+        _groq_transient_cooldowns.pop(ck, None)
+        _groq_transient_failures.pop(ck, None)
+        _groq_auth_cooldowns.pop(api_key, None)
+
+
+def _note_transient_failure(api_key: str, model: str) -> tuple:
+    """Apply exponential backoff for a transient key/model failure.
+
+    Returns (failure_count, backoff_seconds). The cap keeps one bad network
+    path from monopolising the caller while still retrying often enough to
+    ride out short Groq/egress blips.
+    """
+    ck = cooldown_key(api_key, model)
+    with _llm_lock:
+        count = _groq_transient_failures.get(ck, 0) + 1
+        _groq_transient_failures[ck] = count
+        backoff = min(2.0 ** min(count, 5), 30.0) + random.uniform(0.0, 0.75)
+        _groq_transient_cooldowns[ck] = time.time() + backoff
+    return count, backoff
+
+
+def _is_auth_error(err: str) -> bool:
+    low = err.lower()
+    return ("401" in err or "403" in err or "invalid api key" in low
+            or "invalid_api_key" in low or "unauthorized" in low
+            or "forbidden" in low or "authentication" in low)
+
+
+def _is_invalid_request_error(err: str) -> bool:
+    """Provider rejected the request shape/content itself.
+
+    Rotating keys cannot fix malformed messages, bad parameters, or context
+    length overflows. Retrying those across every key just burns quota and
+    delays the caller, so these fail fast.
+    """
+    low = err.lower()
+    return ("400" in err or "invalid_request" in low
+            or "context_length" in low or "context length" in low
+            or ("max_tokens" in low and "invalid" in low))
 
 
 def _parse_groq_wait_time(err_msg: str) -> int:
@@ -165,8 +239,10 @@ def _call_llm(
     """
     if not _groq_clients:
         logger.warning(f"[{task}] No Groq keys configured")
+        metrics.incr("llm.no_keys")
         return ""
 
+    metrics.incr("llm.calls", task=task)
     if want_json and "json" not in system.lower():
         system += "\n\nIMPORTANT: You must reply in valid JSON format."
 
@@ -198,10 +274,10 @@ def _call_llm(
                 idx = _groq_current_key_idx % n
                 candidate = _groq_clients[idx]
 
-                cooldown_until = _groq_cooldowns.get(f"{candidate.api_key}|{model}", 0)
+                cooldown_until = _key_unavailable_until(candidate.api_key, model)
                 if cooldown_until > now:
                     remaining = int(cooldown_until - now)
-                    logger.debug(f"[{task}] Key {idx+1} cooling on {model} ({remaining}s left), trying next")
+                    logger.debug(f"[{task}] Key {idx+1} unavailable on {model} ({remaining}s left), trying next")
                     _groq_current_key_idx = (idx + 1) % n
                     continue
 
@@ -213,7 +289,7 @@ def _call_llm(
                 break
 
             if client is None:
-                soonest = min(_groq_cooldowns.get(f"{c.api_key}|{model}", 0) for c in _groq_clients)
+                soonest = min(_key_unavailable_until(c.api_key, model) for c in _groq_clients)
                 wait_s = max(soonest - time.time(), 0) + 1
                 wait_s = min(wait_s, max(deadline - time.time(), 0))
 
@@ -227,6 +303,7 @@ def _call_llm(
             time.sleep(wait_s)
             continue
 
+        metrics.incr("llm.attempts", task=task)
         try:
             # Don't use response_format — gpt-oss models fail with it.
             # Instead, we parse JSON from the text response.
@@ -260,11 +337,14 @@ def _call_llm(
                     **create_kwargs,
                 )
             logger.debug(f"[{task}] Using key {client_idx+1}/{n} (model: {model})")
+            _note_key_success(client.api_key, model)
+            metrics.incr("llm.success", task=task)
             return resp.choices[0].message.content
 
         except Exception as e:
             err = str(e)
             if "429" in err or "rate limit" in err.lower() or "exceeded" in err.lower():
+                metrics.incr("llm.rate_limited", task=task)
                 is_tpd = "TPD" in err or "tokens per day" in err.lower()
                 parsed = _parse_groq_wait_time(err)
                 wait_time = parsed + 5 if parsed > 0 else (14400 if is_tpd else 60)
@@ -277,10 +357,28 @@ def _call_llm(
                 logger.warning(f"[{task}] Key {client_idx+1} {limit_type} limited on {model}. Rotating. Cool {wait_time}s.")
             elif "404" in err or "model_not_found" in err or "does not exist" in err:
                 # Model not found — don't try other keys, they'll all fail
+                metrics.incr("llm.model_not_found", task=task)
                 logger.error(f"[{task}] Model not found: {model}")
                 return ""
+            elif _is_auth_error(err):
+                metrics.incr("llm.auth_error", task=task)
+                # Bad credentials won't recover on the next key rotation tick.
+                # Park the key across ALL models (unlike per-model quota).
+                auth_wait = 1800
+                with _llm_lock:
+                    _groq_auth_cooldowns[client.api_key] = time.time() + auth_wait
+                logger.warning(f"[{task}] Key {client_idx+1} rejected by auth. Cool {auth_wait}s.")
+            elif _is_invalid_request_error(err):
+                metrics.incr("llm.invalid_request", task=task)
+                logger.error(f"[{task}] Invalid request for {model} — not retrying other keys: {err[:160]}")
+                return ""
             else:
-                logger.warning(f"[{task}] Groq call failed: {e}")
+                metrics.incr("llm.transient_error", task=task)
+                count, backoff = _note_transient_failure(client.api_key, model)
+                logger.warning(
+                    f"[{task}] Groq call failed (transient x{count}; "
+                    f"backing off key {client_idx+1} for {backoff:.1f}s): {e}"
+                )
             # Loop back — the rotation index already moved past this key, so
             # the next iteration tries a different key (or waits if all cool).
 
@@ -400,7 +498,7 @@ def call_voice_stream(task: str, system: str, user: str, **kwargs):
                     _groq_current_key_idx = (idx + 1) % n
                     if candidate.api_key in tried:
                         continue
-                    if _groq_cooldowns.get(f"{candidate.api_key}|{model}", 0) > now:
+                    if _key_unavailable_until(candidate.api_key, model) > now:
                         continue
                     tried.add(candidate.api_key)
                     client = candidate
@@ -439,6 +537,14 @@ def call_voice_stream(task: str, system: str, user: str, **kwargs):
                         _save_cooldowns(_groq_cooldowns)
                 elif "404" in err or "model_not_found" in err or "does not exist" in err:
                     break  # model dead on all keys — try next model
+                elif _is_auth_error(err):
+                    with _llm_lock:
+                        _groq_auth_cooldowns[client.api_key] = time.time() + 1800
+                elif _is_invalid_request_error(err):
+                    logger.debug(f"[{task}] Invalid streaming request for {model}: {err[:120]}")
+                    break
+                else:
+                    _note_transient_failure(client.api_key, model)
                 # else transient — try the next key
     return None
 

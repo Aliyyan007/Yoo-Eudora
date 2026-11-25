@@ -21,6 +21,7 @@ Every public function is wrapped in try/except: this system must NEVER break
 the reply path. Worst case, everyone reads as a stranger.
 """
 import datetime
+import threading
 import time
 from typing import Dict
 
@@ -65,6 +66,9 @@ TIER_CUES_BRIEF = {
 # memory, flushed to server_state on the debounce schedule.
 _stats: Dict[str, dict] = {}
 _flush_at: Dict[str, float] = {}
+# Storage writes may be offloaded to worker threads. Keep cache mutation and
+# snapshot copying serialized independently of the slow network write itself.
+_LOCK = threading.RLock()
 
 
 def _key(user_id) -> str:
@@ -80,9 +84,10 @@ def _stats_for(user_id) -> dict:
     """Return the cached stats dict for a user, merging in whatever is already
     persisted on first touch."""
     uid = str(user_id)
-    cached = _stats.get(uid)
-    if cached is not None:
-        return cached
+    with _LOCK:
+        cached = _stats.get(uid)
+        if cached is not None:
+            return cached
     merged = _blank()
     try:
         stored = mem.load_server_state(_key(uid))
@@ -102,21 +107,37 @@ def _stats_for(user_id) -> dict:
         days = stored.get("days")
         if isinstance(days, list):
             merged["days"] = [str(d) for d in days][-_DAYS_CAP:]
-    _stats[uid] = merged
-    return merged
+    with _LOCK:
+        # Another worker may have won the first-touch race while we were
+        # loading; merge rather than discarding either set of observations.
+        existing = _stats.get(uid)
+        if existing is not None:
+            existing["msg_count"] = max(int(existing.get("msg_count") or 0), int(merged.get("msg_count") or 0))
+            existing["suspicion"] = max(int(existing.get("suspicion") or 0), int(merged.get("suspicion") or 0))
+            existing["first_seen"] = min(x for x in (existing.get("first_seen"), merged.get("first_seen")) if x) if (existing.get("first_seen") or merged.get("first_seen")) else 0.0
+            existing["last_seen"] = max(float(existing.get("last_seen") or 0.0), float(merged.get("last_seen") or 0.0))
+            days = list(dict.fromkeys(list(existing.get("days") or []) + list(merged.get("days") or [])))
+            existing["days"] = days[-_DAYS_CAP:]
+            return existing
+        _stats[uid] = merged
+        return merged
 
 
 def _flush(uid: str):
-    """Persist the cached stats for a user. Best-effort — storage errors are
-    swallowed so a dead D1 never breaks message handling."""
+    """Persist a snapshot of the cached stats for a user. Best-effort —
+    storage errors are swallowed so a dead D1 never breaks message handling."""
     try:
-        st = _stats.get(uid)
-        if st is None:
-            return
-        blob = dict(st)
-        blob["days"] = list(st.get("days") or [])
+        with _LOCK:
+            st = _stats.get(uid)
+            if st is None:
+                return
+            blob = dict(st)
+            blob["days"] = list(st.get("days") or [])
+        # Slow network write happens outside the cache lock; mutations can
+        # continue and will be captured by the next debounced flush.
         mem.save_server_state(_key(uid), blob)
-        _flush_at[uid] = time.time()
+        with _LOCK:
+            _flush_at[uid] = time.time()
     except Exception as e:
         logger.debug(f"relationship flush failed for {uid}: {e}")
 
@@ -142,16 +163,18 @@ def record_message(user_id):
         uid = str(user_id)
         st = _stats_for(uid)
         now = time.time()
-        st["msg_count"] = int(st.get("msg_count") or 0) + 1
-        st["last_seen"] = now
-        if not st.get("first_seen"):
-            st["first_seen"] = now
-        today = datetime.date.today().isoformat()
-        days = st.setdefault("days", [])
-        if today not in days:
-            days.append(today)
-            del days[:-_DAYS_CAP]
-        if now - _flush_at.get(uid, 0) > _FLUSH_INTERVAL_S:
+        with _LOCK:
+            st["msg_count"] = int(st.get("msg_count") or 0) + 1
+            st["last_seen"] = now
+            if not st.get("first_seen"):
+                st["first_seen"] = now
+            today = datetime.date.today().isoformat()
+            days = st.setdefault("days", [])
+            if today not in days:
+                days.append(today)
+                del days[:-_DAYS_CAP]
+            due = now - _flush_at.get(uid, 0) > _FLUSH_INTERVAL_S
+        if due:
             _flush(uid)
     except Exception as e:
         logger.debug(f"relationship record_message failed: {e}")
@@ -163,7 +186,8 @@ def record_suspicion(user_id):
     try:
         uid = str(user_id)
         st = _stats_for(uid)
-        st["suspicion"] = int(st.get("suspicion") or 0) + 1
+        with _LOCK:
+            st["suspicion"] = int(st.get("suspicion") or 0) + 1
         _flush(uid)
     except Exception as e:
         logger.debug(f"relationship record_suspicion failed: {e}")
@@ -173,8 +197,9 @@ def get_stats(user_id) -> dict:
     """Return a copy of the user's merged stats dict."""
     try:
         st = _stats_for(user_id)
-        out = dict(st)
-        out["days"] = list(st.get("days") or [])
+        with _LOCK:
+            out = dict(st)
+            out["days"] = list(st.get("days") or [])
         return out
     except Exception:
         return _blank()

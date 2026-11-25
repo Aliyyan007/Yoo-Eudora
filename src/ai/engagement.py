@@ -178,9 +178,12 @@ class EngagementEngine:
         willing = self.get_willingness(ch_id)
         activity = self.get_activity_level(ch_id)
 
-        # Base probability from willingness (sigmoid)
+        # Base probability from willingness (sigmoid). Center it above zero:
+        # the old `sigmoid(willing-1)` shape still yielded ~27% at ZERO
+        # willingness, so ambient participation had a hidden high floor even
+        # when nothing in the room invited the bot in.
         import math
-        base_prob = 1.0 / (1.0 + math.exp(-willing + 1.0))
+        base_prob = 1.0 / (1.0 + math.exp(-(willing - 1.5) * 1.8))
 
         # Modulate by activity: when chat is very active, reduce probability
         # (don't spam in busy conversations). When quiet, increase it.

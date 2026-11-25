@@ -27,6 +27,8 @@ from typing import Dict, Optional, Set
 import discord
 from loguru import logger
 
+from . import metrics
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -40,6 +42,57 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+class EngagementReservation:
+    """Exclusive engagement-send slot for one channel.
+
+    The old gate was check-then-write: several independent loops could pass
+    `can_send_engagement()` before either generated/typed/sent anything, so
+    the 8-minute shared gap did not actually prevent clustered posts. A
+    reservation writes the shared timestamp immediately; `commit()` moves it
+    to the real send time, while `abort()` restores the previous timestamp
+    when generation or sending fails.
+    """
+
+    def __init__(self, log: "EngagementLog", ch_id: str,
+                 previous_ts: float, reservation_ts: float):
+        self._log = log
+        self._ch_id = ch_id
+        self._previous_ts = previous_ts
+        self._reservation_ts = reservation_ts
+        self._done = False
+
+    def commit(self, msg=None, kind: str = "engage") -> None:
+        """Mark the slot as used after the Discord send has landed."""
+        if self._done:
+            return
+        self._done = True
+        self._log.mark_sent(self._ch_id)
+        metrics.incr("engagement.sent", kind=kind)
+        if msg is not None:
+            self._log.record(self._ch_id, msg, kind=kind)
+
+    def abort(self) -> None:
+        """Release an unused slot without consuming the shared cooldown."""
+        if self._done:
+            return
+        self._done = True
+        metrics.incr("engagement.reservation_aborted")
+        # Only roll back if nobody else committed over the reservation.
+        if self._log._last_send.get(self._ch_id) == self._reservation_ts:
+            if self._previous_ts:
+                self._log._last_send[self._ch_id] = self._previous_ts
+            else:
+                self._log._last_send.pop(self._ch_id, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.abort()
+        return False
 
 
 class EngagementLog:
@@ -64,6 +117,10 @@ class EngagementLog:
         # ch_id -> ts of last stale delete (senders insert a settle gap so
         # old msgs don't vanish the same second a new one appears)
         self._last_delete: Dict[str, float] = {}
+        # ch_id -> asyncio.Lock used by acquire_send_slot(). The lock only
+        # serializes the tiny check/reserve critical section; generation and
+        # typing happen outside it.
+        self._send_locks: Dict[str, asyncio.Lock] = {}
 
         # ── tunables (env) ──
         self.stale_s = _env_int("ENGAGE_STALE_MINUTES", 15) * 60
@@ -184,6 +241,29 @@ class EngagementLog:
     def mark_sent(self, ch_id: str) -> None:
         """Record that an engagement message just went out (shared cooldown)."""
         self._last_send[ch_id] = time.time()
+
+    async def acquire_send_slot(self, ch_id: str, last_human_ts: float = 0.0,
+                                min_gap_s: float = None, history_msgs=None,
+                                bot_user=None) -> Optional[EngagementReservation]:
+        """Atomically reserve the channel's shared engagement slot.
+
+        Returns None when the normal gate rejects the send. The caller must
+        either commit() after a successful send or abort() (usually through
+        the reservation's context manager) when generation/sending fails.
+        """
+        ch_id = str(ch_id)
+        lock = self._send_locks.setdefault(ch_id, asyncio.Lock())
+        async with lock:
+            if not self.can_send_engagement(
+                    ch_id, last_human_ts=last_human_ts, min_gap_s=min_gap_s,
+                    history_msgs=history_msgs, bot_user=bot_user):
+                metrics.incr("engagement.reservation_rejected")
+                return None
+            previous = self._last_send.get(ch_id, 0.0)
+            reserved_at = time.time()
+            self._last_send[ch_id] = reserved_at
+            metrics.incr("engagement.reservation_acquired")
+            return EngagementReservation(self, ch_id, previous, reserved_at)
 
     def is_paused(self, ch_id: str, last_human_ts: float = 0.0) -> bool:
         """Channel is in cooldown after repeated failed engagement cycles.

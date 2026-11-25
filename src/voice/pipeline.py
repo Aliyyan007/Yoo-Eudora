@@ -1718,11 +1718,15 @@ class VoicePipeline:
         # an AI provider or reads like model soup; fall back to a filler.
         try:
             from ..ai import output_guard as _og
-            if _og.leaks_internals(response) or _og.is_degenerate(response):
+            from ..ai import prompts as _prompts
+            _pid = getattr(getattr(_prompts, "_ACTIVE", None), "id", "")
+            _ok, _why = _og.validate_outbound(response, persona_id=_pid, surface="voice")
+            if not _ok:
                 import random as _r  # MUST be inside the branch — the leave_cmd
                 # early-return's local import never runs on this path, and an
                 # unbound _r here made the guard fail OPEN (bad reply spoken)
-                logger.warning(f"[voice] suppressed leaking/degenerate reply: {response[:60]!r}")
+                logger.warning(
+                    f"[voice] suppressed guarded reply ({','.join(_why)}): {response[:60]!r}")
                 await self._speak(_r.choice(["wdym?", "huh?", "sorry what?", "what?"]))
                 return
         except Exception:

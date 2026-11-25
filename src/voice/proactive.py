@@ -76,6 +76,51 @@ _ADDRESSED_QUESTIONS = [
     "hey {name}, what's the last thing that made you laugh?",
 ]
 
+# Voice fallbacks are persona-facing output too. The original shared pool was
+# Eudora-shaped; under rotation it made Rowan sound chatty and Isla sound dry.
+# Keep compact per-persona variants so even LLM outages stay in character.
+_PERSONA_FALLBACKS = {
+    "isla": [
+        "wait, tell me something good that happened today?",
+        "what song have you had on repeat lately?",
+        "have you taken any good photos recently?",
+        "what are we all doing this weekend?",
+    ],
+    "rowan": [
+        "anyone playing anything decent lately?",
+        "what have you been up to, then?",
+        "you seen anything worth watching?",
+        "what's the plan for the weekend?",
+    ],
+}
+_PERSONA_ADDRESSED = {
+    "isla": [
+        "hey {name}, what's been the best bit of your day?",
+        "wait {name}, what music are you obsessed with right now?",
+        "{name}, have you done anything fun lately?",
+    ],
+    "rowan": [
+        "{name}, you been on anything decent lately?",
+        "hey {name}, what's happening?",
+        "{name}, got any weekend plans or what?",
+    ],
+}
+
+
+def _client_persona_id(client) -> str:
+    try:
+        return getattr(getattr(client, "persona", None), "id", "") or "eudora"
+    except Exception:
+        return "eudora"
+
+
+def _fallback_pool(client) -> tuple:
+    pid = _client_persona_id(client)
+    return (
+        _PERSONA_FALLBACKS.get(pid, _FALLBACK_QUESTIONS),
+        _PERSONA_ADDRESSED.get(pid, _ADDRESSED_QUESTIONS),
+    )
+
 
 class ProactiveEngager:
     """Background task that proactively asks questions when VC goes quiet."""
@@ -314,9 +359,13 @@ class ProactiveEngager:
 
                 if response and len(response) > 5:
                     from ..ai import output_guard
-                    if output_guard.leaks_internals(response) or \
-                            output_guard.is_degenerate(response):
-                        logger.debug(f"[proactive] suppressed leaking/degenerate question")
+                    ok, why = output_guard.validate_outbound(
+                        response,
+                        persona_id=_client_persona_id(client),
+                        surface="voice")
+                    if not ok:
+                        logger.debug(
+                            f"[proactive] suppressed guarded question ({','.join(why)})")
                     else:
                         logger.info(f"[proactive] LLM question for {target_name}: {response[:80]}")
                         await pipeline._speak(response)
@@ -326,27 +375,42 @@ class ProactiveEngager:
 
         # Fallback to pre-written question
         if presence_check:
-            presence_lines = [
-                f"hello? {target_name}, you still there?",
-                f"{target_name} — everyone go afk or what?",
-                f"why's it gone dead silent, {target_name} you alive?",
-                f"oi {target_name}, still with us?",
-                f"{target_name}, it's gone proper quiet — you lot still there?",
-            ]
+            pid = _client_persona_id(client)
+            if pid == "rowan":
+                presence_lines = [
+                    f"{target_name}, you still there mate?",
+                    f"everyone gone afk or what, {target_name}?",
+                    f"bit quiet in here — {target_name}, you alive?",
+                ]
+            elif pid == "isla":
+                presence_lines = [
+                    f"hellooo, {target_name}, are you still there?",
+                    f"wait, did everyone vanish? {target_name}, you there?",
+                    f"{target_name}, it's gone so quiet — everything okay?",
+                ]
+            else:
+                presence_lines = [
+                    f"hello? {target_name}, you still there?",
+                    f"{target_name} — everyone go afk or what?",
+                    f"why's it gone dead silent, {target_name} you alive?",
+                    f"oi {target_name}, still with us?",
+                    f"{target_name}, it's gone proper quiet — you lot still there?",
+                ]
             question = random.choice(presence_lines)
             logger.info(f"[proactive] Presence check for {target_name}: {question}")
             await pipeline._speak(question)
             return
 
+        fallback_questions, addressed_questions = _fallback_pool(client)
         if len(all_members) > 1:
             # Multi-user: address by name
-            question = random.choice(_ADDRESSED_QUESTIONS).format(name=target_name)
+            question = random.choice(addressed_questions).format(name=target_name)
         else:
             # Single user: don't need to address by name every time
             if random.random() < 0.5:
-                question = random.choice(_ADDRESSED_QUESTIONS).format(name=target_name)
+                question = random.choice(addressed_questions).format(name=target_name)
             else:
-                question = random.choice(_FALLBACK_QUESTIONS)
+                question = random.choice(fallback_questions)
 
         logger.info(f"[proactive] Fallback question for {target_name}: {question}")
         await pipeline._speak(question)

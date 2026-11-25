@@ -27,6 +27,28 @@ from loguru import logger
 import discord
 
 
+def invites_response(text: str, pinged_user=None) -> bool:
+    """True when a message explicitly asks humans for input.
+
+    This is the single semantic gate that decides whether a bot post may arm
+    the re-engagement ladder. Ordinary answers, statements and low-effort
+    reactions must not create a later obligation to ping people; only direct
+    questions/prompts or an already-targeted mention do.
+    """
+    if pinged_user is not None:
+        return True
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    if "?" in low:
+        return True
+    return any(p in low for p in (
+        "anyone", "what's everyone", "whats everyone", "who's", "whos",
+        "rate your", "pick one", "drop one", "tell me", "show me",
+        "what we", "what are we", "what's the move", "whats the move",
+    ))
+
+
 class PingController:
     """
     Controls all ping usage to prevent irritation.
@@ -454,20 +476,33 @@ class ReEngagementTracker:
         self._got_reply: Dict[str, bool] = {}
         # channel_id -> last ping strategy used (variety — don't repeat)
         self._last_action: Dict[str, str] = {}
+        # channel_id -> number of unanswered re-engagement pings sent for the
+        # current invitation. The ladder is deliberately bounded: one targeted
+        # user ping, then at most one @here escalation, then stop.
+        self._ping_count: Dict[str, int] = {}
         # Re-engagement timeout: 10 minutes
         self._timeout_s = 600
 
     def record_bot_message(self, channel_id: str):
-        """Record that the bot sent a message."""
+        """Record that the bot sent an explicit response-inviting message."""
         self._last_bot_msg[channel_id] = time.time()
         self._got_reply[channel_id] = False
+        self._ping_count[channel_id] = 0
 
     def record_human_reply(self, channel_id: str):
         """Record that a human replied in the channel."""
         self._got_reply[channel_id] = True
+        self._ping_count[channel_id] = 0
+        self._last_action.pop(channel_id, None)
         # Humans are talking — reset the unanswered-ping streak so pings
         # are allowed again in this channel
         _ping_controller.note_human_activity(channel_id)
+
+    def mark_ping_sent(self, channel_id: str):
+        """Advance the bounded escalation ladder after a ping was sent."""
+        self._ping_count[channel_id] = self._ping_count.get(channel_id, 0) + 1
+        self._last_bot_msg[channel_id] = time.time()
+        self._got_reply[channel_id] = False
 
     def needs_re_engagement(self, channel_id: str) -> bool:
         """
@@ -481,6 +516,11 @@ class ReEngagementTracker:
             return False
 
         if self._got_reply.get(channel_id, True):
+            return False
+
+        # Two ignored pings is the hard stop. Anything beyond that is spam,
+        # not engagement.
+        if self._ping_count.get(channel_id, 0) >= 2:
             return False
 
         last_bot = self._last_bot_msg[channel_id]
@@ -506,29 +546,22 @@ class ReEngagementTracker:
         can_user = ping_ctrl.can_ping_user(channel_id)
         can_here = ping_ctrl.can_ping_here(channel_id)
 
-        # Algorithmic escalation
-        # ~70%: try user ping first, ~30%: try @here
-
-        if can_here and random.random() < 0.30:
+        # Deterministic escalation ordering. A mass ping must never be the
+        # first response to silence: first try one relevant person; only if
+        # that explicit invitation is ignored for another full timeout may a
+        # bounded @here escalation be considered.
+        pings_sent = self._ping_count.get(channel_id, 0)
+        if pings_sent == 0:
+            action = "user_ping" if can_user else "none"
+        elif pings_sent == 1 and can_here:
             action = "here"
-        elif can_user:
-            action = "user_ping"
-        # Fallback: try whatever is available
-        elif can_here:
-            action = "here"
-        elif can_user:
+        elif pings_sent == 1 and can_user:
+            # @here is cooling down / capped — one final targeted fallback is
+            # still less intrusive than a mass ping.
             action = "user_ping"
         else:
             action = "none"
 
-        # Strategy variety — don't repeat the same ping strategy back-to-back.
-        # If we rolled the same action as last time, 70% chance to pick a
-        # different available one instead.
-        last = self._last_action.get(channel_id)
-        if action != "none" and action == last and random.random() < 0.70:
-            alts = [a for a, ok in (("user_ping", can_user), ("here", can_here)) if ok and a != action]
-            if alts:
-                action = random.choice(alts)
         if action != "none":
             self._last_action[channel_id] = action
         return action
@@ -537,6 +570,8 @@ class ReEngagementTracker:
         """Clear re-engagement state for a channel."""
         self._last_bot_msg.pop(channel_id, None)
         self._got_reply.pop(channel_id, None)
+        self._ping_count.pop(channel_id, None)
+        self._last_action.pop(channel_id, None)
 
 
 # Singleton instance

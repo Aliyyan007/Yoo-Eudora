@@ -16,7 +16,7 @@ from .ai import output_guard
 from .ai import d1_memory as mem  # D1-backed memory (falls back to JSON if D1 unavailable)
 from .ai import engagement_topics, human_timing
 from .channel_scanner import can_speak_in, is_skip_channel, find_most_active_channel
-from .ai.re_engagement import get_ping_controller, get_re_engagement_tracker, select_online_user
+from .ai.re_engagement import get_ping_controller, get_re_engagement_tracker, select_online_user, invites_response
 from .ai.engagement_log import get_engagement_log
 
 
@@ -42,10 +42,15 @@ def _recent_lines(client, ch_id: str, n: int = 6):
 def _fallback_or(msg: Optional[str], persona_id: str, kind: str, ch_id: str) -> str:
     """Return the LLM message if usable, else a persona-voiced canned line
     drawn via shuffle-bag (every line used once before any repeat)."""
-    if msg and len(msg) >= 3 and not output_guard.is_degenerate(msg) \
-            and not output_guard.leaks_internals(msg):
-        return msg
+    if msg and len(msg) >= 3:
+        ok, _why = output_guard.validate_outbound(
+            msg, persona_id=persona_id, surface="proactive")
+        if ok:
+            return msg
     return engagement_topics.fallback_line(persona_id, kind, ch_id)
+
+
+_invites_response = invites_response
 
 
 class ProactiveMessenger:
@@ -289,20 +294,35 @@ class ProactiveMessenger:
                     self.client.conversation_tracker[ch_id] = {}
                 self.client.conversation_tracker[ch_id][str(pinged_user.id)] = time.time()
 
-        # If the sweep just deleted stale lines, let the channel breathe a
-        # moment — old msgs vanishing the same second a new one appears is a tell
-        if eng_log.seconds_since_delete(ch_id) < 45:
-            await asyncio.sleep(random.uniform(8, 30))
+        # Atomically reserve the shared engagement slot immediately before
+        # the visible typing/send sequence. Generation above can lose the
+        # race harmlessly; clustered posts can't slip through the gate.
+        reservation = await eng_log.acquire_send_slot(
+            ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
+            history_msgs=self.client.history_cache.get(ch_id),
+            bot_user=self.client.user)
+        if reservation is None:
+            logger.debug(f"[engage] #{channel.name} reservation lost — skipping revive")
+            return False
 
-        # Send with typing simulation (proportional to message length)
-        typing_dur = human_timing.typing_seconds(message, persona_id=pid)
-        async with channel.typing():
-            await asyncio.sleep(typing_dur)
-        sent = await channel.send(message)
-        eng_log.mark_sent(ch_id)
-        eng_log.record(ch_id, sent, kind="revive")
-        logger.info(f"Revived dead chat in #{channel.name}: {message}")
-        return True
+        try:
+            # If the sweep just deleted stale lines, let the channel breathe a
+            # moment — old msgs vanishing the same second a new one appears is a tell
+            if eng_log.seconds_since_delete(ch_id) < 45:
+                await asyncio.sleep(random.uniform(8, 30))
+
+            # Send with typing simulation (proportional to message length)
+            typing_dur = human_timing.typing_seconds(message, persona_id=pid)
+            async with channel.typing():
+                await asyncio.sleep(typing_dur)
+            sent = await channel.send(message)
+            reservation.commit(sent, kind="revive")
+            if _invites_response(message, pinged_user):
+                get_re_engagement_tracker().record_bot_message(ch_id)
+            logger.info(f"Revived dead chat in #{channel.name}: {message}")
+            return True
+        finally:
+            reservation.abort()
 
     async def _send_random_chat(self, channel_id: int):
         """Send a spontaneous message to a channel (no ping role).
@@ -339,18 +359,30 @@ class ProactiveMessenger:
         )
         message = _fallback_or(message, pid, "chat", ch_id)
 
-        # Settle gap after a sweep delete
-        if eng_log.seconds_since_delete(ch_id) < 45:
-            await asyncio.sleep(random.uniform(8, 30))
+        reservation = await eng_log.acquire_send_slot(
+            ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
+            history_msgs=self.client.history_cache.get(ch_id),
+            bot_user=self.client.user)
+        if reservation is None:
+            logger.debug(f"[engage] #{channel.name} reservation lost — skipping auto-chat")
+            return
 
-        # Send with typing simulation (proportional)
-        typing_dur = human_timing.typing_seconds(message, persona_id=pid)
-        async with channel.typing():
-            await asyncio.sleep(typing_dur)
-        sent = await channel.send(message)
-        eng_log.mark_sent(ch_id)
-        eng_log.record(ch_id, sent, kind="auto_chat")
-        logger.info(f"Random auto-chat in #{channel.name}: {message}")
+        try:
+            # Settle gap after a sweep delete
+            if eng_log.seconds_since_delete(ch_id) < 45:
+                await asyncio.sleep(random.uniform(8, 30))
+
+            # Send with typing simulation (proportional)
+            typing_dur = human_timing.typing_seconds(message, persona_id=pid)
+            async with channel.typing():
+                await asyncio.sleep(typing_dur)
+            sent = await channel.send(message)
+            reservation.commit(sent, kind="auto_chat")
+            if _invites_response(message):
+                get_re_engagement_tracker().record_bot_message(ch_id)
+            logger.info(f"Random auto-chat in #{channel.name}: {message}")
+        finally:
+            reservation.abort()
 
     async def send_post_bump_messages(self):
         """Send an engagement message after a bump batch to boost chat
@@ -408,19 +440,30 @@ class ProactiveMessenger:
         )
         msg = _fallback_or(msg, pid, "bump", ch_id)
 
-        # Settle gap after a sweep delete
-        if eng_log.seconds_since_delete(ch_id) < 45:
-            await asyncio.sleep(random.uniform(8, 30))
+        reservation = await eng_log.acquire_send_slot(
+            ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
+            history_msgs=self.client.history_cache.get(ch_id),
+            bot_user=self.client.user)
+        if reservation is None:
+            logger.debug(f"[engage] #{channel.name} reservation lost — skipping post-bump")
+            return
 
         try:
+            # Settle gap after a sweep delete
+            if eng_log.seconds_since_delete(ch_id) < 45:
+                await asyncio.sleep(random.uniform(8, 30))
+
             async with channel.typing():
                 await asyncio.sleep(human_timing.typing_seconds(msg, persona_id=pid))
             sent = await channel.send(msg)
-            eng_log.mark_sent(ch_id)
-            eng_log.record(ch_id, sent, kind="post_bump")
+            reservation.commit(sent, kind="post_bump")
+            if _invites_response(msg):
+                get_re_engagement_tracker().record_bot_message(ch_id)
             logger.info(f"Post-bump message in #{channel.name}: {msg}")
         except Exception as e:
             logger.warning(f"Failed to send post-bump message: {e}")
+        finally:
+            reservation.abort()
 
     async def proactive_loop(self):
         """
@@ -485,19 +528,31 @@ class ProactiveMessenger:
                     logger.debug(f"[engage] #{best_ch.name} gated — skipping proactive")
                     continue
 
-                # Settle gap after a sweep delete
-                if eng_log.seconds_since_delete(ch_id) < 45:
-                    await asyncio.sleep(random.uniform(8, 30))
+                reservation = await eng_log.acquire_send_slot(
+                    ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
+                    history_msgs=self.client.history_cache.get(ch_id),
+                    bot_user=self.client.user)
+                if reservation is None:
+                    logger.debug(f"[engage] #{best_ch.name} reservation lost — skipping proactive")
+                    continue
 
-                # Send with typing simulation (proportional)
-                typing_dur = human_timing.typing_seconds(msg, persona_id=pid)
-                async with best_ch.typing():
-                    await asyncio.sleep(typing_dur)
-                sent = await best_ch.send(msg)
-                eng_log.mark_sent(ch_id)
-                eng_log.record(ch_id, sent, kind="proactive")
-                self.last_proactive = time.time()
-                logger.info(f"Proactive message in #{best_ch.name}: {msg}")
+                try:
+                    # Settle gap after a sweep delete
+                    if eng_log.seconds_since_delete(ch_id) < 45:
+                        await asyncio.sleep(random.uniform(8, 30))
+
+                    # Send with typing simulation (proportional)
+                    typing_dur = human_timing.typing_seconds(msg, persona_id=pid)
+                    async with best_ch.typing():
+                        await asyncio.sleep(typing_dur)
+                    sent = await best_ch.send(msg)
+                    reservation.commit(sent, kind="proactive")
+                    if _invites_response(msg):
+                        get_re_engagement_tracker().record_bot_message(ch_id)
+                    self.last_proactive = time.time()
+                    logger.info(f"Proactive message in #{best_ch.name}: {msg}")
+                finally:
+                    reservation.abort()
 
             except Exception as e:
                 logger.warning(f"Proactive loop error: {e}")

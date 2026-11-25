@@ -233,20 +233,21 @@ class MessageCache:
 
         return "\n".join(lines)
 
-    def get_active_user_count(self, ch_id: str, window_minutes: int = 10) -> int:
+    def get_active_user_count(self, ch_id: str, window_minutes: int = 10, own_ids=None) -> int:
         """
-        Count how many UNIQUE users have sent messages in the last N minutes.
-        Used to detect busy channels — if 5+ users are chatting, the bot
-        should NOT auto-step in (only respond when called).
+        Count how many UNIQUE human users have sent messages in the last N minutes.
+        Persona accounts passed through `own_ids` are excluded even when their
+        Discord `bot` flag is false (self-bot accounts usually are).
         """
         now = time.time()
         window_start = now - (window_minutes * 60)
+        is_bot_authored, _ = self._own_matchers(own_ids)
         with self._lock:
             messages = list(self._cache.get(ch_id, []))
 
         active_users = set()
         for m in messages:
-            if m["timestamp"] > window_start and not m["is_bot"]:
+            if m["timestamp"] > window_start and not is_bot_authored(m):
                 active_users.add(m["author_id"])
 
         return len(active_users)

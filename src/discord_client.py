@@ -47,10 +47,15 @@ from .ai.status_manager import get_status_manager
 from .ai.user_behavior import should_store_message, extract_potential_facts, get_engagement_tracker
 from .ai.unanswered_questions import get_unanswered_tracker, is_question
 from .ai.owner_system import get_owner_context, get_non_owner_command_context, detect_command_attempt, get_owner_tracker, is_owner
-from .ai.re_engagement import get_ping_controller, get_re_engagement_tracker, select_online_user
+from .ai.re_engagement import get_ping_controller, get_re_engagement_tracker, select_online_user, invites_response
 from .ai.engagement_log import get_engagement_log
-from .ai.conversational_initiative import get_engagement_analyzer, get_conversational_initiative_context
+from .ai.conversational_initiative import (
+    get_engagement_analyzer, get_conversational_initiative_context,
+    flush_engagement_profiles,
+)
 from .ai.welcome_system import get_welcome_system
+from .ai.social_dynamics import AmbientSignals, ambient_reply_chance
+from .ai import metrics
 from .channel_scanner import (
     can_speak_in, is_skip_channel,
     fetch_guild_rules, scan_guild,
@@ -59,6 +64,19 @@ from .proactive_messaging import ProactiveMessenger
 
 
 URL_PATTERN = re.compile(r'https?://\S+')
+
+
+def _own_persona_ids() -> Set[int]:
+    """All rotating persona account ids known to this process.
+
+    Imported lazily because persona runtime and the Discord client have a
+    circular lifecycle dependency during startup/rotation.
+    """
+    try:
+        from .persona import runtime as prt
+        return set(prt.own_user_ids())
+    except Exception:
+        return set()
 
 # ── Safety / rate-limit constants ─────────────────────────────────────────────
 CHANNEL_COOLDOWN_S = 8      # seconds between replies in same channel
@@ -678,17 +696,23 @@ class AIPersonaClient(discord.Client):
         otherwise (e.g. a bump scheduler that stopped looping for good)."""
         if getattr(self, "_torn_down", False):
             # Teardown already ran — a trailing event (late gateway echo,
-            # queued reply) must not spawn fresh work on a dead client.
+            # queued reply) must not spawn fresh work on a dead client. Close
+            # the unscheduled coroutine or Python emits "never awaited".
+            if asyncio.iscoroutine(coro):
+                coro.close()
             t = asyncio.create_task(_noop())
             return t
         t = asyncio.create_task(coro)
         self._spawned_tasks.append(t)
+        metrics.gauge("tasks.active", sum(1 for x in self._spawned_tasks if not x.done()))
         def _on_done(task):
             try:
+                metrics.gauge("tasks.active", sum(1 for x in self._spawned_tasks if not x.done()))
                 if task.cancelled():
                     return
                 exc = task.exception()
                 if exc is not None:
+                    metrics.incr("tasks.unexpected_failure")
                     logger.error(f"Background task died unexpectedly: {exc!r}")
             except Exception:
                 pass
@@ -739,9 +763,17 @@ class AIPersonaClient(discord.Client):
         try:
             flush = getattr(relationship, "flush_all", None)
             if flush:
-                res = flush()
-                if asyncio.iscoroutine(res):
-                    await res
+                # flush_all performs synchronous storage writes. Keep the
+                # rotation event loop responsive and bound the wait — worker
+                # threads may finish their best-effort writes in background.
+                await asyncio.wait_for(self._offloop(flush), timeout=10)
+        except Exception:
+            pass
+        # Flush adaptive engagement EWMA profiles — otherwise the tail of
+        # each activation relearns user warmth from scratch after rotation.
+        try:
+            await asyncio.wait_for(
+                self._offloop(flush_engagement_profiles), timeout=10)
         except Exception:
             pass
         for t in self._spawned_tasks:
@@ -778,6 +810,9 @@ class AIPersonaClient(discord.Client):
 
     async def on_ready(self):
         """Called when the bot is logged in and ready."""
+        self._ready_count = getattr(self, "_ready_count", 0) + 1
+        metrics.incr("ready.refire" if self._ready_count > 1 else "ready.initial",
+                     persona=self.persona.id)
         logger.info(f"Logged in as {self.user.name} (ID: {self.user.id})")
         logger.info(f"Mood: {self.mood_engine.current_mood} | Groq keys: {ai_reply.llm.get_key_count()}")
 
@@ -864,6 +899,10 @@ class AIPersonaClient(discord.Client):
 
         # Start periodic status/bio updates
         self._ensure_loop("status-updates", self._status_update_loop())
+
+        # Compact quantitative operations log — makes degradation visible
+        # without relying on anecdotal scrolling through verbose logs.
+        self._ensure_loop("metrics-log", self._metrics_log_loop())
 
         # Start re-engagement loop (check if no one replied to bot's messages)
         self._ensure_loop("re-engagement", self._re_engagement_loop())
@@ -1165,6 +1204,20 @@ class AIPersonaClient(discord.Client):
             # Jittered ~30min — presence changes shouldn't tick like a cron.
             await asyncio.sleep(random.uniform(1500, 2700))
 
+    async def _metrics_log_loop(self):
+        """Periodically emit compact operational counters + loop-lag gauge."""
+        await asyncio.sleep(120)
+        while True:
+            try:
+                logger.info(f"[metrics] {metrics.compact_summary()}")
+            except Exception as e:
+                logger.debug(f"Metrics log loop error: {e}")
+            started = time.time()
+            await asyncio.sleep(900)
+            # Sleep drift is a cheap event-loop-health signal: big positive
+            # values mean heartbeats and reply timing were probably starved.
+            metrics.gauge("event_loop.lag_seconds", max(0.0, time.time() - started - 900.0))
+
     # ── Voice conversation handlers ────────────────────────────────────────
 
     def _get_voice_history(self, guild_id: int) -> deque:
@@ -1236,9 +1289,10 @@ class AIPersonaClient(discord.Client):
         from collections import deque as _dq
         vq = self._user_recent_voice.setdefault(user_id, _dq(maxlen=5))
         vq.append((time.time(), transcript[:200]))
-        # Talking in VC counts toward the relationship too
+        # Talking in VC counts toward the relationship too. Storage writes
+        # are synchronous/debounced, so keep them off the voice hot path.
         try:
-            relationship.record_message(str(user_id))
+            self._spawn(self._offloop(relationship.record_message, str(user_id)))
         except Exception:
             pass
 
@@ -1603,19 +1657,31 @@ class AIPersonaClient(discord.Client):
                                 self.conversation_tracker[ch_id] = {}
                             self.conversation_tracker[ch_id][str(pinged_user.id)] = time.time()
 
-                        # Send with typing simulation (proportional)
-                        typing_dur = human_timing.typing_seconds(
-                            msg, persona_id=self.persona.id)
-                        async with channel.typing():
-                            await asyncio.sleep(typing_dur)
-                        sent = await channel.send(msg)
-                        eng_log.mark_sent(ch_id)
-                        eng_log.record(ch_id, sent, kind="re_engage")
-                        logger.info(f"Re-engagement ({action}) in #{channel.name}: {msg}")
+                        # Atomically reserve the shared engagement slot —
+                        # re-engagement races proactive/post-bump loops otherwise.
+                        reservation = await eng_log.acquire_send_slot(
+                            ch_id, last_human_ts=self.last_activity.get(ch_id, 0),
+                            history_msgs=self.history_cache.get(ch_id),
+                            bot_user=self.user)
+                        if reservation is None:
+                            continue
 
-                        # Clear re-engagement state
-                        re_tracker.clear_channel(ch_id)
-                        re_tracker.record_bot_message(ch_id)
+                        try:
+                            # Send with typing simulation (proportional)
+                            typing_dur = human_timing.typing_seconds(
+                                msg, persona_id=self.persona.id)
+                            async with channel.typing():
+                                await asyncio.sleep(typing_dur)
+                            sent = await channel.send(msg)
+                            reservation.commit(sent, kind="re_engage")
+                            logger.info(f"Re-engagement ({action}) in #{channel.name}: {msg}")
+                        finally:
+                            reservation.abort()
+
+                        # Advance the bounded ladder. The first ignored
+                        # invitation gets one targeted ping; only a second full
+                        # timeout may escalate once to @here, then it stops.
+                        re_tracker.mark_ping_sent(ch_id)
 
                         # Only do one re-engagement per cycle
                         break
@@ -1656,12 +1722,23 @@ class AIPersonaClient(discord.Client):
 
     async def _on_message_impl(self, message: discord.Message):
         """Actual message handler implementation (wrapped for error catching)."""
-        # Always cache our own messages for history accuracy
+        # Always cache our own messages for history accuracy. This must feed
+        # BOTH caches: prompts use msg_cache transcripts, and without our own
+        # lines interleaved there the model sees only one side of the convo.
         if message.author == self.user:
             ch_id = str(message.channel.id)
             if ch_id not in self.history_cache:
                 self.history_cache[ch_id] = deque(maxlen=40)
             self.history_cache[ch_id].append(message)
+            self.msg_cache.add_message(
+                ch_id=ch_id,
+                content=message.clean_content,
+                author=message.author.display_name,
+                author_id=str(message.author.id),
+                timestamp=message.created_at.timestamp(),
+                is_bot=True,
+                message_id=message.id,
+            )
             return
 
         # Dedup
@@ -1679,7 +1756,8 @@ class AIPersonaClient(discord.Client):
         if not message.author.bot and is_bot_accusation(message.content):
             self._bot_suspicion_until[ch_id] = time.time() + 1800
             try:
-                relationship.record_suspicion(str(message.author.id))
+                self._spawn(self._offloop(
+                    relationship.record_suspicion, str(message.author.id)))
             except Exception:
                 pass
             logger.info(f"[suspicion] bot accusation in #{message.channel} — 30min low profile")
@@ -1744,7 +1822,8 @@ class AIPersonaClient(discord.Client):
             engagement_tracker = get_engagement_tracker()
             engagement_tracker.record_message(str(message.author.id), message.content)
             try:
-                relationship.record_message(str(message.author.id))
+                self._spawn(self._offloop(
+                    relationship.record_message, str(message.author.id)))
             except Exception:
                 pass
 
@@ -1795,8 +1874,15 @@ class AIPersonaClient(discord.Client):
             get_engagement_log().mark_interaction(ch_id)
 
             # ── Conversational initiative: track user engagement ──────────
-            # Record message for engagement analysis (response time, length, etc.)
-            get_engagement_analyzer().record_user_message(str(message.author.id), message.content)
+            # Record message for engagement analysis off-loop — adaptive
+            # profiles are debounce-persisted through shared server state and
+            # must never block the gateway hot path.
+            try:
+                self._spawn(self._offloop(
+                    get_engagement_analyzer().record_user_message,
+                    str(message.author.id), message.content))
+            except Exception:
+                pass
 
             # ── Update conversation tracker ────────────────────────────────
             # If we have an active conversation with this user, refresh the
@@ -1816,7 +1902,8 @@ class AIPersonaClient(discord.Client):
             try:
                 cache = self.history_cache.get(ch_id, deque())
                 user_msgs_in_cache = sum(1 for m in cache if str(m.author.id) == str(message.author.id) and not m.author.bot)
-                active_users_count = self.msg_cache.get_active_user_count(ch_id, window_minutes=10)
+                active_users_count = self.msg_cache.get_active_user_count(
+                    ch_id, window_minutes=10, own_ids=_own_persona_ids() or {self.user.id})
                 # New participant = hasn't spoken in recent cache AND channel isn't too busy
                 is_new_participant = (user_msgs_in_cache <= 1 and active_users_count < 8)
                 # Returning user = check if they spoke in the last hour by looking at a wider window
@@ -1847,9 +1934,13 @@ class AIPersonaClient(discord.Client):
             self.history_cache[ch_id].append(message)
 
         # Track activity for proactive messaging — humans only. Other bots'
-        # messages (DISBOARD confirms etc.) must not reset dead-chat timers or
-        # count as `last_human_ts` for the engagement gate.
-        if not message.author.bot:
+        # messages (DISBOARD confirms etc.) and sibling persona accounts must
+        # not reset dead-chat timers or count as `last_human_ts` for the
+        # engagement gate.
+        own_ids = _own_persona_ids()
+        is_own_persona_msg = message.author.id in own_ids
+        is_machine_msg = bool(getattr(message.author, "bot", False)) or is_own_persona_msg
+        if not is_machine_msg:
             self.last_activity[ch_id] = time.time()
             if self.proactive_messenger:
                 self.proactive_messenger.record_activity(message.channel.id)
@@ -1861,7 +1952,7 @@ class AIPersonaClient(discord.Client):
             author=message.author.display_name,
             author_id=str(message.author.id),
             timestamp=message.created_at.timestamp(),
-            is_bot=(message.author == self.user),
+            is_bot=is_machine_msg,
             message_id=message.id,
         )
 
@@ -1941,7 +2032,7 @@ class AIPersonaClient(discord.Client):
         # messages from a previous batch, queue this message to maintain
         # FIFO order. Without the pending-check, a new message can jump
         # ahead of queued messages, causing out-of-order responses.
-        if ch_id in self._sending_in_channel or self._pending_messages.get(ch_id):
+        if ch_id in self._sending_in_channel or ch_id in self._pending_messages:
             # Queue this message for processing after the current reply
             if ch_id not in self._pending_messages:
                 self._pending_messages[ch_id] = deque(maxlen=5)
@@ -2463,7 +2554,8 @@ class AIPersonaClient(discord.Client):
             # the bot should NOT auto-step in. It only responds when called
             # (mention, name, reply, personal question, loneliness).
             # This prevents the bot from spamming in busy conversations.
-            active_users = self.msg_cache.get_active_user_count(ch_id, window_minutes=10)
+            active_users = self.msg_cache.get_active_user_count(
+                ch_id, window_minutes=10, own_ids=_own_persona_ids() or {self.user.id})
             if active_users >= 8:
                 return False, f"busy-channel ({active_users} users active — staying silent)"
 
@@ -2573,42 +2665,33 @@ class AIPersonaClient(discord.Client):
                     return True, f"random-server-name-match (chance: {chance:.0%})"
                 return False, f"random-skip-other-name (chance: {chance:.0%})"
 
-            # Dynamic reply chance based on time of day + engagement score
+            # Ambient participation is a social decision, not a fixed random
+            # rollout. Centralize the trade-offs so the policy is testable:
+            # room busyness, question/substance hooks, user warmth, recent
+            # engagement context, and negative feedback from ignored openers.
             time_chance = dynamic_reply_chance()
             engagement_prob = self.engagement.get_engagement_probability(ch_id)
-            # Blend: 60% time-of-day, 40% engagement score
-            chance = (time_chance * 0.6) + (engagement_prob * 0.4)
-
-            # Boost chance for messages that are questions or have substance
-            msg_stripped = message.content.strip()
-            if "?" in msg_stripped:
-                chance += 0.15  # Questions deserve a reply more often
-            if len(msg_stripped) > 30:
-                chance += 0.10  # Longer messages show more engagement
-            # If only 1-2 users active (not busy), be more responsive
-            if active_users <= 2:
-                chance += 0.10
-
-            # Boost chance for new participants (someone stepping into the chat)
             msg_flags = getattr(self, '_msg_flags', {}).get(message.id, {})
             is_new_participant = msg_flags.get('is_new_participant', False)
             is_returning_user = msg_flags.get('is_returning_user', False)
-            if is_new_participant:
-                chance += 0.25  # Much more likely to acknowledge new participants
-                if is_returning_user:
-                    chance += 0.10  # Extra boost for returning users
-
-            # Their message probably answers the engagement message the bot
-            # just sent ("anyone up for a game?" → "hey bro" / "i'm bored af")
-            if get_engagement_log().recent_engagement(ch_id, within_s=240):
-                chance += 0.35
-
-            # Recently-joined members — part of the conversation pool now
             join_ts = self._recent_joins.get(message.author.id)
-            if join_ts and (now - join_ts) < 1800:
-                chance += 0.15
-
-            chance = min(chance, 0.85)  # Cap at 85%
+            eng_log = get_engagement_log()
+            try:
+                user_level = get_engagement_analyzer().get_engagement_level(str(message.author.id))
+            except Exception:
+                user_level = "medium"
+            chance = ambient_reply_chance(AmbientSignals(
+                text=message.content,
+                time_chance=time_chance,
+                engagement_probability=engagement_prob,
+                active_users=active_users,
+                user_engagement_level=user_level,
+                consecutive_engagement_fails=eng_log.consecutive_fails(ch_id),
+                recent_engagement=eng_log.recent_engagement(ch_id, within_s=240),
+                is_new_participant=is_new_participant,
+                is_returning_user=is_returning_user,
+                recently_joined=bool(join_ts and (now - join_ts) < 1800),
+            ))
 
             if random.random() < chance:
                 self.engagement.boost(ch_id, 0.5, "decided-to-reply")
@@ -3014,7 +3097,8 @@ class AIPersonaClient(discord.Client):
             self.sticky_until[ch_id] = time.time() + 120
             _au = str(message.author.id)
             self.conversation_tracker.setdefault(ch_id, {})[_au] = time.time()
-            get_re_engagement_tracker().record_bot_message(ch_id)
+            # A defensive pushback is not an engagement invitation — it must
+            # never arm the re-engagement ping ladder.
             if ch_id not in self.history_cache:
                 self.history_cache[ch_id] = deque(maxlen=40)
             self.history_cache[ch_id].append(sent)
@@ -3066,13 +3150,18 @@ class AIPersonaClient(discord.Client):
         total_delay = min(max(notif_delay + read_delay + late_delay, 0.5), 38.0)
         logger.debug(f"Simulating {total_delay:.1f}s read delay [read: {read_s:.1f}s, think: {think_s:.1f}s, sentiment: {sentiment}, speed: {speed_mult}x, late: {late_delay:.1f}s]...")
         await asyncio.sleep(total_delay)
+        # The read/think delay can be tens of seconds. If rotation happened
+        # while we were "reading", this account must never continue into LLM
+        # work or send under stale persona context.
+        if self.is_closed() or self._is_stale_self():
+            return
 
         try:
             # Build transcript from the TTL-based message cache
             # Smart context: 4 messages + all messages from the same user
             # within the last 10 minutes (so the bot sees the full burst flow)
             transcript = self.msg_cache.get_context_text(
-                ch_id, count=8, own_ids={self.user.id})
+                ch_id, count=8, own_ids=(_own_persona_ids() or {self.user.id}))
 
             # Also get reactions from the discord history cache (for vibe)
             ctx_msgs = list(self.history_cache.get(ch_id, []))[-10:]
@@ -3425,6 +3514,10 @@ class AIPersonaClient(discord.Client):
             if not ai_data:
                 logger.warning("AI returned no data — skipping")
                 return
+            # LLM generation is another long-flight boundary — do not apply
+            # mood/status changes or sends from a rotated-out persona.
+            if self.is_closed() or self._is_stale_self():
+                return
 
             reply_text = ai_data.get("reply")
             burst_reply = ai_data.get("burst_reply")
@@ -3437,15 +3530,21 @@ class AIPersonaClient(discord.Client):
             if new_mood and str(new_mood).strip() in MOODS:
                 self.mood_engine.set_mood(str(new_mood).strip())
 
-            # Update status if AI suggested one
+            # Update status if AI suggested one. Statuses are outbound text
+            # too — the same persona/leak guard applies, with a tighter cap.
             if new_status and str(new_status).strip() not in ("null", "None", ""):
-                if new_status != self.current_status_text:
+                status_txt = str(new_status).strip()
+                ok_status, why_status = output_guard.validate_outbound(
+                    status_txt, persona_id=self.persona.id, surface="status")
+                if ok_status and status_txt != self.current_status_text:
                     try:
-                        await self.change_presence(activity=discord.CustomActivity(name=str(new_status)))
-                        self.current_status_text = str(new_status)
-                        logger.debug(f"Status -> {new_status}")
+                        await self.change_presence(activity=discord.CustomActivity(name=status_txt))
+                        self.current_status_text = status_txt
+                        logger.debug(f"Status -> {status_txt}")
                     except Exception as e:
                         logger.debug(f"Status change failed: {e}")
+                elif not ok_status:
+                    logger.debug(f"[guard] status suppressed ({','.join(why_status)}): {status_txt[:60]!r}")
 
             # Retry with stronger instruction if reply was null — BUT only
             # force a reply when the bot is directly addressed (mention/DM/reply
@@ -3617,17 +3716,15 @@ class AIPersonaClient(discord.Client):
                         ["yea fr", "ayy", "for sure", "sounds good",
                          "nice one", "fair enough"])
 
-                # Degenerate-output guard — theorem soup / ellipsis storms /
-                # oversized rambles never reach the channel.
-                if output_guard.is_degenerate(reply_text):
-                    logger.warning(f"[guard] degenerate reply suppressed: {reply_text[:80]!r}")
-                    return
-
-                # Internals-leak guard — the prompt says never discuss APIs/
-                # models, but when it slips through ("probably OpenAI GPT-4")
-                # the send dies here instead of outing the account.
-                if output_guard.leaks_internals(reply_text):
-                    logger.warning(f"[guard] internals-leak reply suppressed: {reply_text[:80]!r}")
+                # Unified outbound guard — degenerate text, provider/internal
+                # leaks, and deterministic persona-boundary breaks all die at
+                # the same final checkpoint instead of being enforced piecemeal.
+                ok_out, why_out = output_guard.validate_outbound(
+                    reply_text, persona_id=self.persona.id, surface="reply")
+                if not ok_out:
+                    metrics.incr("outbound.suppressed", surface="reply", reason=why_out[0])
+                    logger.warning(
+                        f"[guard] reply suppressed ({','.join(why_out)}): {reply_text[:80]!r}")
                     return
 
                 # React with emoji — human order is notice → react → beat →
@@ -3744,6 +3841,11 @@ class AIPersonaClient(discord.Client):
                     async with message.channel.typing():
                         await asyncio.sleep(typing_dur)
 
+                    # Typing is the final long-flight boundary before text
+                    # hits the wire — rotation here must silence the tail.
+                    if self.is_closed() or self._is_stale_self():
+                        return
+
                     try:
                         if use_reply_quote and i == 0:
                             await message.reply(burst_text)
@@ -3767,8 +3869,11 @@ class AIPersonaClient(discord.Client):
                 # questions we never addressed.
                 self.unanswered_tracker.mark_answered(ch_id, user_id)
 
-                # Record bot message for re-engagement tracking
-                get_re_engagement_tracker().record_bot_message(ch_id)
+                # Only explicit invitations may arm re-engagement. Recording
+                # every ordinary answer made "no fast reply" escalate into a
+                # personal ping or @here even when nothing was asked.
+                if invites_response(reply_text):
+                    get_re_engagement_tracker().record_bot_message(ch_id)
 
                 # Record bot message for engagement analysis (response timing)
                 get_engagement_analyzer().record_bot_message_to_user(user_id)
@@ -3790,6 +3895,9 @@ class AIPersonaClient(discord.Client):
                 if ch_id not in self.reply_history:
                     self.reply_history[ch_id] = deque(maxlen=8)
                 self.reply_history[ch_id].append(reply_text)
+                metrics.incr("reply.sent", persona=self.persona.id)
+                if len(bursts) > 1:
+                    metrics.incr("reply.burst_sent", amount=len(bursts) - 1, persona=self.persona.id)
                 logger.info(f"Sent reply ({len(bursts)} burst(s)): {reply_text[:80]}")
 
                 # Activity anchor: if they just asked "wyd"-style, remember

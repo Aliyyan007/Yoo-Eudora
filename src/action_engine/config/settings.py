@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from pathlib import Path
 from typing import List
+from typing_extensions import Annotated
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 
 # .env lives at <repo>/config/.env — the same file src/main.py and
 # src/ai/llm.py already load into os.environ at startup. We do NOT call
@@ -22,6 +24,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # leak real credentials into test runs that deliberately strip them.
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _ENV_PATH = _PROJECT_ROOT / "config" / ".env"
+# The host process already loads config/.env before importing the action
+# engine. Reading it again here makes test isolation impossible (scrubbing
+# os.environ would still hydrate real secrets). Opt in only for standalone
+# engine use.
+_ACTION_ENV_FILE = str(_ENV_PATH) if os.getenv("ACTION_ENGINE_LOAD_ENV_FILE") == "1" else None
 
 
 def _collect_groq_keys() -> List[str]:
@@ -51,14 +58,18 @@ class Settings(BaseSettings):
     """Validated, typed settings for the whole bot."""
 
     model_config = SettingsConfigDict(
-        env_file=str(_ENV_PATH),
+        env_file=_ACTION_ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",
     )
 
     # --- Discord ---
-    discord_token: str = Field(..., alias="DISCORD_TOKEN")
+    # Optional and currently unused inside the action engine: host startup
+    # supports persona-only token layouts (DISCORD_TOKEN_ISLA/ROWAN without a
+    # legacy DISCORD_TOKEN), and requiring this here silently disabled every
+    # action capability in that valid configuration.
+    discord_token: str = Field("", alias="DISCORD_TOKEN")
 
     # Comma-separated list of owner IDs — "123" or "123,456" both work.
     owner_user_id: str = Field("0", alias="OWNER_USER_ID")
@@ -99,7 +110,7 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", alias="LOG_LEVEL")
 
     # --- Auto-bump ---
-    bump_channel_ids: list[int] = Field(default_factory=list, alias="BUMP_CHANNEL_IDS")
+    bump_channel_ids: Annotated[list[int], NoDecode] = Field(default_factory=list, alias="BUMP_CHANNEL_IDS")
     auto_bump: bool = Field(False, alias="AUTO_BUMP")
 
     # --- Voice chat ---
@@ -138,7 +149,15 @@ class Settings(BaseSettings):
             return [int(x) for x in v]
         if isinstance(v, str):
             # Handle comma-separated or JSON array format.
-            parts = [p.strip() for p in v.strip("[]").split(",") if p.strip()]
+            s = v.strip()
+            if s.startswith("["):
+                try:
+                    arr = json.loads(s)
+                    if isinstance(arr, list):
+                        return [int(x) for x in arr]
+                except Exception:
+                    pass
+            parts = [p.strip().strip('"\'') for p in s.strip("[]").split(",") if p.strip()]
             return [int(p) for p in parts]
         if isinstance(v, int):
             return [v]
@@ -146,6 +165,13 @@ class Settings(BaseSettings):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # Host/env conventions historically used OWNER_IDS or OWNER_ID while
+        # this engine's original field was OWNER_USER_ID. Accept all three;
+        # OWNER_USER_ID remains the most specific/explicit setting.
+        if str(self.owner_user_id or "").strip() in ("", "0"):
+            fallback = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID")
+            if fallback:
+                self.owner_user_id = fallback
         # Populate groq_keys from the raw env (not model fields).
         if not self.groq_keys:
             self.groq_keys = _collect_groq_keys()

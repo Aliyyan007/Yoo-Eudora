@@ -78,6 +78,10 @@ _DENIAL_TELL = re.compile(
     r"\bi'?m\s+(?:just\s+)?a?\s*real\s+(?:human|person)\b|"
     r"\bjust\s+a\s+real\s+(?:human|person)\b",
     re.IGNORECASE)
+_SELF_AI_TELL = re.compile(
+    r"\bas\s+(?:an?\s+)?(?:ai|artificial\s+intelligence|language\s+model|chatbot)\b|"
+    r"\bi(?:'m| am)\s+(?:just\s+)?(?:an?\s+)?(?:ai|artificial\s+intelligence|language\s+model|chatbot)\b",
+    re.IGNORECASE)
 
 
 def leaks_internals(text: str) -> bool:
@@ -95,4 +99,95 @@ def leaks_internals(text: str) -> bool:
         return True
     if _DENIAL_TELL.search(t):
         return True
+    if _SELF_AI_TELL.search(t):
+        return True
     return False
+
+
+# ── Persona output policy ────────────────────────────────────────────────────
+# Prompt instructions are probabilistic; these are deterministic boundaries for
+# the highest-visibility identity contradictions. Keep them narrow: broad
+# censorship makes output stilted, but a Rowan message full of hearts or Isla
+# suddenly saying "bruv" is an immediate persona break.
+
+_PERSONA_BANNED = {
+    "eudora": re.compile(r"\b(?:aww|omg|yass|so\s+cute)\b", re.IGNORECASE),
+    "isla": re.compile(r"\b(?:bruv|mate|roadman|meh)\b", re.IGNORECASE),
+    "rowan": re.compile(r"\b(?:aww|omg|hehe|yass|bestie|so\s+cute)\b", re.IGNORECASE),
+}
+
+# Emoji in the broad Unicode pictograph blocks. Discord custom emoji are
+# counted separately below.
+_UNICODE_EMOJI = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF]")
+_CUSTOM_EMOJI = re.compile(r"<a?:\w{2,}:\d+>")
+_HEART_EMOJI = re.compile("[\u2764\U0001F493-\U0001F49F\U0001F5A4\U0001F90D\U0001F90E\U0001FA75-\U0001FA77]")
+
+_PERSONA_MAX_EMOJI = {
+    "eudora": 1,
+    "rowan": 1,
+    # Isla is intentionally unrestricted beyond the global degenerate-output
+    # checks — emoji abundance is part of her voice.
+}
+_ROWAN_ALLOWED_EMOJI = {"💀"}
+
+
+def emoji_count(text: str) -> int:
+    """Best-effort count of unicode/custom emoji in a message."""
+    return len(_UNICODE_EMOJI.findall(text or "")) + len(_CUSTOM_EMOJI.findall(text or ""))
+
+
+def persona_violations(text: str, persona_id: str = "") -> list:
+    """Deterministic persona-boundary violations in generated output."""
+    t = (text or "").strip()
+    if not t or not persona_id:
+        return []
+    pid = persona_id.lower()
+    violations = []
+
+    banned = _PERSONA_BANNED.get(pid)
+    if banned and banned.search(t):
+        violations.append("persona-banned-vocabulary")
+
+    count = emoji_count(t)
+    max_emoji = _PERSONA_MAX_EMOJI.get(pid)
+    if max_emoji is not None and count > max_emoji:
+        violations.append("persona-emoji-overuse")
+
+    if pid == "eudora" and _HEART_EMOJI.search(t):
+        violations.append("eudora-heart-emoji")
+    if pid == "isla" and t.lower() in {"k", "k.", "kk"}:
+        violations.append("isla-dry-k")
+    if pid == "rowan":
+        for e in _UNICODE_EMOJI.findall(t):
+            if e not in _ROWAN_ALLOWED_EMOJI:
+                violations.append("rowan-disallowed-emoji")
+                break
+
+    return violations
+
+
+def validate_outbound(text: str, persona_id: str = "", surface: str = "reply") -> tuple:
+    """Unified final validation for every human-visible text surface.
+
+    Returns (ok, reasons). `surface` tunes length limits while keeping the
+    non-negotiable checks identical across replies, proactive messages,
+    statuses, voice lines, and search follow-ups.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False, ["empty"]
+    max_len = {
+        "status": 100,
+        "voice": 500,
+        "proactive": 240,
+        "search": 400,
+    }.get(surface, 400)
+    if is_degenerate(t, max_len=max_len):
+        return False, ["degenerate"]
+    if leaks_internals(t):
+        return False, ["internals-leak"]
+    violations = persona_violations(t, persona_id)
+    if violations:
+        return False, violations
+    return True, []

@@ -5,10 +5,13 @@ Provides async query execution with retry logic and error handling.
 import os
 import json
 import time
+import random
 import asyncio
 import aiohttp
 from typing import Any, List, Dict, Optional, Union
 from loguru import logger
+
+from . import metrics
 
 
 class D1Unavailable(Exception):
@@ -70,6 +73,78 @@ class D1Client:
         # retry budget during an outage).
         self._avail_cached = False
         self._avail_cached_until = 0.0
+        # Circuit breaker. In the observed production logs an invalid D1
+        # token produced thousands of repeated authentication warnings while
+        # every memory operation still paid multi-second retry latency. Once
+        # D1 proves unavailable, fail fast for a bounded window instead.
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+        self._circuit_reason = ""
+
+    # ── failure classification / circuit bookkeeping ─────────────────────
+    @staticmethod
+    def _is_auth_error(msg: str, status: int = 0) -> bool:
+        low = (msg or "").lower()
+        return (status in (401, 403) or "authentication" in low
+                or "unauthorized" in low or "forbidden" in low
+                or "invalid api token" in low or "invalid token" in low
+                or "access denied" in low)
+
+    @staticmethod
+    def _is_transient_error(msg: str, status: int = 0) -> bool:
+        low = (msg or "").lower()
+        return (status in (408, 409, 425, 429) or status >= 500
+                or "timeout" in low or "timed out" in low
+                or "temporarily" in low or "try again" in low
+                or "rate limit" in low or "connection" in low
+                or "network" in low or "eof" in low
+                or "service unavailable" in low or "bad gateway" in low)
+
+    def _circuit_remaining(self) -> float:
+        return max(0.0, self._circuit_open_until - time.time())
+
+    def _note_success(self) -> None:
+        metrics.incr("d1.success")
+        if self._consecutive_failures or self._circuit_open_until:
+            logger.info("D1 circuit closed — query succeeded")
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+        self._circuit_reason = ""
+
+    def _note_failure(self, kind: str = "transient") -> None:
+        metrics.incr("d1.failure", kind=kind)
+        now = time.time()
+        self._consecutive_failures += 1
+        was_open = self._circuit_open_until > now
+        if kind == "auth":
+            wait_s = float(os.getenv("D1_AUTH_CIRCUIT_SECONDS", "1800"))
+            self._circuit_reason = "authentication"
+        else:
+            if self._consecutive_failures < 3:
+                return
+            # 15s, 30s, 60s ... capped at 5min. Jitter avoids a fleet-wide
+            # retry thundering herd when several instances share one DB.
+            wait_s = min(300.0, 15.0 * (2 ** (self._consecutive_failures - 3)))
+            wait_s += random.uniform(0.0, 3.0)
+            self._circuit_reason = "transient failures"
+        self._circuit_open_until = max(self._circuit_open_until, now + wait_s)
+        if not was_open:
+            metrics.incr("d1.circuit_opened", reason=self._circuit_reason.replace(" ", "_"))
+            metrics.gauge("d1.circuit_open_seconds", self._circuit_open_until - now)
+            logger.warning(
+                f"D1 circuit opened for {int(self._circuit_open_until - now)}s "
+                f"after {self._consecutive_failures} failure(s): {self._circuit_reason}"
+            )
+
+    def circuit_state(self) -> dict:
+        """Small observability snapshot for diagnostics/tests."""
+        remaining = self._circuit_remaining()
+        return {
+            "open": remaining > 0,
+            "remaining_s": round(remaining, 1),
+            "reason": self._circuit_reason,
+            "consecutive_failures": self._consecutive_failures,
+        }
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -94,6 +169,9 @@ class D1Client:
         """
         if not _ACCOUNT_ID or not _DATABASE_ID or not _API_TOKEN:
             raise D1Unavailable("D1 credentials not configured")
+        remaining = self._circuit_remaining()
+        if remaining:
+            raise D1Unavailable(f"D1 circuit open ({int(remaining)}s left: {self._circuit_reason})")
 
         body = {"sql": sql}
         if params:
@@ -106,6 +184,13 @@ class D1Client:
         for attempt in range(3):
             try:
                 async with session.post(_BASE_URL, json=body) as resp:
+                    status = int(getattr(resp, "status", 0) or 0)
+                    if self._is_auth_error("", status):
+                        last_err = f"D1 authentication failed (HTTP {status})"
+                        logger.warning(last_err)
+                        self._note_failure("auth")
+                        raise D1Unavailable(last_err)
+
                     data = await resp.json()
 
                     if not data.get("success"):
@@ -113,12 +198,21 @@ class D1Client:
                         err_msg = errors[0].get("message", "Unknown error") if errors else "Unknown error"
                         last_err = f"D1 query failed: {err_msg} (SQL: {sql[:80]})"
                         logger.warning(last_err)
-                        if attempt < 2:
+                        if self._is_auth_error(err_msg, status):
+                            self._note_failure("auth")
+                            raise D1Unavailable(last_err)
+                        transient = self._is_transient_error(err_msg, status)
+                        if transient and attempt < 2:
                             await asyncio.sleep(0.5 * (attempt + 1))
                             continue
+                        if transient:
+                            self._note_failure("transient")
+                        # Deterministic SQL/schema/client errors are not
+                        # retried — repeating them only burns latency and logs.
                         raise D1Unavailable(last_err)
 
                     result = data.get("result", [])
+                    self._note_success()
                     if isinstance(result, list) and len(result) > 0:
                         return result[0]
                     return {}
@@ -131,6 +225,7 @@ class D1Client:
                 if attempt < 2:
                     await asyncio.sleep(1.0 * (attempt + 1))
                     continue
+                self._note_failure("transient")
                 raise D1Unavailable(last_err)
             except Exception as e:
                 last_err = f"D1 query error: {e} (attempt {attempt+1}/3)"
@@ -138,6 +233,7 @@ class D1Client:
                 if attempt < 2:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
+                self._note_failure("transient")
                 raise D1Unavailable(last_err) from e
 
         raise D1Unavailable(last_err)
@@ -290,6 +386,14 @@ class D1Client:
         if not _ACCOUNT_ID or not _DATABASE_ID or not _API_TOKEN:
             return False
         now = time.time()
+        circuit_left = self._circuit_remaining()
+        if circuit_left:
+            # Cache the negative probe for a minute so memory operations
+            # degrade to local JSON immediately instead of repeatedly paying
+            # even the cheap circuit check/log path during an outage.
+            self._avail_cached = False
+            self._avail_cached_until = now + min(60.0, circuit_left)
+            return False
         if now < self._avail_cached_until:
             return self._avail_cached
         ok = False

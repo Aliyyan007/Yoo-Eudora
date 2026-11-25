@@ -20,9 +20,12 @@ Algorithmic approach:
 import re
 import time
 import random
+import threading
 from typing import Optional, List, Dict, Tuple
 from collections import defaultdict
 from loguru import logger
+
+from . import d1_memory as mem
 
 
 # ── Follow-up question templates ─────────────────────────────────────────────
@@ -85,6 +88,100 @@ INTEREST_STARTERS = {
 
 # ── User engagement analysis ─────────────────────────────────────────────────
 
+# Adaptive engagement memory must survive persona rotation and restarts. The
+# fast path still uses small in-process rolling windows, but their aggregates
+# are mirrored into the shared non-namespaced server_state KV as EWMA values.
+# EWMA keeps the stored blob tiny and naturally weights recent behaviour over
+# ancient history without retaining raw message content.
+_ADAPT_FLUSH_S = 240.0
+_ADAPT_ALPHA = 0.28
+_ADAPT_KEY_PREFIX = "adaptive_engagement:"
+_ADAPT_LOCK = threading.RLock()
+_adaptive_cache: Dict[str, dict] = {}
+
+
+def _adaptive_key(user_id: str) -> str:
+    return _ADAPT_KEY_PREFIX + str(user_id)
+
+
+def _blank_adaptive() -> dict:
+    return {
+        "samples": 0,
+        "response_ewma": 0.0,
+        "response_samples": 0,
+        "length_ewma": 0.0,
+        "last_interaction": 0.0,
+        "flushed_at": 0.0,
+    }
+
+
+def _adaptive_cached(user_id: str) -> dict:
+    """Cache-only profile lookup — safe for the gateway hot path (never does IO)."""
+    with _ADAPT_LOCK:
+        return _adaptive_cache.get(str(user_id)) or _blank_adaptive()
+
+
+def _adaptive_profile(user_id: str) -> dict:
+    """Profile lookup that may synchronously hydrate shared state.
+
+    Only call this from off-loop workers/tests. The reply gate must use
+    `_adaptive_cached` because D1/JSON fallback IO can otherwise stall gateway
+    heartbeats for seconds.
+    """
+    uid = str(user_id)
+    with _ADAPT_LOCK:
+        cached = _adaptive_cache.get(uid)
+        if cached is not None:
+            return cached
+    prof = _blank_adaptive()
+    try:
+        stored = mem.load_server_state(_adaptive_key(uid))
+        if isinstance(stored, dict):
+            for key in ("samples", "response_samples"):
+                try:
+                    prof[key] = max(0, int(stored.get(key) or 0))
+                except Exception:
+                    pass
+            for key in ("response_ewma", "length_ewma", "last_interaction", "flushed_at"):
+                try:
+                    prof[key] = max(0.0, float(stored.get(key) or 0.0))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    with _ADAPT_LOCK:
+        existing = _adaptive_cache.get(uid)
+        if existing is not None:
+            return existing
+        _adaptive_cache[uid] = prof
+        return prof
+
+
+def _flush_adaptive(user_id: str, force: bool = False) -> None:
+    """Best-effort debounced persist; callers run this off the event loop."""
+    uid = str(user_id)
+    try:
+        with _ADAPT_LOCK:
+            prof = _adaptive_cache.get(uid)
+            if prof is None:
+                return
+            now = time.time()
+            if not force and now - float(prof.get("flushed_at") or 0.0) < _ADAPT_FLUSH_S:
+                return
+            blob = dict(prof)
+            blob["flushed_at"] = now
+            prof["flushed_at"] = now
+        mem.save_server_state(_adaptive_key(uid), blob)
+    except Exception as e:
+        logger.debug(f"adaptive engagement flush failed for {uid}: {e}")
+
+
+def flush_engagement_profiles() -> None:
+    """Flush all adaptive engagement profiles during teardown/testing."""
+    for uid in list(_adaptive_cache):
+        _flush_adaptive(uid, force=True)
+
+
 class UserEngagementAnalyzer:
     """
     Analyzes user engagement patterns to adjust bot behavior.
@@ -111,40 +208,84 @@ class UserEngagementAnalyzer:
 
     def record_bot_message_to_user(self, user_id: str):
         """Record that the bot sent a message to a user (for response timing)."""
-        self._last_bot_msg_to_user[user_id] = time.time()
+        self._last_bot_msg_to_user[str(user_id)] = time.time()
 
     def record_user_message(self, user_id: str, text: str):
-        """Record a message from a user."""
-        self._msg_count[user_id] += 1
-        self._last_interaction[user_id] = time.time()
-        self._msg_lengths[user_id].append(len(text))
+        """Record a message from a user and update persistent adaptation.
+
+        Rolling lists give immediate session behaviour; the shared profile stores
+        only aggregate counts/EWMAs (never message text) so rotation/restart does
+        not reset the persona's social calibration.
+        """
+        uid = str(user_id)
+        now = time.time()
+        self._msg_count[uid] += 1
+        self._last_interaction[uid] = now
+        msg_len = len(text or "")
+        self._msg_lengths[uid].append(msg_len)
         # Keep only last 20 messages
-        if len(self._msg_lengths[user_id]) > 20:
-            self._msg_lengths[user_id] = self._msg_lengths[user_id][-20:]
+        if len(self._msg_lengths[uid]) > 20:
+            self._msg_lengths[uid] = self._msg_lengths[uid][-20:]
 
         # Calculate response time if we have a bot message timestamp
-        last_bot = self._last_bot_msg_to_user.get(user_id)
+        response_time = None
+        last_bot = self._last_bot_msg_to_user.get(uid)
         if last_bot:
-            response_time = time.time() - last_bot
-            self._response_times[user_id].append(response_time)
-            if len(self._response_times[user_id]) > 20:
-                self._response_times[user_id] = self._response_times[user_id][-20:]
+            response_time = now - last_bot
+            # Very late messages are usually a new topic, not a response to
+            # our last turn; counting them would dominate the EWMA and make
+            # an interested user look disengaged for weeks.
+            if response_time > 900:
+                response_time = None
+            else:
+                self._response_times[uid].append(response_time)
+            if len(self._response_times[uid]) > 20:
+                self._response_times[uid] = self._response_times[uid][-20:]
             # Clear the bot message timestamp
-            self._last_bot_msg_to_user[user_id] = None
+            self._last_bot_msg_to_user[uid] = None
+
+        prof = _adaptive_profile(uid)
+        with _ADAPT_LOCK:
+            prof["samples"] = int(prof.get("samples") or 0) + 1
+            prof["last_interaction"] = now
+            old_len = float(prof.get("length_ewma") or 0.0)
+            prof["length_ewma"] = (
+                float(msg_len) if int(prof.get("samples") or 0) <= 1 or not old_len
+                else (_ADAPT_ALPHA * msg_len + (1.0 - _ADAPT_ALPHA) * old_len)
+            )
+            if response_time is not None:
+                prof["response_samples"] = int(prof.get("response_samples") or 0) + 1
+                old_rt = float(prof.get("response_ewma") or 0.0)
+                prof["response_ewma"] = (
+                    float(response_time) if int(prof.get("response_samples") or 0) <= 1 or not old_rt
+                    else (_ADAPT_ALPHA * response_time + (1.0 - _ADAPT_ALPHA) * old_rt)
+                )
+        # Debounced persistence. This method is normally invoked via the
+        # client's off-loop executor, so a slow D1 fallback cannot stall the
+        # gateway hot path. Direct unit-test callers still work synchronously.
+        _flush_adaptive(uid)
 
     def get_avg_response_time(self, user_id: str) -> float:
-        """Get average response time for a user (seconds)."""
+        """Get average/EWMA response time for a user (seconds)."""
         times = self._response_times.get(user_id, [])
-        if not times:
+        if times:
+            return sum(times) / len(times)
+        try:
+            prof = _adaptive_cached(str(user_id))
+            return float(prof.get("response_ewma") or 0.0)
+        except Exception:
             return 0.0
-        return sum(times) / len(times)
 
     def get_avg_msg_length(self, user_id: str) -> float:
-        """Get average message length for a user."""
+        """Get average/EWMA message length for a user."""
         lengths = self._msg_lengths.get(user_id, [])
-        if not lengths:
+        if lengths:
+            return sum(lengths) / len(lengths)
+        try:
+            prof = _adaptive_cached(str(user_id))
+            return float(prof.get("length_ewma") or 0.0)
+        except Exception:
             return 0.0
-        return sum(lengths) / len(lengths)
 
     def get_engagement_level(self, user_id: str) -> str:
         """
@@ -159,6 +300,10 @@ class UserEngagementAnalyzer:
         - Recency of interaction
         """
         count = self._msg_count.get(user_id, 0)
+        try:
+            count = max(count, int(_adaptive_cached(str(user_id)).get("samples") or 0))
+        except Exception:
+            pass
         if count == 0:
             return "minimal"
 
@@ -227,12 +372,21 @@ class UserEngagementAnalyzer:
 
     def get_user_stats(self, user_id: str) -> dict:
         """Get engagement stats for a user."""
+        try:
+            prof = _adaptive_cached(str(user_id))
+        except Exception:
+            prof = _blank_adaptive()
+        count = max(self._msg_count.get(user_id, 0), int(prof.get("samples") or 0))
+        last_seen = max(
+            float(self._last_interaction.get(user_id, 0) or 0),
+            float(prof.get("last_interaction") or 0.0),
+        )
         return {
-            "msg_count": self._msg_count.get(user_id, 0),
+            "msg_count": count,
             "avg_response_time": self.get_avg_response_time(user_id),
             "avg_msg_length": self.get_avg_msg_length(user_id),
             "engagement_level": self.get_engagement_level(user_id),
-            "last_interaction": self._last_interaction.get(user_id, 0),
+            "last_interaction": last_seen,
         }
 
 

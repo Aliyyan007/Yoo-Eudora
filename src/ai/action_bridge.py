@@ -44,6 +44,8 @@ from typing import Optional
 
 from loguru import logger
 
+from . import metrics
+
 
 # â”€â”€ Tunables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _ENABLED = os.getenv("ACTION_WORKER_ENABLED", "1") != "0"
@@ -304,10 +306,12 @@ class ActionWorker:
                 permission gate and records what actually ran."""
                 allowed, args = worker._check_allowed(ctx, name, args)
                 if not allowed:
+                    metrics.incr("action.tool_denied", tool=name)
                     logger.info(f"[actions] denied '{name}' for user {ctx.author_id}")
                     return json.dumps({"error": "not allowed for this user"})
                 result = await _real_dispatch(ctx, name, args)
                 ok = '"error"' not in (result or "")[:120]
+                metrics.incr("action.tool_ok" if ok else "action.tool_error", tool=name)
                 if not ok:
                     # Tool errors were invisible — the agent saw them but the
                     # console only showed 'performed=False'. Log the reason.
@@ -626,11 +630,14 @@ class ActionWorker:
                 f"[actions] {label} '{text[:60]}' â†’ performed="
                 f"{getattr(ctx, 'performed', [])} (agent said: {str(reply)[:60]!r} â€” suppressed)"
             )
+            metrics.incr("action.run_completed", surface=label)
             return str(reply or "")
         except asyncio.TimeoutError:
+            metrics.incr("action.run_timeout", surface=label)
             logger.warning(f"[actions] {label} worker timed out: '{text[:60]}'")
             return _note_for(getattr(ctx, "performed", []))
         except Exception as e:
+            metrics.incr("action.run_error", surface=label)
             logger.error(f"[actions] {label} worker error: {e!r}")
             return None
 
@@ -683,8 +690,11 @@ class ActionWorker:
             return False
         key = (str(message.channel.id), str(message.author.id))
         if key in self._inflight:
+            metrics.incr("action.queue_duplicate")
             return False
         self._inflight.add(key)
+        metrics.incr("action.queued", surface="text")
+        metrics.gauge("action.inflight", len(self._inflight))
 
         from src.action_engine.config.prompts import CHAT_MODE
 
@@ -708,6 +718,7 @@ class ActionWorker:
                     context=context)
             finally:
                 self._inflight.discard(key)
+                metrics.gauge("action.inflight", len(self._inflight))
 
         t = asyncio.create_task(_job())
         self._tasks.add(t)
@@ -779,6 +790,7 @@ class ActionWorker:
                     ctx, f"[{speaker}]: {transcript}", categories, VOICE_MODE, "voice")
             finally:
                 self._inflight.discard(key)
+                metrics.gauge("action.inflight", len(self._inflight))
 
         t = asyncio.create_task(_job())
         self._tasks.add(t)

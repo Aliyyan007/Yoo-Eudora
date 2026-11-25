@@ -45,6 +45,28 @@ def _load_memory() -> dict:
                 return _memory_cache
         except Exception as e:
             logger.warning(f"Failed to load memory: {e}")
+            # Crash-window recovery: older save logic could leave only the
+            # backup behind after moving the primary aside. Prefer the backup
+            # to total amnesia.
+            bak_file = _MEMORY_FILE + ".bak"
+            if os.path.exists(bak_file):
+                try:
+                    with open(bak_file, "r", encoding="utf-8") as f:
+                        _memory_cache = json.load(f)
+                        logger.warning("Recovered memory from memory.json.bak")
+                        return _memory_cache
+                except Exception as be:
+                    logger.warning(f"Failed to load memory backup: {be}")
+    else:
+        bak_file = _MEMORY_FILE + ".bak"
+        if os.path.exists(bak_file):
+            try:
+                with open(bak_file, "r", encoding="utf-8") as f:
+                    _memory_cache = json.load(f)
+                    logger.warning("Primary memory file missing — recovered .bak")
+                    return _memory_cache
+            except Exception as be:
+                logger.warning(f"Failed to load memory backup: {be}")
     _memory_cache = {}
     return _memory_cache
 
@@ -62,19 +84,31 @@ def _save_memory(memory: dict):
         bak_file = _MEMORY_FILE + ".bak"
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(memory, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
 
-        # Try atomic replace with retries for Windows file locking
+        # Copy the old primary as a backup. NEVER move it away: the previous
+        # move-primary-then-replace sequence had a crash window in which the
+        # primary simply did not exist. os.replace(temp, primary) is itself
+        # atomic on both POSIX and modern Windows.
+        import shutil
         import time as _time
         for attempt in range(3):
             try:
                 if os.path.exists(_MEMORY_FILE):
                     try:
-                        os.replace(_MEMORY_FILE, bak_file)
-                    except OSError:
-                        # Can't create backup — just remove old file
-                        if os.path.exists(_MEMORY_FILE):
-                            os.remove(_MEMORY_FILE)
+                        shutil.copy2(_MEMORY_FILE, bak_file)
+                    except OSError as copy_err:
+                        logger.debug(f"Memory backup copy failed (continuing): {copy_err}")
                 os.replace(temp_file, _MEMORY_FILE)
+                # First-ever save had no prior primary to copy as `.bak`.
+                # Keep a backup from the start so a corrupt/missing primary
+                # never means total amnesia after a single write cycle.
+                if not os.path.exists(bak_file):
+                    try:
+                        shutil.copy2(_MEMORY_FILE, bak_file)
+                    except OSError as copy_err:
+                        logger.debug(f"Initial memory backup failed (continuing): {copy_err}")
                 break
             except OSError:
                 if attempt < 2:

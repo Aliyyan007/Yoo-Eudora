@@ -359,9 +359,18 @@ def build_reply_prompt(
     except Exception:
         time_anchor = ""
 
+    # Persistent life anchor — a real person's answer to "wyd" does not get
+    # regenerated from scratch every turn or after every restart.
+    try:
+        from .life_state import continuity_context
+        life_anchor = continuity_context(_ACTIVE.id)
+    except Exception:
+        life_anchor = ""
+
     return (
         f"[mood: {mood}]\n"
         f"{time_anchor}"
+        f"{life_anchor}"
         f"{identity_anchor}"
         f"{addressing_block}"
         f"{profile_block}"

@@ -155,8 +155,8 @@ def humanize(text: str) -> str:
 
     # 6. Anti-detection: Remove AI tells (em-dashes, semicolons, "moreover", etc.)
     # AI text overuses em-dashes and semicolons â€” humans rarely use them in chat
-    text = text.replace('â€”', '-')   # em-dash -> hyphen
-    text = text.replace('â€“', '-')   # en-dash -> hyphen
+    text = text.replace('\u2014', '-')   # em-dash -> hyphen
+    text = text.replace('\u2013', '-')   # en-dash -> hyphen
     if r() < 0.80:
         text = text.replace(';', ',')  # semicolons -> commas (80% of the time)
     # Remove AI transition words
@@ -876,6 +876,11 @@ def generate_proactive_message(channel_topic: str = "", for_user: str = None,
         "DIFFERENT format, don't do another one of these]\n"
         if recent_fmt else ""
     )
+    try:
+        from .life_state import continuity_context
+        life_hint = continuity_context(persona_id or prompts._ACTIVE.id)
+    except Exception:
+        life_hint = ""
     for attempt in range(2):
         pick = engagement_topics.pick_angle(
             cid, persona_id=persona_id,
@@ -884,7 +889,7 @@ def generate_proactive_message(channel_topic: str = "", for_user: str = None,
             task="proactive",
             system=prompts.PROACTIVE_SYSTEM,
             user=f"{topic_hint if attempt == 0 else ''}{ctx_hint}"
-                 f"{recents_hint}{fmt_hint}{ping_hint}"
+                 f"{recents_hint}{fmt_hint}{ping_hint}{life_hint}"
                  f"[your angle: {pick['prompt_line']}]\n"
                  "Write ONE short casual message in YOUR voice for that angle. "
                  "Single line only.",

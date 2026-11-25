@@ -14,6 +14,7 @@ Algorithmic approach:
 - Status mode: idle when quiet, dnd when annoyed, online when active
 - Don't change status too often (cooldown: 30 min)
 """
+import asyncio
 import time
 import random
 from typing import Optional
@@ -117,9 +118,20 @@ def generate_status(mood: str, time_of_day: Optional[str] = None) -> str:
     # reads like THAT person, not a shared generic vibe
     try:
         from ..persona.runtime import active as _active_persona
-        _ps = _active_persona().statuses
-        if _ps and random.random() < 0.3:
+        _persona = _active_persona()
+        _ps = _persona.statuses
+        if _ps and random.random() < 0.22:
             return random.choice(_ps)
+    except Exception:
+        _persona = None
+
+    # Persistent life-state statuses make presence coherent with what the
+    # persona claims to be doing in chat. They change by date/time slot, not
+    # randomly every 30 minutes.
+    try:
+        from .life_state import status_activity
+        if _persona is not None and random.random() < 0.28:
+            return status_activity(_persona.id)
     except Exception:
         pass
 
@@ -201,12 +213,23 @@ class StatusManager:
             return
 
         ns = self._ns()
-        status_text = generate_status(mood)
+        # generate_status may touch the life-state KV on a cold cache; keep
+        # that storage latency off the Discord gateway event loop.
+        status_text = await asyncio.to_thread(generate_status, mood)
         status_mode = get_status_mode(mood)
 
-        # Don't update if same as current
+        # Don't update if same as current, and never let a generated status
+        # bypass the unified outbound/persona boundary.
         if status_text == self._current_status.get(ns, ""):
             return
+        try:
+            from . import output_guard
+            ok, why = output_guard.validate_outbound(status_text, persona_id=ns, surface="status")
+            if not ok:
+                logger.debug(f"Status suppressed by outbound guard ({','.join(why)}): {status_text[:60]!r}")
+                return
+        except Exception:
+            pass
 
         try:
             activity = discord.CustomActivity(name=status_text)
